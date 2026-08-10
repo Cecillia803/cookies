@@ -29,6 +29,7 @@ type AdapterGatewayImageAdapter struct {
 	client            *http.Client
 	now               func() time.Time
 	allowInsecureHTTP bool
+	submissions       chan struct{}
 }
 
 func NewAdapterGatewayImageAdapter(credentials GatewayCredentialResolver, handles OutputHandleStore) (*AdapterGatewayImageAdapter, error) {
@@ -45,6 +46,7 @@ func NewAdapterGatewayImageAdapterWithPolicy(credentials GatewayCredentialResolv
 		client:            &http.Client{},
 		now:               time.Now,
 		allowInsecureHTTP: allowInsecureHTTP,
+		submissions:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -58,8 +60,8 @@ func (a *AdapterGatewayImageAdapter) Prepare(ctx context.Context, request ImageG
 	if err := request.Route.ValidateWithPolicy(a.allowInsecureHTTP); err != nil {
 		return err
 	}
-	if request.Input.Width != 1024 || request.Input.Height != 1024 {
-		return gatewayExecutionError("MODEL_INPUT_UNSUPPORTED", "Adapter gateway M1 supports only 1024x1024 images")
+	if !adapterGatewayImageSizeSupported(request.Input.Width, request.Input.Height) {
+		return gatewayExecutionError("MODEL_INPUT_UNSUPPORTED", "Adapter gateway image dimensions are unsupported")
 	}
 	if _, err := a.credentials.ResolveGatewayCredential(ctx, request.Route.CredentialID, request.Route.CredentialVersion); err != nil {
 		return gatewayExecutionError("MODEL_AUTH_UNAVAILABLE", "Adapter gateway credential could not be resolved")
@@ -79,12 +81,18 @@ func (a *AdapterGatewayImageAdapter) Submit(ctx context.Context, request ImageGe
 		"model":           request.Route.UpstreamModel,
 		"prompt":          request.Input.Prompt,
 		"n":               1,
-		"size":            "1024x1024",
+		"size":            fmt.Sprintf("%dx%d", request.Input.Width, request.Input.Height),
 		"response_format": "b64_json",
 		"output_format":   "png",
 	})
 	if err != nil {
 		return ImageSubmission{}, err
+	}
+	select {
+	case a.submissions <- struct{}{}:
+		defer func() { <-a.submissions }()
+	case <-ctx.Done():
+		return ImageSubmission{}, ctx.Err()
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(request.Route.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -113,7 +121,7 @@ func (a *AdapterGatewayImageAdapter) Submit(ctx context.Context, request ImageGe
 		return ImageSubmission{}, gatewayExecutionError("MODEL_RESPONSE_INVALID", "Adapter gateway response exceeded the configured safety limit")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return ImageSubmission{}, mapGatewayHTTPError(response.StatusCode)
+		return ImageSubmission{}, mapGatewayImageHTTPError(response.StatusCode)
 	}
 	var decoded struct {
 		Model string `json:"model"`
@@ -157,6 +165,12 @@ func (a *AdapterGatewayImageAdapter) Submit(ctx context.Context, request ImageGe
 	}, nil
 }
 
+func adapterGatewayImageSizeSupported(width, height int) bool {
+	return (width == 1024 && height == 1024) ||
+		(width == 1024 && height == 1536) ||
+		(width == 1536 && height == 1024)
+}
+
 func (a *AdapterGatewayImageAdapter) Poll(context.Context, ImageTaskReference) (ImageTaskResult, error) {
 	return ImageTaskResult{}, fmt.Errorf("adapter gateway image generation is synchronous and does not support polling")
 }
@@ -170,7 +184,7 @@ func (a *AdapterGatewayImageAdapter) Open(ctx context.Context, project contract.
 
 func (*AdapterGatewayImageAdapter) ProviderCode() string { return adapterGatewayProviderCode }
 
-func mapGatewayHTTPError(status int) error {
+func mapGatewayImageHTTPError(status int) error {
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return gatewayExecutionError("MODEL_AUTH_REJECTED", "Adapter gateway rejected its service credential")
@@ -188,6 +202,46 @@ func mapGatewayHTTPError(status int) error {
 		}
 		return gatewayExecutionError("MODEL_REQUEST_REJECTED", fmt.Sprintf("Adapter gateway returned HTTP %d", status))
 	}
+}
+
+func mapGatewayTextHTTPError(status int, responseBody []byte) error {
+	if status == http.StatusTooManyRequests && gatewayRejectedTextParameters(responseBody) {
+		return gatewayExecutionError("MODEL_REQUEST_REJECTED", "Text model rejected the configured request parameters")
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return gatewayExecutionError("MODEL_AUTH_REJECTED", "Adapter gateway rejected its service credential")
+	case http.StatusBadRequest:
+		return gatewayExecutionError("MODEL_REQUEST_REJECTED", "Adapter gateway rejected the text request")
+	case http.StatusUnprocessableEntity:
+		return gatewayExecutionError("MODEL_INPUT_UNSUPPORTED", "Adapter gateway could not process the text request")
+	case http.StatusTooManyRequests:
+		return ExecutionError{JobError: contract.JobError{
+			Code: "MODEL_RATE_LIMITED", Message: "Adapter gateway rate limited the text request", Retryable: true,
+		}}
+	default:
+		if status >= 500 {
+			return gatewayExecutionError("MODEL_SUBMISSION_UNKNOWN", "Adapter gateway submission outcome is unknown and will not be retried automatically")
+		}
+		return gatewayExecutionError("MODEL_REQUEST_REJECTED", fmt.Sprintf("Adapter gateway returned HTTP %d", status))
+	}
+}
+
+func gatewayRejectedTextParameters(responseBody []byte) bool {
+	var payload struct {
+		Error struct {
+			Message      string `json:"message"`
+			ProviderCode string `json:"provider_code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return false
+	}
+	providerCode := strings.ToLower(strings.TrimSpace(payload.Error.ProviderCode))
+	message := strings.ToLower(strings.TrimSpace(payload.Error.Message))
+	return providerCode == "invalidparameter" ||
+		providerCode == "invalid_parameter" ||
+		strings.Contains(message, "unsupported thinking type")
 }
 
 func gatewayExecutionError(code, message string) error {

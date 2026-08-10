@@ -15,13 +15,42 @@ var ErrNotFound = errors.New("project not found")
 var ErrNotActive = errors.New("project is not active")
 var ErrBrandNotFound = errors.New("brand not found")
 var ErrProductNotFound = errors.New("product not found")
+var ErrMembershipNotFound = errors.New("project membership not found")
+var ErrMembershipForbidden = errors.New("project membership operation forbidden")
+var ErrMembershipConflict = errors.New("project membership changed")
+var ErrLastOwner = errors.New("project must keep an active owner")
 
 type Store interface {
 	CreateBrand(context.Context, Brand) error
 	CreateProject(context.Context, Project, contract.Principal, []contract.ProductID) error
+	UpdateProject(context.Context, Project, ProjectRuntime, int64) error
+	CreateProjectArtifact(context.Context, ProjectArtifact) error
+	ListProjectArtifacts(context.Context, contract.OrganizationID, contract.ProjectID) ([]ProjectArtifact, error)
+	GetProjectArtifact(context.Context, contract.OrganizationID, contract.ProjectID, string) (ProjectArtifact, error)
+	UpdateProjectArtifact(context.Context, ProjectArtifact, int64) error
 	GetProject(context.Context, contract.OrganizationID, contract.ProjectID) (Project, error)
+	GetProjectRuntime(context.Context, contract.OrganizationID, contract.ProjectID) (ProjectRuntime, error)
+	UpsertProjectRuntime(context.Context, contract.OrganizationID, contract.ProjectID, ProjectRuntime) error
+	GetWorkbench(context.Context, contract.OrganizationID, contract.ProjectID) (Workbench, error)
+	UpsertWorkbench(context.Context, Workbench) error
 	GetContext(context.Context, contract.OrganizationID, contract.ProjectID) (contract.ProjectContext, error)
 	ListProjects(context.Context, contract.ActorContext) ([]Project, error)
+	CreateBusinessTask(context.Context, BusinessTask) error
+	ListBusinessTasks(context.Context, contract.OrganizationID, contract.ProjectID) ([]BusinessTask, error)
+	GetBusinessTask(context.Context, contract.OrganizationID, contract.ProjectID, string) (BusinessTask, error)
+	UpdateBusinessTask(context.Context, BusinessTask) error
+	CreateOperationalRecord(context.Context, OperationalRecord) error
+	ListOperationalRecords(context.Context, contract.OrganizationID, contract.ProjectID) ([]OperationalRecord, error)
+	GetOperationalRecord(context.Context, contract.OrganizationID, contract.ProjectID, string) (OperationalRecord, error)
+	UpdateOperationalRecord(context.Context, OperationalRecord) error
+	DeleteOperationalRecord(context.Context, contract.OrganizationID, contract.ProjectID, string) error
+	CreateChangeSet(context.Context, ChangeSet) error
+	ListChangeSets(context.Context, contract.OrganizationID, contract.ProjectID) ([]ChangeSet, error)
+	GetChangeSet(context.Context, contract.OrganizationID, contract.ProjectID, string) (ChangeSet, error)
+	UpdateChangeSet(context.Context, ChangeSet) error
+	AppendChangeSetEvent(context.Context, ChangeSetEvent) error
+	AppendAuditEvent(context.Context, AuditEvent) error
+	ListAuditEvents(context.Context, contract.OrganizationID, contract.ProjectID) ([]AuditEvent, error)
 }
 
 type Service struct {
@@ -79,14 +108,69 @@ func (s Service) CreateProject(ctx context.Context, actor contract.ActorContext,
 	if request.Activate {
 		status = StatusActive
 	}
+	industry := request.Industry
+	if industry == "" {
+		industry = IndustryEcommerce
+	}
 	project := Project{
 		ID: contract.ProjectID(id), OrganizationID: actor.OrganizationID, Name: request.Name, Status: status,
-		PrimaryBrandID: request.PrimaryBrandID, ProjectContextVersion: 1,
+		Industry: industry, PrimaryBrandID: request.PrimaryBrandID, ProjectContextVersion: 1,
 	}
 	if err := s.Store.CreateProject(ctx, project, actor.Principal, request.ProductIDs); err != nil {
 		return Project{}, err
 	}
+	if strings.TrimSpace(request.Brand) != "" || strings.TrimSpace(request.Goal) != "" {
+		runtime, err := s.Store.GetProjectRuntime(ctx, actor.OrganizationID, project.ID)
+		if err != nil {
+			return Project{}, err
+		}
+		if strings.TrimSpace(request.Brand) != "" {
+			runtime.Brand = strings.TrimSpace(request.Brand)
+		}
+		if strings.TrimSpace(request.Goal) != "" {
+			runtime.Goal = strings.TrimSpace(request.Goal)
+		}
+		if err := s.Store.UpsertProjectRuntime(ctx, actor.OrganizationID, project.ID, runtime); err != nil {
+			return Project{}, err
+		}
+	}
 	return s.Store.GetProject(ctx, actor.OrganizationID, project.ID)
+}
+
+func (s Service) UpdateProject(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, request UpdateProjectRequest) (Project, error) {
+	if err := s.authorizeWorkflow(ctx, actor, projectID); err != nil {
+		return Project{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return Project{}, err
+	}
+	current, err := s.Store.GetProject(ctx, actor.OrganizationID, projectID)
+	if err != nil {
+		return Project{}, err
+	}
+	if request.ExpectedContextVersion != nil && *request.ExpectedContextVersion != current.ProjectContextVersion {
+		return Project{}, ErrVersionConflict
+	}
+	runtime, err := s.Store.GetProjectRuntime(ctx, actor.OrganizationID, projectID)
+	if err != nil {
+		return Project{}, err
+	}
+	if request.Name != nil {
+		current.Name = strings.TrimSpace(*request.Name)
+	}
+	if request.Industry != nil {
+		current.Industry = *request.Industry
+	}
+	if request.Brand != nil {
+		runtime.Brand = strings.TrimSpace(*request.Brand)
+	}
+	if request.Goal != nil {
+		runtime.Goal = strings.TrimSpace(*request.Goal)
+	}
+	if err := s.Store.UpdateProject(ctx, current, runtime, current.ProjectContextVersion); err != nil {
+		return Project{}, err
+	}
+	return s.Store.GetProject(ctx, actor.OrganizationID, projectID)
 }
 
 func (s Service) GetContext(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID) (contract.ProjectContext, error) {
@@ -100,6 +184,25 @@ func (s Service) GetContext(ctx context.Context, actor contract.ActorContext, pr
 		return contract.ProjectContext{}, err
 	}
 	return s.Store.GetContext(ctx, actor.OrganizationID, projectID)
+}
+
+// GetBusinessContext returns names only for cross-artifact compatibility
+// checks. Authorization is identical to GetContext and the immutable IDs in
+// ProjectContext remain the source of lineage truth.
+func (s Service) GetBusinessContext(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID) (contract.ProjectBusinessContext, error) {
+	if s.Store == nil || s.Authorizer == nil {
+		return contract.ProjectBusinessContext{}, identity.ErrProjectAccessDenied
+	}
+	if err := s.Authorizer.AuthorizeProject(ctx, actor, projectID); err != nil {
+		return contract.ProjectBusinessContext{}, err
+	}
+	reader, ok := s.Store.(interface {
+		GetBusinessContext(context.Context, contract.OrganizationID, contract.ProjectID) (contract.ProjectBusinessContext, error)
+	})
+	if !ok {
+		return contract.ProjectBusinessContext{}, fmt.Errorf("project business context reader is required")
+	}
+	return reader.GetBusinessContext(ctx, actor.OrganizationID, projectID)
 }
 
 func (s Service) RequireActiveContext(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID) (contract.ProjectContext, error) {

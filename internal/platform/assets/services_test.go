@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"image"
 	"image/color"
 	"image/png"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +74,216 @@ func TestUploadCreatesImmutableProjectAsset(t *testing.T) {
 	}
 }
 
+func TestUploadPersistsVideoProbeMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository()
+	metadata := MediaMetadata{
+		DurationSeconds: 12.4,
+		FPS:             29.97,
+		Codec:           "h264",
+		BitrateBPS:      3_200_000,
+		AudioCodec:      "aac",
+		AudioChannels:   2,
+		AudioSampleRate: 48000,
+		PosterFrameRef:  "poster://asset/video_1/frame_0",
+	}
+	service := UploadService{
+		Repository: repo, Projects: fakeProjects{organization: "org_1", project: "project_1", version: 4},
+		Blobs: NewMemoryBlobStore(), Scanner: NoopScanner{}, MediaProbe: StaticMediaProbe{Metadata: metadata},
+		QuarantineBucket: "quarantine", AssetsBucket: "assets", Now: func() time.Time { return now }, NewID: sequenceIDs(),
+	}
+	data := testMP4()
+	digest := sha256.Sum256(data)
+	hash := hex.EncodeToString(digest[:])
+	rc := testRequestContext("org_1", "project_1")
+	created, err := service.Create(context.Background(), rc, "project_1", "video-upload-key", CreateUploadRequest{Filename: "hero.mp4", DeclaredMIMEType: "video/mp4", DeclaredSizeBytes: int64(len(data)), DeclaredSHA256: &hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PutContent(context.Background(), rc.Actor, "project_1", created.Session.ID, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Finalize(context.Background(), rc, "project_1", created.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProjectAssetRef == nil {
+		t.Fatal("expected project asset ref")
+	}
+	stored, err := repo.GetProjectAsset(context.Background(), "org_1", "project_1", result.ProjectAssetRef.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Asset.Kind != contract.AssetVideo || stored.Version.MIMEType != "video/mp4" {
+		t.Fatalf("unexpected video asset: %#v", stored)
+	}
+	if stored.Version.Media.ProbeStatus != MediaProbeSucceeded || stored.Version.Media.DurationSeconds != 12.4 || stored.Version.Media.Codec != "h264" || stored.Version.Media.AudioCodec != "aac" || stored.Version.Media.PosterFrameRef == "" {
+		t.Fatalf("unexpected media metadata: %#v", stored.Version.Media)
+	}
+	items, err := service.List(context.Background(), rc.Actor, "project_1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Version.Media.FPS != 29.97 {
+		t.Fatalf("list did not return media metadata: %#v", items)
+	}
+}
+
+func TestUploadPersistsProjectAuthorizedAudioWithProbeMetadata(t *testing.T) {
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	repo := newFakeRepository()
+	blobs := NewMemoryBlobStore()
+	service := UploadService{
+		Repository: repo, Projects: fakeProjects{organization: "org_1", project: "project_1", version: 4},
+		Blobs: blobs, Scanner: NoopScanner{},
+		QuarantineBucket: "quarantine", AssetsBucket: "assets", Now: func() time.Time { return now }, NewID: sequenceIDs(),
+		AudioProbe: fakeAudioProbe{metadata: AudioMetadata{DurationMS: 2400, Codec: "pcm_s16le", Channels: 1, SampleRate: 48000, BitrateBPS: 768000}},
+	}
+	data := testWAV(48000, 2400)
+	rc := testRequestContext("org_1", "project_1")
+	created, err := service.Create(context.Background(), rc, "project_1", "audio-upload-key", CreateUploadRequest{Filename: "voice.wav", DeclaredMIMEType: "audio/wav", DeclaredSizeBytes: int64(len(data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PutContent(context.Background(), rc.Actor, "project_1", created.Session.ID, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Finalize(context.Background(), rc, "project_1", created.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.GetProjectAsset(context.Background(), "org_1", "project_1", result.ProjectAssetRef.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Asset.Kind != contract.AssetAudio || stored.Version.MIMEType != "audio/wav" || stored.Version.DurationMS != 2400 {
+		t.Fatalf("audio asset = %#v", stored)
+	}
+	if stored.Version.Media.AudioCodec != "pcm_s16le" || stored.Version.Media.AudioChannels != 1 || stored.Version.Media.AudioSampleRate != 48000 || stored.Version.Media.ProbeStatus != MediaProbeSucceeded {
+		t.Fatalf("audio metadata = %#v", stored.Version.Media)
+	}
+	preview, info, err := service.OpenPreview(context.Background(), rc.Actor, "project_1", result.ProjectAssetRef.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer preview.Close()
+	got, err := io.ReadAll(preview)
+	if err != nil || !bytes.Equal(got, data) || info.MIMEType != "audio/wav" {
+		t.Fatalf("audio preview size=%d mime=%q err=%v", len(got), info.MIMEType, err)
+	}
+}
+
+func TestDerivedAudioIntakeIsIdempotentAndPreservesCreativeLineage(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 4, 12, 30, 0, 0, time.UTC)
+	repository := newFakeRepository()
+	service := UploadService{
+		Repository: repository, Projects: fakeProjects{organization: "org_1", project: "project_1", version: 7},
+		Blobs: NewMemoryBlobStore(), Scanner: NoopScanner{}, QuarantineBucket: "quarantine", AssetsBucket: "assets",
+		Now: func() time.Time { return now }, NewID: sequenceIDs(),
+		AudioProbe: fakeAudioProbe{metadata: AudioMetadata{DurationMS: 600, Codec: "pcm_s16le", Channels: 1, SampleRate: 48000, BitrateBPS: 768000}},
+	}
+	contents := testWAV(48000, 600)
+	planRevision := int64(2)
+	sources := []contract.ResourceRef{{Type: "creative_brand_film_plan", ID: "task_1", Version: &planRevision}}
+	rc := testRequestContext("org_1", "project_1")
+	first, err := service.IngestDerivedAudio(context.Background(), rc, "project_1", "brand-audio-fixture-abc", bytes.NewReader(contents), int64(len(contents)), "audio/wav", sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.IngestDerivedAudio(context.Background(), rc, "project_1", "brand-audio-fixture-abc", bytes.NewReader(contents), int64(len(contents)), "audio/wav", sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("derived audio retry created a second asset: first=%+v second=%+v", first, second)
+	}
+	asset, err := repository.GetProjectAsset(context.Background(), "org_1", "project_1", first.AssetVersion)
+	if err != nil || asset.Asset.Kind != contract.AssetAudio || asset.Version.SourceType != contract.AssetSourceDerived {
+		t.Fatalf("derived audio = %#v err=%v", asset, err)
+	}
+	relations, err := repository.ListAssetRelations(context.Background(), "org_1", "project_1", first.AssetVersion)
+	if err != nil || len(relations) != 1 || relations[0].Source.Type != "creative_brand_film_plan" || relations[0].Source.ID != "task_1" {
+		t.Fatalf("derived audio lineage = %#v err=%v", relations, err)
+	}
+}
+
+func TestCanonicalDetectedMediaMIMEAcceptsFilesystemWAVAlias(t *testing.T) {
+	t.Parallel()
+	if got := canonicalDetectedMediaMIME("audio/wave"); got != "audio/wav" {
+		t.Fatalf("canonical WAV MIME = %q", got)
+	}
+	if got := canonicalDetectedMediaMIME("audio/x-wav"); got != "audio/wav" {
+		t.Fatalf("canonical x-wav MIME = %q", got)
+	}
+}
+
+func TestUploadKeepsVideoWhenProbeFails(t *testing.T) {
+	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository()
+	service := UploadService{
+		Repository: repo, Projects: fakeProjects{organization: "org_1", project: "project_1", version: 4},
+		Blobs: NewMemoryBlobStore(), Scanner: NoopScanner{}, MediaProbe: StaticMediaProbe{Err: context.DeadlineExceeded},
+		QuarantineBucket: "quarantine", AssetsBucket: "assets", Now: func() time.Time { return now }, NewID: sequenceIDs(),
+	}
+	data := testMP4()
+	rc := testRequestContext("org_1", "project_1")
+	created, err := service.Create(context.Background(), rc, "project_1", "video-upload-key", CreateUploadRequest{Filename: "hero.mp4", DeclaredMIMEType: "video/mp4", DeclaredSizeBytes: int64(len(data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PutContent(context.Background(), rc.Actor, "project_1", created.Session.ID, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Finalize(context.Background(), rc, "project_1", created.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repo.GetProjectAsset(context.Background(), "org_1", "project_1", result.ProjectAssetRef.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Version.Media.ProbeStatus != MediaProbeFailed || stored.Version.Media.ProbeError == "" {
+		t.Fatalf("unexpected failed probe metadata: %#v", stored.Version.Media)
+	}
+}
+
+func TestAssetFeatureUpsertValidatesAndIsolatesProjectScope(t *testing.T) {
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository()
+	service := UploadService{Repository: repo, Projects: fakeProjects{organization: "org_1", project: "project_1", version: 4}, Blobs: NewMemoryBlobStore(), Scanner: NoopScanner{}, QuarantineBucket: "quarantine", AssetsBucket: "assets", Now: func() time.Time { return now }, NewID: sequenceIDs()}
+	ref := repo.commit(AssetCommit{BlobID: "blob_1", OrganizationID: "org_1", ProjectID: "project_1", AssetID: "asset_1", Version: 1, Kind: contract.AssetVideo, SourceType: contract.AssetSourceUpload, OwnerSystem: "assets", MIMEType: "video/mp4", SizeBytes: 128, SHA256: strings.Repeat("a", 64), Media: MediaMetadata{ProbeStatus: MediaProbeSucceeded}, Location: ObjectLocation{Provider: "memory", Bucket: "assets", Key: "asset_1"}, Event: contract.EventEnvelope{EventID: "event_1"}}, now)
+	actor := testRequestContext("org_1", "project_1").Actor
+	feature := testAssetFeature(ref.AssetVersion)
+
+	stored, err := service.UpsertFeature(context.Background(), actor, "project_1", feature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feature.HookStrength = 0.93
+	updated, err := service.UpsertFeature(context.Background(), actor, "project_1", feature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CreatedAt.IsZero() || !stored.CreatedAt.Equal(updated.CreatedAt) || updated.HookStrength != 0.93 {
+		t.Fatalf("unexpected upsert timestamps/value: stored=%#v updated=%#v", stored, updated)
+	}
+	got, err := service.GetFeature(context.Background(), actor, "project_1", ref.AssetVersion, "vlm-2026-07-26")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SellingPoints[0] != "0.01mm 精度" || got.SimilarityRisk != AssetFeatureRiskMedium {
+		t.Fatalf("unexpected feature: %#v", got)
+	}
+	if _, err := service.GetFeature(context.Background(), actor, "project_other", ref.AssetVersion, "vlm-2026-07-26"); err == nil {
+		t.Fatal("expected cross-project feature read to fail")
+	}
+	feature.SchemaVersion = "asset_feature_v0"
+	if _, err := service.UpsertFeature(context.Background(), actor, "project_1", feature); err == nil {
+		t.Fatal("expected schema validation error")
+	}
+}
+
 func TestUploadRejectsDeclaredMetadataMismatch(t *testing.T) {
 	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
 	repo := newFakeRepository()
@@ -104,7 +316,8 @@ func TestGeneratedIntakeIsIdempotentAndCompletesOneOutput(t *testing.T) {
 	data := testPNG(t)
 	digest := sha256.Sum256(data)
 	hash := hex.EncodeToString(digest[:])
-	request := GeneratedAssetIntakeRequest{ProviderJobID: "job_1", Output: contract.ProviderOutputRef{ProviderCode: "fake", ProviderJobID: "job_1", OutputID: "output_1", RetrievalExpiresAt: now.Add(time.Hour), DeclaredMIMEType: "image/png", DeclaredSizeBytes: int64(len(data)), DeclaredSHA256: &hash}, Provenance: GenerationProvenance{Capability: "image.generate", ProviderCode: "fake", ModelAlias: "image.standard", ModelVersion: "v1", SourceAssetRefs: []contract.AssetVersionRef{}, ProjectContextVersion: 7, GeneratedAt: now}}
+	sourceVersion := int64(3)
+	request := GeneratedAssetIntakeRequest{ProviderJobID: "job_1", Output: contract.ProviderOutputRef{ProviderCode: "fake", ProviderJobID: "job_1", OutputID: "output_1", RetrievalExpiresAt: now.Add(time.Hour), DeclaredMIMEType: "image/png", DeclaredSizeBytes: int64(len(data)), DeclaredSHA256: &hash}, Provenance: GenerationProvenance{Capability: "image.generate", ProviderCode: "fake", ModelAlias: "image.standard", ModelVersion: "v1", SourceAssetRefs: []contract.AssetVersionRef{{AssetID: "input_asset_1", Version: sourceVersion}}, SourceResourceRefs: []contract.ResourceRef{{Type: "remix_plan", ID: "remixplan_1"}, {Type: "remix_render_job", ID: "remixrender_1"}}, ProjectContextVersion: 7, GeneratedAt: now}}
 	rc := testRequestContext("org_1", "project_1")
 	first, err := service.Create(context.Background(), rc, "project_1", "provider-job-1-output-1", request)
 	if err != nil {
@@ -140,6 +353,152 @@ func TestGeneratedIntakeIsIdempotentAndCompletesOneOutput(t *testing.T) {
 	}
 	if asset.Version.ProviderJobID != "job_1" || asset.Version.ProviderOutputID != "output_1" || asset.Version.SourceType != contract.AssetSourceProviderGenerated {
 		t.Fatalf("unexpected generated asset: %#v", asset.Version)
+	}
+	relations, err := repo.ListAssetRelations(context.Background(), "org_1", "project_1", stored.ProjectAssetRef.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relations) != 3 {
+		t.Fatalf("relations count=%d relations=%#v", len(relations), relations)
+	}
+	sources := map[string]bool{}
+	for _, relation := range relations {
+		if relation.OutputAsset != stored.ProjectAssetRef.AssetVersion || relation.RelationType != AssetRelationGeneratedFrom {
+			t.Fatalf("unexpected relation: %#v", relation)
+		}
+		version := int64(0)
+		if relation.Source.Version != nil {
+			version = *relation.Source.Version
+		}
+		sources[relation.Source.Type+"/"+relation.Source.ID+"/"+strconv.FormatInt(version, 10)] = true
+	}
+	for _, want := range []string{"asset_version/input_asset_1/3", "remix_plan/remixplan_1/0", "remix_render_job/remixrender_1/0"} {
+		if !sources[want] {
+			t.Fatalf("missing relation source %s in %#v", want, relations)
+		}
+	}
+}
+
+func TestGeneratedIntakeUsesFilesystemBlobStoreWithoutLeakingStorageHandles(t *testing.T) {
+	now := time.Date(2026, 7, 22, 11, 0, 0, 0, time.UTC)
+	repo := newFakeRepository()
+	projects := fakeProjects{organization: "org_1", project: "project_1", version: 7}
+	ids := sequenceIDs()
+	service := GeneratedIntakeService{Repository: repo, Projects: projects, Now: func() time.Time { return now }, NewID: ids}
+	data := testPNG(t)
+	digest := sha256.Sum256(data)
+	hash := hex.EncodeToString(digest[:])
+	request := GeneratedAssetIntakeRequest{
+		ProviderJobID: "job_1",
+		Output: contract.ProviderOutputRef{
+			ProviderCode:       "fake",
+			ProviderJobID:      "job_1",
+			OutputID:           "output_1",
+			RetrievalExpiresAt: now.Add(time.Hour),
+			DeclaredMIMEType:   "image/png",
+			DeclaredSizeBytes:  int64(len(data)),
+			DeclaredSHA256:     &hash,
+		},
+		Provenance: GenerationProvenance{
+			Capability:            "image.generate",
+			ProviderCode:          "fake",
+			ModelAlias:            "image.standard",
+			ModelVersion:          "v1",
+			SourceAssetRefs:       []contract.AssetVersionRef{},
+			ProjectContextVersion: 7,
+			GeneratedAt:           now,
+		},
+	}
+	rc := testRequestContext("org_1", "project_1")
+	intake, err := service.Create(context.Background(), rc, "project_1", "provider-job-1-output-1", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := NewFilesystemBlobStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload := UploadService{Repository: repo, Projects: projects, Blobs: blobs, Scanner: NoopScanner{}, QuarantineBucket: "quarantine", AssetsBucket: "assets", Now: func() time.Time { return now }, NewID: ids}
+	worker := GeneratedIntakeWorker{Repository: repo, Projects: projects, Fetcher: fakeFetcher{data: data, metadata: contract.OutputMetadata{MIMEType: "image/png", SizeBytes: int64(len(data)), SHA256: hash}}, Upload: upload, Actor: rc.Actor, Now: func() time.Time { return now }}
+
+	processed, err := worker.ProcessOnce(context.Background(), "worker_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed {
+		t.Fatal("expected queued intake")
+	}
+	stored, err := service.Get(context.Background(), rc.Actor, "project_1", intake.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != GeneratedIntakeSucceeded || stored.ProjectAssetRef == nil {
+		t.Fatalf("unexpected intake: %#v", stored)
+	}
+	asset, err := repo.GetProjectAsset(context.Background(), "org_1", "project_1", stored.ProjectAssetRef.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asset.Version.Blob.Provider != "filesystem" || asset.Version.Blob.Bucket != "assets" || asset.Version.Blob.Key == "" {
+		t.Fatalf("generated asset was not committed to filesystem storage: %#v", asset.Version.Blob)
+	}
+	responseJSON, err := json.Marshal(stored.Response())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := string(responseJSON)
+	for _, forbidden := range []string{"bucket", "object_key", "storage", "tos://", "filesystem://", "https://vendor.example"} {
+		if strings.Contains(response, forbidden) {
+			t.Fatalf("generated intake response leaked %q: %s", forbidden, response)
+		}
+	}
+}
+
+func TestGeneratedIntakeRetriesTransientFailureThenRecordsAsset(t *testing.T) {
+	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository()
+	projects := fakeProjects{organization: "org_1", project: "project_1", version: 7}
+	ids := sequenceIDs()
+	service := GeneratedIntakeService{Repository: repo, Projects: projects, Now: func() time.Time { return now }, NewID: ids, MaxAttempts: 2}
+	data := testPNG(t)
+	digest := sha256.Sum256(data)
+	hash := hex.EncodeToString(digest[:])
+	request := GeneratedAssetIntakeRequest{ProviderJobID: "job_1", Output: contract.ProviderOutputRef{ProviderCode: "fake", ProviderJobID: "job_1", OutputID: "output_1", RetrievalExpiresAt: now.Add(time.Hour), DeclaredMIMEType: "image/png", DeclaredSizeBytes: int64(len(data)), DeclaredSHA256: &hash}, Provenance: GenerationProvenance{Capability: "image.generate", ProviderCode: "fake", ModelAlias: "image.standard", ModelVersion: "v1", SourceAssetRefs: []contract.AssetVersionRef{}, SourceResourceRefs: []contract.ResourceRef{{Type: "remix_render_job", ID: "remixrender_1"}}, ProjectContextVersion: 7, GeneratedAt: now}}
+	rc := testRequestContext("org_1", "project_1")
+	intake, err := service.Create(context.Background(), rc, "project_1", "provider-job-1-output-1", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload := UploadService{Repository: repo, Projects: projects, Blobs: NewMemoryBlobStore(), Scanner: NoopScanner{}, QuarantineBucket: "quarantine", AssetsBucket: "assets", Now: func() time.Time { return now }, NewID: ids}
+	firstWorker := GeneratedIntakeWorker{Repository: repo, Projects: projects, Fetcher: fakeFetcher{err: transientFetcherError{}}, Upload: upload, Actor: rc.Actor, Now: func() time.Time { return now }}
+	processed, err := firstWorker.ProcessOnce(context.Background(), "worker_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed {
+		t.Fatal("expected first attempt to claim intake")
+	}
+	requeued, err := service.Get(context.Background(), rc.Actor, "project_1", intake.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued.Status != GeneratedIntakeQueued || requeued.Error == nil || !requeued.Error.Retryable {
+		t.Fatalf("expected retryable queued intake, got %#v", requeued)
+	}
+	secondWorker := GeneratedIntakeWorker{Repository: repo, Projects: projects, Fetcher: fakeFetcher{data: data, metadata: contract.OutputMetadata{MIMEType: "image/png", SizeBytes: int64(len(data)), SHA256: hash}}, Upload: upload, Actor: rc.Actor, Now: func() time.Time { return now.Add(time.Second) }}
+	processed, err = secondWorker.ProcessOnce(context.Background(), "worker_2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed {
+		t.Fatal("expected second attempt to claim intake")
+	}
+	done, err := service.Get(context.Background(), rc.Actor, "project_1", intake.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != GeneratedIntakeSucceeded || done.ProjectAssetRef == nil {
+		t.Fatalf("expected successful retry, got %#v", done)
 	}
 }
 
@@ -243,6 +602,132 @@ func TestRenderedVideoIntakeIsIdempotentByRenderJob(t *testing.T) {
 	}
 }
 
+func TestDerivedImageIntakeIsIdempotentAndPreservesSourceLineage(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 31, 16, 0, 0, 0, time.UTC)
+	repository := newFakeRepository()
+	service := UploadService{
+		Repository: repository, Projects: fakeProjects{organization: "org_1", project: "project_1", version: 7},
+		Blobs: NewMemoryBlobStore(), Scanner: NoopScanner{}, QuarantineBucket: "quarantine", AssetsBucket: "assets",
+		Now: func() time.Time { return now }, NewID: sequenceIDs(),
+	}
+	source := repository.commit(AssetCommit{
+		BlobID: "source_blob", OrganizationID: "org_1", ProjectID: "project_1", AssetID: "source_video", Version: 1,
+		Kind: contract.AssetVideo, SourceType: contract.AssetSourceUpload, OwnerSystem: "assets", MIMEType: "video/mp4",
+		SizeBytes: 128, SHA256: strings.Repeat("a", 64), Location: ObjectLocation{Provider: "memory", Bucket: "assets", Key: "source"},
+	}, now).AssetVersion
+	frame := testPNG(t)
+	rc := testRequestContext("org_1", "project_1")
+	first, err := service.IngestDerivedImage(context.Background(), rc, "project_1", "game-frame-source_video-v1-21271ms-v1", source, bytes.NewReader(frame), int64(len(frame)), "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.IngestDerivedImage(context.Background(), rc, "project_1", "game-frame-source_video-v1-21271ms-v1", source, bytes.NewReader(frame), int64(len(frame)), "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("derivation retry created a second asset: first=%+v second=%+v", first, second)
+	}
+	stored, err := repository.GetProjectAsset(context.Background(), "org_1", "project_1", first.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Asset.Kind != contract.AssetImage || stored.Version.SourceType != contract.AssetSourceDerived || stored.Version.DerivationID == "" {
+		t.Fatalf("derived asset metadata = %+v", stored.Version)
+	}
+	relations, err := repository.ListAssetRelations(context.Background(), "org_1", "project_1", first.AssetVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relations) != 1 || relations[0].RelationType != AssetRelationDerivedFrom || relations[0].Source.ID != string(source.AssetID) || relations[0].Source.Version == nil || *relations[0].Source.Version != source.Version {
+		t.Fatalf("derived source lineage = %+v", relations)
+	}
+}
+
+func TestRenderedImageIntakePreservesLineageAndFrozenDimensions(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+	repository := newFakeRepository()
+	service := UploadService{
+		Repository: repository,
+		Projects:   fakeProjects{organization: "org_1", project: "project_1", version: 7},
+		Blobs:      NewMemoryBlobStore(), Scanner: NoopScanner{},
+		QuarantineBucket: "quarantine", AssetsBucket: "assets",
+		Now: func() time.Time { return now }, NewID: sequenceIDs(),
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 1080, 1440))); err != nil {
+		t.Fatalf("encode rendered image: %v", err)
+	}
+	sourceAsset := contract.AssetVersionRef{AssetID: "asset_base", Version: 2}
+	draftVersion := int64(4)
+	sourceResource := contract.ResourceRef{
+		Type: "creative_image_text_draft", ID: "task_1", Version: &draftVersion,
+	}
+	requestContext := testRequestContext("org_1", "project_1")
+	first, err := service.IngestRenderedImage(
+		context.Background(), requestContext, "project_1", "image_render_1",
+		bytes.NewReader(encoded.Bytes()), int64(encoded.Len()),
+		1080, 1440,
+		[]contract.AssetVersionRef{sourceAsset}, []contract.ResourceRef{sourceResource},
+	)
+	if err != nil {
+		t.Fatalf("IngestRenderedImage() error = %v", err)
+	}
+	second, err := service.IngestRenderedImage(
+		context.Background(), requestContext, "project_1", "image_render_1",
+		bytes.NewReader(encoded.Bytes()), int64(encoded.Len()),
+		1080, 1440,
+		[]contract.AssetVersionRef{sourceAsset}, []contract.ResourceRef{sourceResource},
+	)
+	if err != nil {
+		t.Fatalf("idempotent IngestRenderedImage() error = %v", err)
+	}
+	if first != second {
+		t.Fatalf("render retry created a second asset: first=%+v second=%+v", first, second)
+	}
+	relations, err := repository.ListAssetRelations(
+		context.Background(), "org_1", "project_1", first.AssetVersion,
+	)
+	if err != nil {
+		t.Fatalf("ListAssetRelations() error = %v", err)
+	}
+	if len(relations) != 2 {
+		t.Fatalf("relations = %+v, want base asset and Creative draft lineage", relations)
+	}
+}
+
+func TestRenderedImageIntakeAcceptsDeclaredCanvasDimensions(t *testing.T) {
+	t.Parallel()
+	repository := newFakeRepository()
+	service := UploadService{
+		Repository: repository,
+		Projects:   fakeProjects{organization: "org_1", project: "project_1", version: 7},
+		Blobs:      NewMemoryBlobStore(), Scanner: NoopScanner{},
+		QuarantineBucket: "quarantine", AssetsBucket: "assets",
+		Now: time.Now, NewID: sequenceIDs(),
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 720, 1280))); err != nil {
+		t.Fatalf("encode canvas image: %v", err)
+	}
+	ref, err := service.IngestRenderedImage(
+		context.Background(), testRequestContext("org_1", "project_1"), "project_1", "short_drama_canvas_1",
+		bytes.NewReader(encoded.Bytes()), int64(encoded.Len()), 720, 1280, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("IngestRenderedImage() arbitrary canvas error = %v", err)
+	}
+	stored, err := repository.GetProjectAsset(context.Background(), "org_1", "project_1", ref.AssetVersion)
+	if err != nil {
+		t.Fatalf("GetProjectAsset() error = %v", err)
+	}
+	if stored.Asset.Kind != contract.AssetImage || stored.Version.WidthPixels != 720 || stored.Version.HeightPixels != 1280 {
+		t.Fatalf("canvas metadata = %+v", stored.Version)
+	}
+}
+
 type fakeVideoProbe struct {
 	metadata VideoMetadata
 	err      error
@@ -285,6 +770,11 @@ func (f fakeFetcher) Open(context.Context, contract.ProjectRef, contract.Provide
 	return io.NopCloser(bytes.NewReader(f.data)), f.metadata, f.err
 }
 
+type transientFetcherError struct{}
+
+func (transientFetcherError) Error() string   { return "temporary fetch failure" }
+func (transientFetcherError) Retryable() bool { return true }
+
 type fakeRepository struct {
 	mu         sync.Mutex
 	uploads    map[string]UploadSession
@@ -292,10 +782,12 @@ type fakeRepository struct {
 	intakes    map[string]GeneratedIntake
 	intakeKeys map[string]string
 	assets     map[string]ProjectAsset
+	relations  map[string][]AssetRelation
+	features   map[string]AssetFeature
 }
 
 func newFakeRepository() *fakeRepository {
-	return &fakeRepository{uploads: map[string]UploadSession{}, uploadKeys: map[string]string{}, intakes: map[string]GeneratedIntake{}, intakeKeys: map[string]string{}, assets: map[string]ProjectAsset{}}
+	return &fakeRepository{uploads: map[string]UploadSession{}, uploadKeys: map[string]string{}, intakes: map[string]GeneratedIntake{}, intakeKeys: map[string]string{}, assets: map[string]ProjectAsset{}, relations: map[string][]AssetRelation{}, features: map[string]AssetFeature{}}
 }
 func (r *fakeRepository) CreateUpload(_ context.Context, v UploadSession) (UploadSession, bool, error) {
 	r.mu.Lock()
@@ -440,9 +932,24 @@ func (r *fakeRepository) CompleteRender(_ context.Context, renderJobID string, c
 	}
 	return r.commit(c, now), nil
 }
+func (r *fakeRepository) CompleteDerived(_ context.Context, derivationID string, c AssetCommit, now time.Time) (contract.ProjectAssetRef, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, existing := range r.assets {
+		if existing.Asset.OrganizationID == c.OrganizationID && existing.Version.DerivationID == derivationID {
+			return existing.Ref, nil
+		}
+	}
+	return r.commit(c, now), nil
+}
 func (r *fakeRepository) commit(c AssetCommit, now time.Time) contract.ProjectAssetRef {
 	ref := contract.ProjectAssetRef{ProjectID: c.ProjectID, AssetVersion: contract.AssetVersionRef{AssetID: c.AssetID, Version: c.Version}}
-	r.assets[string(c.OrganizationID)+"/"+string(c.ProjectID)+"/"+string(c.AssetID)] = ProjectAsset{Ref: ref, Asset: Asset{ID: c.AssetID, OrganizationID: c.OrganizationID, Kind: c.Kind, Status: AssetReady, OwnerSystem: c.OwnerSystem, LatestVersion: c.Version, CreatedAt: now, UpdatedAt: now}, Version: AssetVersion{OrganizationID: c.OrganizationID, AssetID: c.AssetID, Version: c.Version, Status: AssetReady, SourceType: c.SourceType, MIMEType: c.MIMEType, SizeBytes: c.SizeBytes, SHA256: c.SHA256, WidthPixels: c.WidthPixels, HeightPixels: c.HeightPixels, DurationMS: c.DurationMS, FrameRate: c.FrameRate, VideoCodec: c.VideoCodec, AudioCodec: c.AudioCodec, RenderJobID: c.RenderJobID, ProviderJobID: c.ProviderJobID, ProviderOutputID: c.ProviderOutputID, ProjectContextVersion: c.ProjectContextVersion, Blob: c.Location, CreatedAt: now}, CreatedAt: now}
+	r.assets[string(c.OrganizationID)+"/"+string(c.ProjectID)+"/"+string(c.AssetID)] = ProjectAsset{Ref: ref, Asset: Asset{ID: c.AssetID, OrganizationID: c.OrganizationID, Kind: c.Kind, Status: AssetReady, OwnerSystem: c.OwnerSystem, LatestVersion: c.Version, CreatedAt: now, UpdatedAt: now}, Version: AssetVersion{OrganizationID: c.OrganizationID, AssetID: c.AssetID, Version: c.Version, Status: AssetReady, SourceType: c.SourceType, MIMEType: c.MIMEType, SizeBytes: c.SizeBytes, SHA256: c.SHA256, WidthPixels: c.WidthPixels, HeightPixels: c.HeightPixels, Media: c.Media, DurationMS: c.DurationMS, FrameRate: c.FrameRate, VideoCodec: c.VideoCodec, AudioCodec: c.AudioCodec, RenderJobID: c.RenderJobID, DerivationID: c.DerivationID, ProviderJobID: c.ProviderJobID, ProviderOutputID: c.ProviderOutputID, ProjectContextVersion: c.ProjectContextVersion, Blob: c.Location, CreatedAt: now}, CreatedAt: now}
+	for _, relation := range c.Relations {
+		relation.CreatedAt = now
+		key := relationKey(c.OrganizationID, c.ProjectID, relation.OutputAsset)
+		r.relations[key] = append(r.relations[key], relation)
+	}
 	return ref
 }
 func (r *fakeRepository) GetProjectAsset(_ context.Context, o contract.OrganizationID, p contract.ProjectID, ref contract.AssetVersionRef) (ProjectAsset, error) {
@@ -471,6 +978,64 @@ func (r *fakeRepository) RemoveProjectAsset(_ context.Context, o contract.Organi
 	delete(r.assets, string(o)+"/"+string(p)+"/"+string(ref.AssetID))
 	return nil
 }
+func (r *fakeRepository) ListAssetRelations(_ context.Context, o contract.OrganizationID, p contract.ProjectID, ref contract.AssetVersionRef) ([]AssetRelation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]AssetRelation(nil), r.relations[relationKey(o, p, ref)]...), nil
+}
+func (r *fakeRepository) UpsertAssetFeature(_ context.Context, v AssetFeature, now time.Time) (AssetFeature, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.assets[string(v.OrganizationID)+"/"+string(v.ProjectID)+"/"+string(v.AssetID)]; !ok {
+		return AssetFeature{}, ErrNotFound
+	}
+	key := featureKey(v.OrganizationID, v.ProjectID, v.AssetID, v.AssetVersion, v.FeatureVersion)
+	if old, ok := r.features[key]; ok {
+		v.CreatedAt = old.CreatedAt
+	} else {
+		v.CreatedAt = now
+	}
+	v.UpdatedAt = now
+	r.features[key] = v
+	return v, nil
+}
+func (r *fakeRepository) GetAssetFeature(_ context.Context, o contract.OrganizationID, p contract.ProjectID, ref contract.AssetVersionRef, featureVersion string) (AssetFeature, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.features[featureKey(o, p, ref.AssetID, ref.Version, featureVersion)]
+	if !ok {
+		return AssetFeature{}, ErrNotFound
+	}
+	return v, nil
+}
+func (r *fakeRepository) ListAssetFeatures(_ context.Context, o contract.OrganizationID, p contract.ProjectID, _ int) ([]AssetFeature, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := []AssetFeature{}
+	for _, v := range r.features {
+		if v.OrganizationID == o && v.ProjectID == p {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+func featureKey(o contract.OrganizationID, p contract.ProjectID, assetID contract.AssetID, version int64, featureVersion string) string {
+	return string(o) + "/" + string(p) + "/" + string(assetID) + "/" + strconv.FormatInt(version, 10) + "/" + featureVersion
+}
+func relationKey(o contract.OrganizationID, p contract.ProjectID, ref contract.AssetVersionRef) string {
+	return string(o) + "/" + string(p) + "/" + string(ref.AssetID) + "/" + strconv.FormatInt(ref.Version, 10)
+}
+
+func testAssetFeature(ref contract.AssetVersionRef) AssetFeature {
+	return AssetFeature{
+		AssetID: ref.AssetID, AssetVersion: ref.Version, SchemaVersion: AssetFeatureSchemaV1,
+		FeatureVersion: "vlm-2026-07-26", HookStrength: 0.82, ProductVisibility: 0.76,
+		SceneTags: []string{"factory"}, ProductTags: []string{"cnc"}, PersonTags: []string{"engineer"},
+		ActionTags: []string{"cutting"}, EmotionTags: []string{"trust"}, SellingPoints: []string{"0.01mm 精度"},
+		CTAPresence: true, SimilarityGroup: "precision-demo-a", SimilarityRisk: AssetFeatureRiskMedium,
+		Evidence: []string{"00:00-00:03 强钩子"},
+	}
+}
 
 func testRequestContext(org contract.OrganizationID, _ contract.ProjectID) contract.RequestContext {
 	return contract.RequestContext{RequestID: "req_1", TraceID: "trace_1", Actor: contract.ActorContext{OrganizationID: org, Principal: contract.Principal{Kind: contract.PrincipalUser, ID: "user_1"}, Scopes: []contract.Scope{"project.read", "project.write", "assets.read", "assets.write"}}}
@@ -484,6 +1049,13 @@ func testPNG(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return b.Bytes()
+}
+func testMP4() []byte {
+	return []byte{
+		0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2',
+		0x00, 0x00, 0x00, 0x00, 'm', 'p', '4', '2', 'i', 's', 'o', 'm',
+		0x00, 0x00, 0x00, 0x08, 'm', 'd', 'a', 't',
+	}
 }
 func sequenceIDs() func(string) (string, error) {
 	var mu sync.Mutex

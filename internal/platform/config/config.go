@@ -6,8 +6,10 @@ package config
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,7 +42,9 @@ type Config struct {
 	Scanner       Scanner
 	Media         Media
 	Provider      Provider
+	Creative      Creative
 	Strategy      Strategy
+	Research      Research
 	LocalIdentity *LocalIdentity
 }
 
@@ -81,15 +85,58 @@ type Media struct {
 // Package-to-Creative permits only the explicit package-to-Intake handoff;
 // approval never creates a Creative task implicitly.
 type Strategy struct {
-	Enabled                  bool
-	V2Enabled                bool
-	RealProviderEnabled      bool
-	ApproveEnabled           bool
-	PackageToCreativeEnabled bool
-	TextModelAlias           string
-	PromptVersion            string
-	CriticEnabled            bool
-	OrganizationAllowlist    []string
+	Enabled                     bool
+	V2Enabled                   bool
+	RealProviderEnabled         bool
+	ApproveEnabled              bool
+	PackageToCreativeEnabled    bool
+	CreativeTaskPlanningEnabled bool
+	QuickViralRemakeEnabled     bool
+	TextModelAlias              string
+	DeepReviewModelAlias        string
+	PromptVersion               string
+	ConversationPromptVersion   string
+	RevisePromptVersion         string
+	ReviewPromptVersion         string
+	RepairPromptVersion         string
+	CreativeTaskPromptVersion   string
+	CriticEnabled               bool
+	ContextSelectionEnabled     bool
+	OrganizationAllowlist       []string
+}
+
+type Creative struct {
+	DirectionPlanningEnabled       bool
+	DirectionPlannerModelAlias     string
+	ImageFontPath                  string
+	ImageFontSHA256                string
+	ShortDramaModelPlannerEnabled  bool
+	ShortDramaPlannerModelAlias    string
+	GamePrerollModelPlannerEnabled bool
+	GamePrerollPlannerModelAlias   string
+	BrandFilmModelPlannerEnabled   bool
+	BrandFilmPlannerModelAlias     string
+	AINativeMaxActiveUnits         int
+}
+
+// Research configures backend-owned web research. MCP fields are retained only
+// for decoding older local configuration and are not used by the API process.
+type Research struct {
+	SeedEnabled        bool
+	SeedModelAlias     string
+	MaxConcurrent      int
+	TikaEnabled        bool
+	TikaBaseURL        string
+	TikaVersion        string
+	TikaTimeoutSeconds int
+	TikaMaxOutputBytes int
+	MCPStdioCommand    string
+	MCPStdioArgs       []string
+	MCPToolName        string
+	MCPProtocolVersion string
+	MCPEnvAllowlist    []string
+	TimeoutSeconds     int
+	MaxOutputBytes     int
 }
 
 // Provider contains only local composition choices. Credentials are read from
@@ -98,6 +145,8 @@ type Provider struct {
 	ImageAdapter      string
 	VideoAdapter      string
 	TextAdapter       string
+	AudioAdapter      string
+	SpeechAdapter     string
 	MasterKey         string
 	MasterKeyVersion  string
 	OutputBucket      string
@@ -106,6 +155,8 @@ type Provider struct {
 	ArkVideo          ArkVideo
 	ArkText           ArkText
 	OpenAIImage       OpenAIImage
+	VolcengineASR     VolcengineASR
+	VolcengineSpeech  VolcengineSpeech
 }
 
 type ArkImage struct {
@@ -130,6 +181,27 @@ type OpenAIImage struct {
 	APIKey  string
 	Model   string
 	BaseURL string
+}
+
+// VolcengineASR is the local-only preconfiguration for the recording-file
+// recognition capability. The actual audio.transcribe execution adapter is
+// introduced with the Creative Phase 2 runtime, so keeping this separate from
+// Ark text/video prevents one credential from being used for the wrong API.
+type VolcengineASR struct {
+	Endpoint    string
+	AuthMode    string
+	AppID       string
+	AccessToken string
+	APIKey      string
+	ResourceID  string
+	Model       string
+}
+
+type VolcengineSpeech struct {
+	Endpoint     string
+	APIKey       string
+	ResourceID   string
+	DefaultVoice string
 }
 
 // MySQL contains only connection-pool configuration. No business module owns
@@ -188,6 +260,9 @@ func parseDotEnv(reader io.Reader) (map[string]string, error) {
 	for scanner.Scan() {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
+		if lineNumber == 1 {
+			line = strings.TrimPrefix(line, "\uFEFF")
+		}
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -227,7 +302,23 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	strategyCreativeTaskPlanningEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_STRATEGY_CREATIVE_TASK_PLANNING_ENABLED",
+		environment == EnvironmentLocal || environment == EnvironmentTest,
+	)
+	if err != nil {
+		return Config{}, err
+	}
 	strategyCriticEnabled, err := strictBoolValueOr(lookup, "COOKIES_STRATEGY_CRITIC_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	strategyContextSelectionEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_STRATEGY_CONTEXT_SELECTION_ENABLED",
+		environment == EnvironmentLocal || environment == EnvironmentTest,
+	)
 	if err != nil {
 		return Config{}, err
 	}
@@ -242,6 +333,66 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 	strategyV2Enabled, err := strictBoolValueOr(lookup, "COOKIES_STRATEGY_V2_ENABLED", true)
 	if err != nil {
 		return Config{}, err
+	}
+	strategyQuickViralRemakeEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_STRATEGY_QUICK_VIRAL_REMAKE_ENABLED",
+		environment != EnvironmentProduction,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	gamePrerollModelPlannerEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_CREATIVE_GAME_PREROLL_MODEL_PLANNER_ENABLED",
+		true,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	shortDramaModelPlannerEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_CREATIVE_SHORT_DRAMA_MODEL_PLANNER_ENABLED",
+		true,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	brandFilmModelPlannerEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_CREATIVE_BRAND_FILM_MODEL_PLANNER_ENABLED",
+		true,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	directionPlanningEnabled, err := strictBoolValueOr(
+		lookup,
+		"COOKIES_CREATIVE_DIRECTION_PLANNING_ENABLED",
+		false,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	researchSeedEnabled, err := strictBoolValueOr(lookup, "COOKIES_RESEARCH_SEED_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	researchTikaEnabled, err := strictBoolValueOr(lookup, "COOKIES_RESEARCH_TIKA_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	generatePromptDefault := "strategy.generate.v2"
+	conversationPromptDefault := "strategy.conversation.v3"
+	revisePromptDefault := "strategy.revise.v2"
+	reviewPromptDefault := "strategy.review.deep.v1"
+	repairPromptDefault := "strategy.repair.v1"
+	if environment == EnvironmentLocal || environment == EnvironmentTest {
+		generatePromptDefault = "strategy.generate.v4"
+		conversationPromptDefault = "strategy.conversation.v6"
+		revisePromptDefault = "strategy.revise.v3"
+		reviewPromptDefault = "strategy.review.deep.v2"
+		repairPromptDefault = "strategy.repair.v2"
 	}
 	config := Config{
 		Environment: environment,
@@ -274,21 +425,61 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			FFprobePath:   valueOr(lookup, "COOKIES_FFPROBE_PATH", ""),
 			VideoWorkRoot: valueOr(lookup, "COOKIES_VIDEO_WORK_ROOT", ".data/video-work"),
 		},
+		Creative: Creative{
+			DirectionPlanningEnabled:       directionPlanningEnabled,
+			DirectionPlannerModelAlias:     valueOr(lookup, "COOKIES_CREATIVE_DIRECTION_PLANNER_MODEL_ALIAS", "cookies.text.standard"),
+			ImageFontPath:                  valueOr(lookup, "COOKIES_CREATIVE_IMAGE_FONT_PATH", ""),
+			ImageFontSHA256:                strings.ToLower(strings.TrimSpace(valueOr(lookup, "COOKIES_CREATIVE_IMAGE_FONT_SHA256", ""))),
+			ShortDramaModelPlannerEnabled:  shortDramaModelPlannerEnabled,
+			ShortDramaPlannerModelAlias:    valueOr(lookup, "COOKIES_CREATIVE_SHORT_DRAMA_PLANNER_MODEL_ALIAS", "cookies.text.standard"),
+			GamePrerollModelPlannerEnabled: gamePrerollModelPlannerEnabled,
+			GamePrerollPlannerModelAlias:   valueOr(lookup, "COOKIES_CREATIVE_GAME_PREROLL_PLANNER_MODEL_ALIAS", "cookies.text.standard"),
+			BrandFilmModelPlannerEnabled:   brandFilmModelPlannerEnabled,
+			BrandFilmPlannerModelAlias:     valueOr(lookup, "COOKIES_CREATIVE_BRAND_FILM_PLANNER_MODEL_ALIAS", "cookies.text.standard"),
+			AINativeMaxActiveUnits:         intValueOr(lookup, "COOKIES_AI_AD_MAX_ACTIVE_UNITS", 2),
+		},
 		Strategy: Strategy{
-			Enabled:                  strategyEnabled,
-			V2Enabled:                strategyV2Enabled,
-			RealProviderEnabled:      strategyRealProviderEnabled,
-			ApproveEnabled:           strategyApproveEnabled,
-			PackageToCreativeEnabled: strategyPackageToCreativeEnabled,
-			TextModelAlias:           valueOr(lookup, "COOKIES_STRATEGY_TEXT_MODEL_ALIAS", "cookies.text.standard"),
-			PromptVersion:            valueOr(lookup, "COOKIES_STRATEGY_PROMPT_VERSION", "strategy.generate.v2"),
-			CriticEnabled:            strategyCriticEnabled,
-			OrganizationAllowlist:    splitCSV(valueOr(lookup, "COOKIES_STRATEGY_ORGANIZATION_ALLOWLIST", "")),
+			Enabled:                     strategyEnabled,
+			V2Enabled:                   strategyV2Enabled,
+			RealProviderEnabled:         strategyRealProviderEnabled,
+			ApproveEnabled:              strategyApproveEnabled,
+			PackageToCreativeEnabled:    strategyPackageToCreativeEnabled,
+			CreativeTaskPlanningEnabled: strategyCreativeTaskPlanningEnabled,
+			QuickViralRemakeEnabled:     strategyQuickViralRemakeEnabled,
+			TextModelAlias:              valueOr(lookup, "COOKIES_STRATEGY_TEXT_MODEL_ALIAS", "cookies.text.standard"),
+			DeepReviewModelAlias:        valueOr(lookup, "COOKIES_STRATEGY_DEEP_REVIEW_MODEL_ALIAS", "cookies.text.deep_review"),
+			PromptVersion:               valueOr(lookup, "COOKIES_STRATEGY_PROMPT_VERSION", generatePromptDefault),
+			ConversationPromptVersion:   valueOr(lookup, "COOKIES_STRATEGY_CONVERSATION_PROMPT_VERSION", conversationPromptDefault),
+			RevisePromptVersion:         valueOr(lookup, "COOKIES_STRATEGY_REVISE_PROMPT_VERSION", revisePromptDefault),
+			ReviewPromptVersion:         valueOr(lookup, "COOKIES_STRATEGY_REVIEW_PROMPT_VERSION", reviewPromptDefault),
+			RepairPromptVersion:         valueOr(lookup, "COOKIES_STRATEGY_REPAIR_PROMPT_VERSION", repairPromptDefault),
+			CreativeTaskPromptVersion:   valueOr(lookup, "COOKIES_STRATEGY_CREATIVE_TASK_PROMPT_VERSION", "strategy.creative_task.generate.v2"),
+			CriticEnabled:               strategyCriticEnabled,
+			ContextSelectionEnabled:     strategyContextSelectionEnabled,
+			OrganizationAllowlist:       splitCSV(valueOr(lookup, "COOKIES_STRATEGY_ORGANIZATION_ALLOWLIST", "")),
+		},
+		Research: Research{
+			SeedEnabled:        researchSeedEnabled,
+			SeedModelAlias:     valueOr(lookup, "COOKIES_RESEARCH_SEED_MODEL_ALIAS", "cookies.research.web.standard"),
+			MaxConcurrent:      intValueOr(lookup, "COOKIES_RESEARCH_MAX_CONCURRENT", 3),
+			TikaEnabled:        researchTikaEnabled,
+			TikaBaseURL:        valueOr(lookup, "COOKIES_RESEARCH_TIKA_BASE_URL", "http://127.0.0.1:9998"),
+			TikaVersion:        valueOr(lookup, "COOKIES_RESEARCH_TIKA_VERSION", "3.2.3.0"),
+			TikaTimeoutSeconds: intValueOr(lookup, "COOKIES_RESEARCH_TIKA_TIMEOUT_SECONDS", 120),
+			TikaMaxOutputBytes: intValueOr(lookup, "COOKIES_RESEARCH_TIKA_MAX_OUTPUT_BYTES", 20*1024*1024),
+			MCPStdioCommand:    strings.TrimSpace(valueOr(lookup, "COOKIES_RESEARCH_MCP_STDIO_COMMAND", "")),
+			MCPToolName:        valueOr(lookup, "COOKIES_RESEARCH_MCP_TOOL_NAME", "research"),
+			MCPProtocolVersion: valueOr(lookup, "COOKIES_RESEARCH_MCP_PROTOCOL_VERSION", "2025-11-25"),
+			MCPEnvAllowlist:    splitCSV(valueOr(lookup, "COOKIES_RESEARCH_MCP_ENV_ALLOWLIST", "PATH,PATHEXT,SystemRoot,TEMP,TMP,ComSpec")),
+			TimeoutSeconds:     intValueOr(lookup, "COOKIES_RESEARCH_TIMEOUT_SECONDS", 120),
+			MaxOutputBytes:     intValueOr(lookup, "COOKIES_RESEARCH_MAX_OUTPUT_BYTES", 4*1024*1024),
 		},
 		Provider: Provider{
 			ImageAdapter:      valueOr(lookup, "COOKIES_PROVIDER_IMAGE_ADAPTER", "fake"),
 			VideoAdapter:      valueOr(lookup, "COOKIES_PROVIDER_VIDEO_ADAPTER", "fake"),
 			TextAdapter:       valueOr(lookup, "COOKIES_PROVIDER_TEXT_ADAPTER", "fake"),
+			AudioAdapter:      valueOr(lookup, "COOKIES_PROVIDER_AUDIO_ADAPTER", "fake"),
+			SpeechAdapter:     valueOr(lookup, "COOKIES_PROVIDER_SPEECH_ADAPTER", "fake"),
 			MasterKey:         valueOr(lookup, "COOKIES_PROVIDER_MASTER_KEY", ""),
 			MasterKeyVersion:  valueOr(lookup, "COOKIES_PROVIDER_MASTER_KEY_VERSION", "v1"),
 			OutputBucket:      valueOr(lookup, "COOKIES_PROVIDER_OUTPUT_BUCKET", "cookies-provider-output"),
@@ -313,7 +504,27 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 				Model:   valueOr(lookup, "COOKIES_OPENAI_IMAGE_MODEL", ""),
 				BaseURL: valueOr(lookup, "COOKIES_OPENAI_IMAGE_BASE_URL", ""),
 			},
+			VolcengineASR: VolcengineASR{
+				Endpoint:    valueOr(lookup, "COOKIES_VOLCENGINE_ASR_ENDPOINT", "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"),
+				AuthMode:    valueOr(lookup, "COOKIES_VOLCENGINE_ASR_AUTH_MODE", "legacy"),
+				AppID:       valueOr(lookup, "COOKIES_VOLCENGINE_ASR_APP_ID", ""),
+				AccessToken: valueOr(lookup, "COOKIES_VOLCENGINE_ASR_ACCESS_TOKEN", ""),
+				APIKey:      valueOr(lookup, "COOKIES_VOLCENGINE_ASR_API_KEY", ""),
+				ResourceID:  valueOr(lookup, "COOKIES_VOLCENGINE_ASR_RESOURCE_ID", "volc.bigasr.auc_turbo"),
+				Model:       valueOr(lookup, "COOKIES_VOLCENGINE_ASR_MODEL", "bigmodel"),
+			},
+			VolcengineSpeech: VolcengineSpeech{
+				Endpoint:     valueOr(lookup, "COOKIES_VOLCENGINE_SPEECH_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional"),
+				APIKey:       valueOr(lookup, "COOKIES_VOLCENGINE_SPEECH_API_KEY", ""),
+				ResourceID:   valueOr(lookup, "COOKIES_VOLCENGINE_SPEECH_RESOURCE_ID", "seed-tts-2.0"),
+				DefaultVoice: valueOr(lookup, "COOKIES_VOLCENGINE_SPEECH_DEFAULT_VOICE", ""),
+			},
 		},
+	}
+	if raw := strings.TrimSpace(valueOr(lookup, "COOKIES_RESEARCH_MCP_STDIO_ARGS_JSON", "")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &config.Research.MCPStdioArgs); err != nil {
+			return Config{}, fmt.Errorf("COOKIES_RESEARCH_MCP_STDIO_ARGS_JSON must be a JSON string array: %w", err)
+		}
 	}
 
 	identityValues := map[string]string{
@@ -383,14 +594,63 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Media.VideoWorkRoot) == "" {
 		return fmt.Errorf("COOKIES_VIDEO_WORK_ROOT must not be empty")
 	}
+	if strings.TrimSpace(c.Creative.ShortDramaPlannerModelAlias) == "" {
+		return fmt.Errorf("COOKIES_CREATIVE_SHORT_DRAMA_PLANNER_MODEL_ALIAS must not be empty")
+	}
+	if strings.TrimSpace(c.Creative.GamePrerollPlannerModelAlias) == "" {
+		return fmt.Errorf("COOKIES_CREATIVE_GAME_PREROLL_PLANNER_MODEL_ALIAS must not be empty")
+	}
+	if strings.TrimSpace(c.Creative.BrandFilmPlannerModelAlias) == "" {
+		return fmt.Errorf("Creative brand film planner model alias is required")
+	}
+	if c.Creative.AINativeMaxActiveUnits < 1 || c.Creative.AINativeMaxActiveUnits > 10 {
+		return fmt.Errorf("COOKIES_AI_AD_MAX_ACTIVE_UNITS must be between 1 and 10")
+	}
+	if c.Research.TimeoutSeconds < 1 || c.Research.TimeoutSeconds > 600 {
+		return fmt.Errorf("COOKIES_RESEARCH_TIMEOUT_SECONDS must be between 1 and 600")
+	}
+	if c.Research.MaxOutputBytes < 1024 || c.Research.MaxOutputBytes > 16*1024*1024 {
+		return fmt.Errorf("COOKIES_RESEARCH_MAX_OUTPUT_BYTES must be between 1024 and 16777216")
+	}
+	if strings.TrimSpace(c.Research.SeedModelAlias) == "" {
+		return fmt.Errorf("COOKIES_RESEARCH_SEED_MODEL_ALIAS must not be empty")
+	}
+	if c.Research.MaxConcurrent < 1 || c.Research.MaxConcurrent > 4 {
+		return fmt.Errorf("COOKIES_RESEARCH_MAX_CONCURRENT must be between 1 and 4")
+	}
+	if c.Research.TikaTimeoutSeconds < 1 || c.Research.TikaTimeoutSeconds > 600 {
+		return fmt.Errorf("COOKIES_RESEARCH_TIKA_TIMEOUT_SECONDS must be between 1 and 600")
+	}
+	if c.Research.TikaMaxOutputBytes < 1024 || c.Research.TikaMaxOutputBytes > 32*1024*1024 {
+		return fmt.Errorf("COOKIES_RESEARCH_TIKA_MAX_OUTPUT_BYTES must be between 1024 and 33554432")
+	}
+	if c.Research.TikaEnabled {
+		tikaURL, err := url.Parse(strings.TrimSpace(c.Research.TikaBaseURL))
+		if err != nil || (tikaURL.Scheme != "http" && tikaURL.Scheme != "https") || tikaURL.Host == "" {
+			return fmt.Errorf("COOKIES_RESEARCH_TIKA_BASE_URL must be an absolute HTTP(S) URL")
+		}
+		if strings.TrimSpace(c.Research.TikaVersion) == "" {
+			return fmt.Errorf("COOKIES_RESEARCH_TIKA_VERSION must not be empty")
+		}
+	}
+	if c.Research.MCPStdioCommand != "" &&
+		(strings.TrimSpace(c.Research.MCPToolName) == "" || strings.TrimSpace(c.Research.MCPProtocolVersion) == "") {
+		return fmt.Errorf("MCP stdio research requires a tool name and protocol version")
+	}
 	if c.Provider.ImageAdapter != "fake" && c.Provider.ImageAdapter != "ark_image" && c.Provider.ImageAdapter != "openai_image" && c.Provider.ImageAdapter != "adapter_gateway" {
 		return fmt.Errorf("COOKIES_PROVIDER_IMAGE_ADAPTER must be fake, ark_image, openai_image, or adapter_gateway")
 	}
 	if c.Provider.TextAdapter != "fake" && c.Provider.TextAdapter != "adapter_gateway" && c.Provider.TextAdapter != "ark_text" {
 		return fmt.Errorf("COOKIES_PROVIDER_TEXT_ADAPTER must be fake, adapter_gateway, or ark_text")
 	}
-	if c.Provider.VideoAdapter != "fake" && c.Provider.VideoAdapter != "ark_video" {
-		return fmt.Errorf("COOKIES_PROVIDER_VIDEO_ADAPTER must be fake or ark_video")
+	if c.Provider.VideoAdapter != "fake" && c.Provider.VideoAdapter != "adapter_gateway" && c.Provider.VideoAdapter != "ark_video" {
+		return fmt.Errorf("COOKIES_PROVIDER_VIDEO_ADAPTER must be fake, adapter_gateway, or ark_video")
+	}
+	if c.Provider.AudioAdapter != "fake" && c.Provider.AudioAdapter != "volcengine_asr" {
+		return fmt.Errorf("COOKIES_PROVIDER_AUDIO_ADAPTER must be fake or volcengine_asr")
+	}
+	if c.Provider.SpeechAdapter != "fake" && c.Provider.SpeechAdapter != "volcengine_speech" && c.Provider.SpeechAdapter != "minimax_speech" {
+		return fmt.Errorf("COOKIES_PROVIDER_SPEECH_ADAPTER must be fake, volcengine_speech, or minimax_speech")
 	}
 	if c.Strategy.RealProviderEnabled && c.Provider.TextAdapter != "adapter_gateway" && c.Provider.TextAdapter != "ark_text" {
 		return fmt.Errorf("COOKIES_STRATEGY_REAL_PROVIDER_ENABLED requires a real text adapter")
@@ -398,8 +658,41 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Strategy.TextModelAlias) == "" {
 		return fmt.Errorf("COOKIES_STRATEGY_TEXT_MODEL_ALIAS must not be empty")
 	}
+	if strings.TrimSpace(c.Strategy.DeepReviewModelAlias) == "" {
+		return fmt.Errorf("COOKIES_STRATEGY_DEEP_REVIEW_MODEL_ALIAS must not be empty")
+	}
 	if strings.TrimSpace(c.Strategy.PromptVersion) == "" {
 		return fmt.Errorf("COOKIES_STRATEGY_PROMPT_VERSION must not be empty")
+	}
+	if !oneOf(c.Strategy.PromptVersion, "strategy.generate.v2", "strategy.generate.v3", "strategy.generate.v4") {
+		return fmt.Errorf("COOKIES_STRATEGY_PROMPT_VERSION is unsupported")
+	}
+	if strings.TrimSpace(c.Strategy.ConversationPromptVersion) == "" {
+		return fmt.Errorf("COOKIES_STRATEGY_CONVERSATION_PROMPT_VERSION must not be empty")
+	}
+	if !oneOf(c.Strategy.ConversationPromptVersion, "strategy.conversation.v3", "strategy.conversation.v4", "strategy.conversation.v5", "strategy.conversation.v6") {
+		return fmt.Errorf("COOKIES_STRATEGY_CONVERSATION_PROMPT_VERSION is unsupported")
+	}
+	if strings.TrimSpace(c.Strategy.RevisePromptVersion) == "" {
+		return fmt.Errorf("COOKIES_STRATEGY_REVISE_PROMPT_VERSION must not be empty")
+	}
+	if !oneOf(c.Strategy.RevisePromptVersion, "strategy.revise.v2", "strategy.revise.v3") {
+		return fmt.Errorf("COOKIES_STRATEGY_REVISE_PROMPT_VERSION is unsupported")
+	}
+	if strings.TrimSpace(c.Strategy.ReviewPromptVersion) == "" {
+		return fmt.Errorf("COOKIES_STRATEGY_REVIEW_PROMPT_VERSION must not be empty")
+	}
+	if !oneOf(c.Strategy.ReviewPromptVersion, "strategy.review.deep.v1", "strategy.review.deep.v2") {
+		return fmt.Errorf("COOKIES_STRATEGY_REVIEW_PROMPT_VERSION is unsupported")
+	}
+	if strings.TrimSpace(c.Strategy.RepairPromptVersion) == "" {
+		return fmt.Errorf("COOKIES_STRATEGY_REPAIR_PROMPT_VERSION must not be empty")
+	}
+	if !oneOf(c.Strategy.RepairPromptVersion, "strategy.repair.v1", "strategy.repair.v2") {
+		return fmt.Errorf("COOKIES_STRATEGY_REPAIR_PROMPT_VERSION is unsupported")
+	}
+	if c.Strategy.CreativeTaskPromptVersion != "strategy.creative_task.generate.v2" {
+		return fmt.Errorf("COOKIES_STRATEGY_CREATIVE_TASK_PROMPT_VERSION is unsupported")
 	}
 	if c.Strategy.CriticEnabled && !c.Strategy.RealProviderEnabled {
 		return fmt.Errorf("COOKIES_STRATEGY_CRITIC_ENABLED requires COOKIES_STRATEGY_REAL_PROVIDER_ENABLED=true")
@@ -416,7 +709,45 @@ func (c Config) Validate() error {
 	if c.Provider.TextAdapter == "ark_text" && (c.Environment != EnvironmentLocal || strings.TrimSpace(c.Provider.ArkText.APIKey) == "" || strings.TrimSpace(c.Provider.ArkText.Model) == "") {
 		return fmt.Errorf("ark_text is local-only and requires COOKIES_ARK_TEXT_API_KEY and COOKIES_ARK_TEXT_MODEL")
 	}
-	usesCredentialBroker := c.Provider.ImageAdapter == "adapter_gateway" || c.Provider.TextAdapter == "adapter_gateway" || c.Provider.VideoAdapter == "ark_video"
+	if c.Provider.AudioAdapter == "volcengine_asr" {
+		if c.Environment != EnvironmentLocal {
+			return fmt.Errorf("volcengine_asr is local-only until the audio.transcribe runtime is introduced")
+		}
+		endpoint, err := url.Parse(c.Provider.VolcengineASR.Endpoint)
+		if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
+			return fmt.Errorf("COOKIES_VOLCENGINE_ASR_ENDPOINT must be an absolute HTTPS URL")
+		}
+		if strings.TrimSpace(c.Provider.VolcengineASR.ResourceID) == "" || strings.TrimSpace(c.Provider.VolcengineASR.Model) == "" {
+			return fmt.Errorf("volcengine_asr requires resource ID and model")
+		}
+		switch c.Provider.VolcengineASR.AuthMode {
+		case "legacy":
+			if strings.TrimSpace(c.Provider.VolcengineASR.AppID) == "" || strings.TrimSpace(c.Provider.VolcengineASR.AccessToken) == "" {
+				return fmt.Errorf("legacy volcengine_asr requires COOKIES_VOLCENGINE_ASR_APP_ID and COOKIES_VOLCENGINE_ASR_ACCESS_TOKEN")
+			}
+		case "api_key":
+			if strings.TrimSpace(c.Provider.VolcengineASR.APIKey) == "" {
+				return fmt.Errorf("api_key volcengine_asr requires COOKIES_VOLCENGINE_ASR_API_KEY")
+			}
+		default:
+			return fmt.Errorf("COOKIES_VOLCENGINE_ASR_AUTH_MODE must be legacy or api_key")
+		}
+	}
+	if c.Provider.SpeechAdapter == "volcengine_speech" {
+		endpoint, err := url.Parse(c.Provider.VolcengineSpeech.Endpoint)
+		if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
+			return fmt.Errorf("COOKIES_VOLCENGINE_SPEECH_ENDPOINT must be an absolute HTTPS URL")
+		}
+		if strings.TrimSpace(c.Provider.VolcengineSpeech.APIKey) == "" || strings.TrimSpace(c.Provider.VolcengineSpeech.ResourceID) == "" || strings.TrimSpace(c.Provider.VolcengineSpeech.DefaultVoice) == "" {
+			return fmt.Errorf("volcengine_speech requires API key, resource ID and default voice")
+		}
+	}
+	usesGenerationBroker := c.Provider.ImageAdapter == "adapter_gateway" ||
+		c.Provider.TextAdapter == "adapter_gateway" ||
+		c.Provider.VideoAdapter == "adapter_gateway" ||
+		c.Provider.VideoAdapter == "ark_video" ||
+		c.Provider.SpeechAdapter == "minimax_speech"
+	usesCredentialBroker := usesGenerationBroker || c.Research.SeedEnabled
 	if usesCredentialBroker && (strings.TrimSpace(c.Provider.MasterKey) == "" || strings.TrimSpace(c.Provider.MasterKeyVersion) == "") {
 		return fmt.Errorf("configured Provider adapter requires COOKIES_PROVIDER_MASTER_KEY and COOKIES_PROVIDER_MASTER_KEY_VERSION")
 	}
@@ -425,7 +756,10 @@ func (c Config) Validate() error {
 		if err != nil || len(key) != 32 {
 			return fmt.Errorf("COOKIES_PROVIDER_MASTER_KEY must be base64-encoded 32 bytes")
 		}
-		if strings.TrimSpace(c.Provider.OutputBucket) == "" || c.Provider.OutputBucket == c.ObjectStorage.AssetsBucket || c.Provider.OutputBucket == c.ObjectStorage.QuarantineBucket {
+		if usesGenerationBroker &&
+			(strings.TrimSpace(c.Provider.OutputBucket) == "" ||
+				c.Provider.OutputBucket == c.ObjectStorage.AssetsBucket ||
+				c.Provider.OutputBucket == c.ObjectStorage.QuarantineBucket) {
 			return fmt.Errorf("adapter_gateway requires a distinct COOKIES_PROVIDER_OUTPUT_BUCKET")
 		}
 		if c.Provider.AllowInsecureHTTP && c.Environment != EnvironmentLocal {
@@ -452,6 +786,15 @@ func (c Config) Validate() error {
 		return fmt.Errorf("local identity requires organization, principal kind, principal ID, and project ID")
 	}
 	return nil
+}
+
+func oneOf(value string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if strings.TrimSpace(value) == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func valueOr(lookup func(string) (string, bool), key, fallback string) string {

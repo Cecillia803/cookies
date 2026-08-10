@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/shikanon/cookies/internal/platform/contract"
@@ -45,6 +46,15 @@ func (s Service) submitVideoJob(ctx context.Context, record JobRecord) (contract
 	if s.VideoAdapter == nil {
 		return contract.ProviderJob{}, nil, fmt.Errorf("video provider adapter is required")
 	}
+	sources, err := s.resolveVideoSources(ctx, record)
+	if err != nil {
+		return record.Job, nil, err
+	}
+	for _, source := range sources {
+		if source.Content != nil {
+			defer source.Content.Close()
+		}
+	}
 	submission, err := s.VideoAdapter.Submit(ctx, VideoGenerationRequest{
 		OrganizationID: record.Job.OrganizationID,
 		ProjectID:      record.Job.ProjectID,
@@ -52,6 +62,7 @@ func (s Service) submitVideoJob(ctx context.Context, record JobRecord) (contract
 		ModelAlias:     record.ModelAlias,
 		IdempotencyKey: record.IdempotencyKey,
 		Input:          record.VideoInput,
+		Sources:        sources,
 		Route:          record.Route,
 	})
 	if err != nil {
@@ -73,6 +84,80 @@ func (s Service) submitVideoJob(ctx context.Context, record JobRecord) (contract
 		return contract.ProviderJob{}, nil, err
 	}
 	return updated.Job, deferAt(now), nil
+}
+
+func (s Service) resolveVideoSources(ctx context.Context, record JobRecord) ([]VideoSource, error) {
+	if len(record.VideoInput.ConditioningAssets) == 0 {
+		return nil, nil
+	}
+	needsLocalResolution := false
+	for _, asset := range record.VideoInput.ConditioningAssets {
+		if asset.AuthorizedAsset == nil {
+			needsLocalResolution = true
+			break
+		}
+	}
+	if needsLocalResolution && s.VisionSources == nil {
+		return nil, fmt.Errorf("video source resolver is required")
+	}
+	projectContext := contract.ProjectContext{
+		OrganizationID:        record.Job.OrganizationID,
+		ProjectID:             record.Job.ProjectID,
+		ProjectContextVersion: record.ProjectContextVersion,
+	}
+	actor := contract.ActorContext{
+		OrganizationID: record.Job.OrganizationID,
+		Principal:      record.Principal,
+		Scopes:         []contract.Scope{},
+	}
+	sources := make([]VideoSource, 0, len(record.VideoInput.ConditioningAssets))
+	for index, asset := range record.VideoInput.ConditioningAssets {
+		if asset.AuthorizedAsset != nil {
+			reference := *asset.AuthorizedAsset
+			sources = append(sources, VideoSource{Role: asset.Role, Reference: asset.Reference, AuthorizedAsset: &reference})
+			continue
+		}
+		requested := []contract.ProjectAssetRef{asset.Reference}
+		resolved, err := s.VisionSources.ResolveVisionSources(ctx, actor, projectContext, requested)
+		if err != nil {
+			closeVideoSources(sources)
+			return nil, err
+		}
+		if err := validateVisionSources(requested, resolved); err != nil {
+			closeVideoSources(sources)
+			for _, source := range resolved {
+				if source.Content != nil {
+					_ = source.Content.Close()
+				}
+			}
+			return nil, err
+		}
+		source := resolved[0]
+		if !isImageMIMEType(source.MIMEType) {
+			closeVideoSources(sources)
+			_ = source.Content.Close()
+			return nil, fmt.Errorf("video conditioning source at index %d is not an image", index)
+		}
+		sources = append(sources, VideoSource{
+			Role:      asset.Role,
+			Reference: source.Reference,
+			MIMEType:  source.MIMEType,
+			Content:   source.Content,
+		})
+	}
+	return sources, nil
+}
+
+func closeVideoSources(sources []VideoSource) {
+	for _, source := range sources {
+		if source.Content != nil {
+			_ = source.Content.Close()
+		}
+	}
+}
+
+func isImageMIMEType(value string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "image/")
 }
 
 func (s Service) pollVideoJob(ctx context.Context, record JobRecord) (contract.ProviderJob, *time.Time, error) {

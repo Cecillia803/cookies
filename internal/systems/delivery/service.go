@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,10 +22,20 @@ const (
 )
 
 var (
-	ErrNotFound        = errors.New("delivery resource not found")
-	ErrInvalidRequest  = errors.New("delivery request is invalid")
-	ErrInvalidState    = errors.New("delivery resource is not in a state that allows this action")
-	ErrVersionConflict = errors.New("delivery resource version conflict")
+	ErrNotFound                         = errors.New("delivery resource not found")
+	ErrInvalidRequest                   = errors.New("delivery request is invalid")
+	ErrInvalidState                     = errors.New("delivery resource is not in a state that allows this action")
+	ErrVersionConflict                  = errors.New("delivery resource version conflict")
+	ErrPlanVersionConflict              = errors.New("delivery plan version conflict")
+	ErrStalePlanVersion                 = errors.New("delivery change set references a stale plan version")
+	ErrApprovalRequired                 = errors.New("delivery approval is required")
+	ErrApprovalExpired                  = errors.New("delivery approval has expired")
+	ErrApprovalContentMismatch          = errors.New("delivery approval content does not match")
+	ErrApprovalScopeExceeded            = errors.New("delivery approval scope or budget was exceeded")
+	ErrIdempotencyConflict              = errors.New("delivery idempotency key was reused with a different request")
+	ErrUnsupportedConfigurationWorkflow = errors.New("delivery repository does not support the configuration workflow")
+	ErrUnsupportedTour                  = errors.New("delivery repository does not support delivery tours")
+	ErrTourOwnerMismatch                = errors.New("delivery tour belongs to another owner")
 )
 
 type DeliveryPlanStatus string
@@ -46,22 +57,31 @@ const (
 const ExecutionModeLocalSimulation = "local_simulation"
 
 const (
-	DemoMetricDatasetVersion = "preroll-demo/v1"
-	MetricSourceDemoFixture  = "demo_fixture"
+	DemoMetricDatasetVersion = "post-launch-simulator/v1"
+	MetricSourceDemoFixture  = "post_launch_simulator"
 )
 
+// CreatePlanRequest accepts the #21 package-oriented fields and the mock
+// lifecycle draft fields. A request using PlanDraft is always explicitly mock.
 type CreatePlanRequest struct {
-	CreativePackageID string    `json:"creative_package_id"`
-	Name              string    `json:"name"`
-	Objective         string    `json:"objective"`
-	BudgetCents       int64     `json:"budget_cents"`
-	StartAt           time.Time `json:"start_at"`
-	EndAt             time.Time `json:"end_at"`
+	CreativePackageID string    `json:"creative_package_id,omitempty"`
+	BudgetCents       int64     `json:"budget_cents,omitempty"`
+	StartAt           time.Time `json:"start_at,omitempty"`
+	EndAt             time.Time `json:"end_at,omitempty"`
+	PlanDraft
+}
+
+func (r CreatePlanRequest) usesLifecycleDraft() bool {
+	return r.PlanDraft.Advertiser.ID != "" || r.PlanDraft.Schedule.Timezone != "" ||
+		r.PlanDraft.Budget.Currency != "" || len(r.PlanDraft.CreativeReferences) > 0
 }
 
 func (r CreatePlanRequest) Validate() error {
+	if r.usesLifecycleDraft() {
+		return r.PlanDraft.Validate()
+	}
 	if strings.TrimSpace(r.CreativePackageID) == "" || strings.TrimSpace(r.Name) == "" ||
-		strings.TrimSpace(r.Objective) == "" || r.BudgetCents <= 0 || r.StartAt.IsZero() ||
+		strings.TrimSpace(r.Objective) == "" || r.BudgetCents < 0 || r.StartAt.IsZero() ||
 		r.EndAt.IsZero() || !r.EndAt.After(r.StartAt) {
 		return ErrInvalidRequest
 	}
@@ -77,52 +97,168 @@ type CreativePackageSnapshot struct {
 	ContentHash       string `json:"content_hash"`
 }
 
+// DeliveryPlan remains the #21 current projection and also exposes the
+// immutable lifecycle snapshots needed by the plan editor.
 type DeliveryPlan struct {
-	ID                  string                  `json:"id"`
-	OrganizationID      contract.OrganizationID `json:"organization_id"`
-	ProjectID           contract.ProjectID      `json:"project_id"`
-	CreativePackageID   string                  `json:"creative_package_id"`
-	CreativePackageHash string                  `json:"creative_package_hash"`
-	CreativeVersionID   string                  `json:"creative_version_id"`
-	Name                string                  `json:"name"`
-	Objective           string                  `json:"objective"`
-	BudgetCents         int64                   `json:"budget_cents"`
-	StartAt             time.Time               `json:"start_at"`
-	EndAt               time.Time               `json:"end_at"`
-	Status              DeliveryPlanStatus      `json:"status"`
-	Version             int64                   `json:"version"`
-	CreatedBy           string                  `json:"created_by"`
-	CreatedAt           time.Time               `json:"created_at"`
-	UpdatedAt           time.Time               `json:"updated_at"`
+	ID                   string                  `json:"id"`
+	OrganizationID       contract.OrganizationID `json:"organization_id"`
+	ProjectID            contract.ProjectID      `json:"project_id"`
+	CreativePackageID    string                  `json:"creative_package_id"`
+	CreativePackageHash  string                  `json:"creative_package_hash"`
+	CreativeVersionID    string                  `json:"creative_version_id"`
+	Name                 string                  `json:"name"`
+	Objective            string                  `json:"objective"`
+	BudgetCents          int64                   `json:"budget_cents"`
+	StartAt              time.Time               `json:"start_at"`
+	EndAt                time.Time               `json:"end_at"`
+	Status               DeliveryPlanStatus      `json:"status"`
+	Version              int64                   `json:"version"`
+	Platform             string                  `json:"platform"`
+	Source               Source                  `json:"source"`
+	Scenario             Scenario                `json:"scenario"`
+	TourRunID            string                  `json:"tour_run_id,omitempty"`
+	TourOwnerID          string                  `json:"tour_owner_id,omitempty"`
+	TourCase             string                  `json:"tour_case,omitempty"`
+	CurrentVersionNumber int                     `json:"current_version_number"`
+	CurrentVersion       DeliveryPlanVersion     `json:"current_version"`
+	Versions             []DeliveryPlanVersion   `json:"versions"`
+	CreatedBy            string                  `json:"created_by"`
+	CreatedAt            time.Time               `json:"created_at"`
+	UpdatedAt            time.Time               `json:"updated_at"`
 }
 
 type ChangeSet struct {
-	ID             string                  `json:"id"`
-	OrganizationID contract.OrganizationID `json:"organization_id"`
-	ProjectID      contract.ProjectID      `json:"project_id"`
-	PlanID         string                  `json:"plan_id"`
-	PlanVersion    int64                   `json:"plan_version"`
-	Status         ChangeSetStatus         `json:"status"`
-	RiskLevel      string                  `json:"risk_level"`
-	PreflightNotes []string                `json:"preflight_notes"`
-	ApprovedBy     string                  `json:"approved_by,omitempty"`
-	ApprovedAt     *time.Time              `json:"approved_at,omitempty"`
-	Version        int64                   `json:"version"`
-	CreatedBy      string                  `json:"created_by"`
-	CreatedAt      time.Time               `json:"created_at"`
-	UpdatedAt      time.Time               `json:"updated_at"`
+	ID                 string                  `json:"id"`
+	OrganizationID     contract.OrganizationID `json:"organization_id"`
+	ProjectID          contract.ProjectID      `json:"project_id"`
+	PlanID             string                  `json:"plan_id"`
+	PlanName           string                  `json:"plan_name"`
+	PlanVersion        int64                   `json:"plan_version"`
+	PlanCanonicalHash  string                  `json:"plan_canonical_hash"`
+	TargetSnapshot     *ThreeTierConfiguration `json:"target_snapshot,omitempty"`
+	TargetSnapshotHash string                  `json:"target_snapshot_hash,omitempty"`
+	RecommendationID   string                  `json:"recommendation_id,omitempty"`
+	BudgetLimit        Budget                  `json:"budget_limit"`
+	Status             ChangeSetStatus         `json:"status"`
+	RiskLevel          string                  `json:"risk_level"`
+	PreflightNotes     []string                `json:"preflight_notes"`
+	ApprovedBy         string                  `json:"approved_by,omitempty"`
+	ApprovedAt         *time.Time              `json:"approved_at,omitempty"`
+	RejectedBy         string                  `json:"rejected_by,omitempty"`
+	RejectedAt         *time.Time              `json:"rejected_at,omitempty"`
+	RejectionReason    string                  `json:"rejection_reason,omitempty"`
+	Approval           *ApprovalView           `json:"approval,omitempty"`
+	Source             Source                  `json:"source"`
+	Scenario           Scenario                `json:"scenario"`
+	Version            int64                   `json:"version"`
+	CreatedBy          string                  `json:"created_by"`
+	CreatedAt          time.Time               `json:"created_at"`
+	UpdatedAt          time.Time               `json:"updated_at"`
+}
+
+type RejectChangeSetRequest struct {
+	ExpectedVersion int64  `json:"expected_version"`
+	Reason          string `json:"reason"`
+}
+
+func (r RejectChangeSetRequest) Validate() error {
+	if r.ExpectedVersion < 1 || len(strings.TrimSpace(r.Reason)) < 3 || len(strings.TrimSpace(r.Reason)) > 1000 {
+		return ErrInvalidRequest
+	}
+	return nil
+}
+
+type changeSetRejectionRepository interface {
+	RejectChangeSet(context.Context, contract.OrganizationID, contract.ProjectID, string, int64, string, string, time.Time) (ChangeSet, error)
 }
 
 type Execution struct {
-	ID             string                  `json:"id"`
-	OrganizationID contract.OrganizationID `json:"organization_id"`
-	ProjectID      contract.ProjectID      `json:"project_id"`
-	ChangeSetID    string                  `json:"change_set_id"`
-	Status         string                  `json:"status"`
-	Mode           string                  `json:"mode"`
-	ExecutedBy     string                  `json:"executed_by"`
-	StartedAt      time.Time               `json:"started_at"`
-	CompletedAt    time.Time               `json:"completed_at"`
+	ID                     string                  `json:"id"`
+	OrganizationID         contract.OrganizationID `json:"organization_id"`
+	ProjectID              contract.ProjectID      `json:"project_id"`
+	ChangeSetID            string                  `json:"change_set_id"`
+	ApprovalID             string                  `json:"approval_id"`
+	Status                 ExecutionStatus         `json:"status"`
+	Version                int64                   `json:"version"`
+	Mode                   string                  `json:"mode"`
+	Adapter                string                  `json:"adapter"`
+	Source                 Source                  `json:"source"`
+	Scenario               ExecutionScenario       `json:"scenario"`
+	IdempotencyKey         string                  `json:"idempotency_key"`
+	RequestHash            string                  `json:"request_hash"`
+	ExecutedBy             string                  `json:"executed_by"`
+	StartedAt              time.Time               `json:"started_at"`
+	CompletedAt            *time.Time              `json:"completed_at"`
+	RetryAllowed           bool                    `json:"retry_allowed"`
+	RecoveryAction         string                  `json:"recovery_action"`
+	RecoveryReason         string                  `json:"recovery_reason"`
+	CompensationCandidates []string                `json:"compensation_candidates"`
+	Steps                  []ExecutionStep         `json:"steps"`
+}
+
+type ExecutionStatus string
+
+const (
+	ExecutionQueued             ExecutionStatus = "queued"
+	ExecutionValidatingApproval ExecutionStatus = "validating_approval"
+	ExecutionExecuting          ExecutionStatus = "executing"
+	ExecutionVerifying          ExecutionStatus = "verifying"
+	ExecutionSucceeded          ExecutionStatus = "succeeded"
+	ExecutionFailed             ExecutionStatus = "failed"
+	ExecutionPartial            ExecutionStatus = "partial"
+	ExecutionResultUnknown      ExecutionStatus = "result_unknown"
+	ExecutionCancelled          ExecutionStatus = "cancelled"
+)
+
+type StepStatus string
+
+const (
+	StepPending       StepStatus = "pending"
+	StepRunning       StepStatus = "running"
+	StepSucceeded     StepStatus = "succeeded"
+	StepFailed        StepStatus = "failed"
+	StepResultUnknown StepStatus = "result_unknown"
+	StepSkipped       StepStatus = "skipped"
+)
+
+type ExecutionScenario string
+
+const (
+	ExecutionScenarioSuccess       ExecutionScenario = "success"
+	ExecutionScenarioFailed        ExecutionScenario = "failed"
+	ExecutionScenarioPartial       ExecutionScenario = "partial"
+	ExecutionScenarioResultUnknown ExecutionScenario = "result_unknown"
+)
+
+type ExecutionStep struct {
+	ID             string     `json:"id"`
+	Sequence       int        `json:"sequence"`
+	Action         string     `json:"action"`
+	Status         StepStatus `json:"status"`
+	Attempt        int        `json:"attempt"`
+	Effect         string     `json:"effect"`
+	OutcomeSummary string     `json:"outcome_summary"`
+	EvidenceRef    string     `json:"evidence_ref"`
+	StartedAt      *time.Time `json:"started_at"`
+	CompletedAt    *time.Time `json:"completed_at"`
+	Version        int64      `json:"version"`
+}
+
+type ExecuteRequest struct {
+	ExpectedVersion int64             `json:"expected_version"`
+	Scenario        ExecutionScenario `json:"scenario"`
+}
+
+func (r ExecuteRequest) Validate() error {
+	if r.ExpectedVersion < 1 {
+		return ErrInvalidRequest
+	}
+	switch r.Scenario {
+	case ExecutionScenarioSuccess, ExecutionScenarioFailed, ExecutionScenarioPartial, ExecutionScenarioResultUnknown:
+		return nil
+	default:
+		return ErrInvalidRequest
+	}
 }
 
 type Evidence struct {
@@ -133,6 +269,9 @@ type Evidence struct {
 	Summary        string                  `json:"summary"`
 	Mode           string                  `json:"mode"`
 	Reversible     bool                    `json:"reversible"`
+	Source         Source                  `json:"source"`
+	Scenario       ExecutionScenario       `json:"scenario"`
+	References     []string                `json:"references"`
 	CreatedAt      time.Time               `json:"created_at"`
 }
 
@@ -143,29 +282,32 @@ type ExecutionResult struct {
 }
 
 type RawMetrics struct {
-	Impressions int64 `json:"impressions"`
-	Clicks      int64 `json:"clicks"`
-	Conversions int64 `json:"conversions"`
-	SpendCents  int64 `json:"spend_cents"`
+	Impressions  int64 `json:"impressions"`
+	Clicks       int64 `json:"clicks"`
+	Conversions  int64 `json:"conversions"`
+	SpendCents   int64 `json:"spend_cents"`
+	RevenueCents int64 `json:"revenue_cents,omitempty"`
 }
 
-// DeliveryMetricSnapshot is an immutable observation bound to one execution
-// and the exact CreativePackage used by its DeliveryPlan. Demo snapshots are
-// deliberately and permanently labelled as simulated.
 type DeliveryMetricSnapshot struct {
 	ID                string                  `json:"id"`
 	OrganizationID    contract.OrganizationID `json:"organization_id"`
 	ProjectID         contract.ProjectID      `json:"project_id"`
 	ExecutionID       string                  `json:"execution_id"`
+	SimulationRunID   string                  `json:"simulation_run_id,omitempty"`
 	PlanID            string                  `json:"plan_id"`
 	CreativePackageID string                  `json:"creative_package_id"`
 	Source            string                  `json:"source"`
 	IsSimulated       bool                    `json:"is_simulated"`
 	DatasetVersion    string                  `json:"dataset_version"`
+	FixtureVersion    string                  `json:"fixture_version"`
+	WindowSequence    int                     `json:"window_sequence"`
+	DataThrough       time.Time               `json:"data_through"`
 	Currency          string                  `json:"currency"`
 	WindowStart       time.Time               `json:"window_start"`
 	WindowEnd         time.Time               `json:"window_end"`
 	RawMetrics        RawMetrics              `json:"raw_metrics"`
+	CalculationBasis  MetricCalculationBasis  `json:"calculation_basis"`
 	CreatedBy         string                  `json:"created_by"`
 	CreatedAt         time.Time               `json:"created_at"`
 }
@@ -191,34 +333,58 @@ type ActiveProjectResolver interface {
 	RequireActiveContext(context.Context, contract.ActorContext, contract.ProjectID) (contract.ProjectContext, error)
 }
 
-// CreativePackageReader is the only seam from Delivery to Creative.
 type CreativePackageReader interface {
 	ReadCreativePackage(context.Context, contract.ActorContext, contract.ProjectID, string) (CreativePackageSnapshot, error)
 }
 
+type PlanReferenceReader interface {
+	ResolvePlanReferences(context.Context, contract.ActorContext, contract.ProjectID, StrategyReference, []CreativeReference) (StrategyReference, []CreativeReference, error)
+}
+
 type Repository interface {
-	CreatePlan(context.Context, DeliveryPlan) (DeliveryPlan, error)
+	CreatePlan(context.Context, DeliveryPlan, DeliveryPlanVersion) (DeliveryPlan, error)
+	UpdatePlan(context.Context, contract.OrganizationID, contract.ProjectID, string, int, DeliveryPlanVersion) (DeliveryPlan, error)
 	ListPlans(context.Context, contract.OrganizationID, contract.ProjectID, int) ([]DeliveryPlan, error)
 	GetPlan(context.Context, contract.OrganizationID, contract.ProjectID, string) (DeliveryPlan, error)
+	ListPlanVersions(context.Context, contract.OrganizationID, contract.ProjectID, string) ([]DeliveryPlanVersion, error)
+	GetPlanVersion(context.Context, contract.OrganizationID, contract.ProjectID, string, int) (DeliveryPlanVersion, error)
 	CreateChangeSet(context.Context, ChangeSet) (ChangeSet, error)
 	ListChangeSets(context.Context, contract.OrganizationID, contract.ProjectID, int) ([]ChangeSet, error)
 	GetChangeSet(context.Context, contract.OrganizationID, contract.ProjectID, string) (ChangeSet, error)
 	TransitionChangeSet(context.Context, contract.OrganizationID, contract.ProjectID, string, int64, ChangeSetStatus, string, time.Time) (ChangeSet, error)
-	RecordExecution(context.Context, ChangeSet, Execution, Evidence) (ExecutionResult, error)
+	ApproveChangeSet(context.Context, ChangeSet, DeliveryApproval) (ChangeSet, error)
+	GetApproval(context.Context, contract.OrganizationID, contract.ProjectID, string) (DeliveryApproval, error)
+	CreateOrReplayExecution(context.Context, ChangeSet, DeliveryApproval, Execution, Evidence) (ExecutionResult, bool, error)
+	FindExecutionByIdempotency(context.Context, contract.OrganizationID, contract.ProjectID, string) (ExecutionResult, bool, error)
+	AdvanceExecution(context.Context, Execution, ExecutionStatus, *time.Time, string, string, []string) (ExecutionResult, error)
+	AdvanceStep(context.Context, Execution, ExecutionStep, ExecutionStep) (ExecutionStep, error)
 	ListExecutions(context.Context, contract.OrganizationID, contract.ProjectID, int) ([]ExecutionResult, error)
+	GetExecution(context.Context, contract.OrganizationID, contract.ProjectID, string) (ExecutionResult, error)
+	GetExecutionByChangeSet(context.Context, contract.OrganizationID, contract.ProjectID, string) (ExecutionResult, error)
 	CreateMetricSnapshot(context.Context, DeliveryMetricSnapshot) (DeliveryMetricSnapshot, bool, error)
 	ListMetricSnapshots(context.Context, contract.OrganizationID, contract.ProjectID, string, int) ([]DeliveryMetricSnapshot, error)
+	ListProjectMetricSnapshots(context.Context, contract.OrganizationID, contract.ProjectID, int) ([]DeliveryMetricSnapshot, error)
+	UpsertAlert(context.Context, DeliveryAlert) (DeliveryAlert, error)
+	ListAlerts(context.Context, contract.OrganizationID, contract.ProjectID, AlertFilter) ([]DeliveryAlert, error)
+	UpdateAlert(context.Context, contract.OrganizationID, contract.ProjectID, string, AlertAction, int64, string, time.Time) (DeliveryAlert, error)
 }
 
 type Service struct {
 	Repository Repository
 	Projects   ActiveProjectResolver
 	Packages   CreativePackageReader
+	References PlanReferenceReader
+	Adapter    PlatformAdapter
+	Insights   InsightsConsumer
 	NewID      ids.Generator
 	Now        func() time.Time
 }
 
 func (s Service) CreatePlan(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, request CreatePlanRequest) (DeliveryPlan, error) {
+	return s.createPlan(ctx, actor, projectID, request, "", "")
+}
+
+func (s Service) createPlan(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, request CreatePlanRequest, tourRunID, tourCase string) (DeliveryPlan, error) {
 	if err := s.ready(actor, projectID, ScopeWrite); err != nil {
 		return DeliveryPlan{}, err
 	}
@@ -228,22 +394,146 @@ func (s Service) CreatePlan(ctx context.Context, actor contract.ActorContext, pr
 	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
 		return DeliveryPlan{}, err
 	}
-	pkg, err := s.Packages.ReadCreativePackage(ctx, actor, projectID, request.CreativePackageID)
-	if err != nil {
-		return DeliveryPlan{}, err
+	tourOwnerID := ""
+	if tourRunID == "" && tourCase != "" || tourRunID != "" && tourCase == "" {
+		return DeliveryPlan{}, ErrInvalidRequest
+	}
+	if tourRunID != "" {
+		tourOwnerID = actor.Principal.ID
 	}
 	id, err := s.idGenerator()("deliveryplan")
 	if err != nil {
 		return DeliveryPlan{}, err
 	}
 	now := s.now()
-	return s.Repository.CreatePlan(ctx, DeliveryPlan{
+	draft, pkg, err := s.createDraftAndPackage(ctx, actor, projectID, request)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	plan := DeliveryPlan{
 		ID: id, OrganizationID: actor.OrganizationID, ProjectID: projectID,
 		CreativePackageID: pkg.ID, CreativePackageHash: pkg.ContentHash, CreativeVersionID: pkg.CreativeVersionID,
-		Name: strings.TrimSpace(request.Name), Objective: strings.TrimSpace(request.Objective),
-		BudgetCents: request.BudgetCents, StartAt: request.StartAt, EndAt: request.EndAt,
-		Status: DeliveryPlanDraft, Version: 1, CreatedBy: actor.Principal.ID, CreatedAt: now, UpdatedAt: now,
-	})
+		Name: draft.Name, Objective: draft.Objective, BudgetCents: draft.Budget.TotalMinor,
+		StartAt: draft.Schedule.StartAt, EndAt: draft.Schedule.EndAt,
+		Status: DeliveryPlanDraft, Version: 1, Platform: "ocean_engine_mock", Source: SourceMock,
+		Scenario: scenarioFor(draft), TourRunID: tourRunID, TourOwnerID: tourOwnerID, TourCase: tourCase, CurrentVersionNumber: 1,
+		CreatedBy: actor.Principal.ID, CreatedAt: now, UpdatedAt: now,
+	}
+	version, err := versionFromDraft(plan, 1, draft, actor.Principal, now)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	return s.Repository.CreatePlan(ctx, plan, version)
+}
+
+func (s Service) createDraftAndPackage(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, request CreatePlanRequest) (PlanDraft, CreativePackageSnapshot, error) {
+	if request.usesLifecycleDraft() {
+		draft := normalizeDraft(request.PlanDraft, scenarioFor(request.PlanDraft))
+		var err error
+		draft, err = s.resolvePlanReferences(ctx, actor, projectID, draft)
+		if err != nil {
+			return PlanDraft{}, CreativePackageSnapshot{}, err
+		}
+		reference := CreativeReference{AssetID: "mock-unset", Version: 1}
+		if len(draft.CreativeReferences) > 0 {
+			reference = draft.CreativeReferences[0]
+		}
+		pkg := CreativePackageSnapshot{
+			ID: reference.AssetID, CreativeVersionID: strconv.Itoa(reference.Version),
+			ContentHash: reference.ContentHash,
+		}
+		return draft, pkg, nil
+	}
+	if s.Packages == nil {
+		return PlanDraft{}, CreativePackageSnapshot{}, fmt.Errorf("delivery creative package reader is required")
+	}
+	pkg, err := s.Packages.ReadCreativePackage(ctx, actor, projectID, request.CreativePackageID)
+	if err != nil {
+		return PlanDraft{}, CreativePackageSnapshot{}, err
+	}
+	draft := PlanDraft{
+		Name: request.Name, Objective: request.Objective,
+		Advertiser:         AdvertiserInput{ID: "mock-advertiser-001", Name: "Cookies Mock 广告主", Platform: "ocean_engine"},
+		Budget:             Budget{TotalMinor: request.BudgetCents, Currency: "CNY"},
+		Schedule:           Schedule{StartAt: request.StartAt, EndAt: request.EndAt, Timezone: "Asia/Shanghai"},
+		Tracking:           Tracking{LandingPage: "https://demo.cookies.local", PixelID: "PX-LOCAL", ConversionEvent: "conversion"},
+		CreativeReferences: []CreativeReference{{AssetID: pkg.ID, Version: 1, ContentHash: pkg.ContentHash, Confirmed: true}},
+	}
+	// The package-oriented compatibility route has no authoritative upstream
+	// project strategy record. Keep it on the legacy validation path instead of
+	// inventing a reference that the production resolver cannot prove.
+	return normalizeDraft(draft, scenarioFor(draft)), pkg, nil
+}
+
+func (s Service) resolvePlanReferences(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, draft PlanDraft) (PlanDraft, error) {
+	if s.References != nil {
+		strategy, creatives, err := s.References.ResolvePlanReferences(ctx, actor, projectID, draft.StrategyReference, draft.CreativeReferences)
+		if err != nil {
+			return PlanDraft{}, err
+		}
+		draft.StrategyReference, draft.CreativeReferences = strategy, creatives
+	} else {
+		// Tests and isolated in-memory adopters still receive immutable references;
+		// production wires the project-backed resolver below.
+		if draft.StrategyReference.ContentHash == "" {
+			draft.StrategyReference.ContentHash, _ = contract.CanonicalJSONHash(struct {
+				TaskID  string `json:"task_id"`
+				Version int64  `json:"version"`
+			}{draft.StrategyReference.TaskID, draft.StrategyReference.Version})
+		}
+		if draft.StrategyReference.Route == "" {
+			draft.StrategyReference.Route = fmt.Sprintf("/projects/%s/strategy/workspaces/%s", projectID, draft.StrategyReference.TaskID)
+		}
+		for index := range draft.CreativeReferences {
+			ref := &draft.CreativeReferences[index]
+			if ref.ContentHash == "" {
+				ref.ContentHash, _ = contract.CanonicalJSONHash(struct {
+					AssetID string `json:"asset_id"`
+					Version int    `json:"version"`
+				}{ref.AssetID, ref.Version})
+			}
+			if ref.Route == "" {
+				ref.Route = fmt.Sprintf("/projects/%s/creative/reviews/%s@v%d", projectID, ref.AssetID, ref.Version)
+			}
+		}
+	}
+	draft.SourceStrategyVersion = fmt.Sprintf("%s@v%d", draft.StrategyReference.TaskID, draft.StrategyReference.Version)
+	return normalizeDraft(draft, scenarioFor(draft)), nil
+}
+
+func (s Service) UpdatePlan(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string, request UpdatePlanRequest) (DeliveryPlan, error) {
+	if err := s.ready(actor, projectID, ScopeWrite); err != nil {
+		return DeliveryPlan{}, err
+	}
+	if err := request.Validate(); err != nil || strings.TrimSpace(planID) == "" {
+		return DeliveryPlan{}, ErrInvalidRequest
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return DeliveryPlan{}, err
+	}
+	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, planID)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	if plan.Status != DeliveryPlanDraft {
+		return DeliveryPlan{}, ErrInvalidState
+	}
+	resolvedDraft, err := s.resolvePlanReferences(ctx, actor, projectID, request.PlanDraft)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	version, err := versionFromDraft(plan, request.ExpectedVersion+1, resolvedDraft, actor.Principal, s.now())
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	// A legacy PATCH can never author three-tier configuration provenance. Preserve a compiled
+	// snapshot exactly and include it in the newly immutable canonical hash.
+	version.ThreeTierConfiguration = cloneThreeTierConfiguration(plan.CurrentVersion.ThreeTierConfiguration)
+	version.CanonicalHash, err = PlanCanonicalHash(version)
+	if err != nil {
+		return DeliveryPlan{}, err
+	}
+	return s.Repository.UpdatePlan(ctx, actor.OrganizationID, projectID, planID, request.ExpectedVersion, version)
 }
 
 func (s Service) ListPlans(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, limit int) ([]DeliveryPlan, error) {
@@ -256,18 +546,187 @@ func (s Service) ListPlans(ctx context.Context, actor contract.ActorContext, pro
 	return s.Repository.ListPlans(ctx, actor.OrganizationID, projectID, normalizeLimit(limit))
 }
 
-func (s Service) GetPlanDetail(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string) (PlanDetail, error) {
+func (s Service) GetPlan(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string) (DeliveryPlan, error) {
 	if err := s.ready(actor, projectID, ScopeRead); err != nil {
-		return PlanDetail{}, err
+		return DeliveryPlan{}, err
 	}
 	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
-		return PlanDetail{}, err
+		return DeliveryPlan{}, err
 	}
-	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, planID)
+	return s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, planID)
+}
+
+func (s Service) ListPlanVersions(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string) ([]DeliveryPlanVersion, error) {
+	if err := s.ready(actor, projectID, ScopeRead); err != nil {
+		return nil, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return nil, err
+	}
+	return s.Repository.ListPlanVersions(ctx, actor.OrganizationID, projectID, planID)
+}
+
+func (s Service) GetPlanVersion(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string, version int) (DeliveryPlanVersion, error) {
+	if err := s.ready(actor, projectID, ScopeRead); err != nil {
+		return DeliveryPlanVersion{}, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return DeliveryPlanVersion{}, err
+	}
+	return s.Repository.GetPlanVersion(ctx, actor.OrganizationID, projectID, planID, version)
+}
+
+func (s Service) RunPlanPreflight(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string) (PreflightResult, error) {
+	if err := s.ready(actor, projectID, ScopeRead); err != nil {
+		return PreflightResult{}, err
+	}
+	plan, err := s.GetPlan(ctx, actor, projectID, planID)
+	if err != nil {
+		return PreflightResult{}, err
+	}
+	checks := RunPreflight(plan.CurrentVersion)
+	return preflightResult(plan.ID, plan.CurrentVersion, checks, s.now()), nil
+}
+
+func preflightResult(planID string, version DeliveryPlanVersion, checks []PreflightCheck, checkedAt time.Time) PreflightResult {
+	blocked := false
+	for _, check := range checks {
+		if !check.Passed && check.Severity == CheckSeverityError {
+			blocked = true
+			break
+		}
+	}
+	return PreflightResult{
+		PlanID: planID, PlanVersion: version.VersionNumber, Passed: !blocked, Blocked: blocked,
+		Checks: checks, Source: SourceMock, Scenario: version.Scenario, CheckedAt: checkedAt,
+	}
+}
+
+func (s Service) ListChangeSets(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, limit int) ([]ChangeSet, error) {
+	if err := s.ready(actor, projectID, ScopeRead); err != nil {
+		return nil, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return nil, err
+	}
+	values, err := s.Repository.ListChangeSets(ctx, actor.OrganizationID, projectID, normalizeLimit(limit))
+	if err != nil {
+		return nil, err
+	}
+	for index := range values {
+		values[index], err = s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, values[index])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
+func (s Service) GetChangeSet(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID string) (ChangeSet, error) {
+	if err := s.ready(actor, projectID, ScopeRead); err != nil {
+		return ChangeSet{}, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return ChangeSet{}, err
+	}
+	value, err := s.Repository.GetChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	return s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, value)
+}
+
+func (s Service) hydrateChangeSet(ctx context.Context, organizationID contract.OrganizationID, projectID contract.ProjectID, value ChangeSet) (ChangeSet, error) {
+	version, err := s.Repository.GetPlanVersion(ctx, organizationID, projectID, value.PlanID, int(value.PlanVersion))
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	value.PlanName = version.Name
+	value.Source, value.Scenario = version.Source, version.Scenario
+	if value.TargetSnapshot != nil {
+		value.Source, value.Scenario = value.TargetSnapshot.Source, Scenario(value.TargetSnapshot.Scenario)
+	}
+	value.PlanCanonicalHash = version.CanonicalHash
+	value.BudgetLimit = version.Budget
+	approval, err := s.Repository.GetApproval(ctx, organizationID, projectID, value.ID)
+	if errors.Is(err, ErrNotFound) {
+		value.Approval = nil
+		return value, nil
+	}
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	plan, err := s.Repository.GetPlan(ctx, organizationID, projectID, value.PlanID)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	view, err := s.approvalView(value, plan, version, approval)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	value.Approval = &view
+	value.ApprovedBy = approval.ApprovedBy
+	approvedAt := approval.ApprovedAt
+	value.ApprovedAt = &approvedAt
+	return value, nil
+}
+
+func (s Service) approvalView(changeSet ChangeSet, plan DeliveryPlan, version DeliveryPlanVersion, approval DeliveryApproval) (ApprovalView, error) {
+	view := ApprovalView{
+		DeliveryApproval: approval,
+		Valid:            true,
+		HashSummary:      hashSummary(approval.PlanCanonicalHash),
+		BudgetLimit:      Budget{TotalMinor: approval.BudgetLimitMinor, Currency: approval.Currency},
+	}
+	if !s.now().Before(approval.ExpiresAt) {
+		view.Valid, view.InvalidReason = false, ApprovalInvalidExpired
+		return view, nil
+	}
+	if plan.Version != approval.PlanVersion {
+		view.Valid, view.InvalidReason = false, ApprovalInvalidStalePlan
+		return view, nil
+	}
+	approvedChangeSetVersion, validLifecycleState := approvalVersionForChangeSetState(changeSet.Status, changeSet.Version)
+	if approval.OrganizationID != changeSet.OrganizationID ||
+		approval.ProjectID != changeSet.ProjectID ||
+		approval.PlanID != changeSet.PlanID ||
+		approval.PlanVersion != changeSet.PlanVersion ||
+		approval.ChangeSetID != changeSet.ID ||
+		!validLifecycleState ||
+		approval.ChangeSetVersion != approvedChangeSetVersion ||
+		approval.PlanCanonicalHash != version.CanonicalHash ||
+		approval.Source != SourceMock ||
+		approval.Scenario != version.Scenario {
+		view.Valid, view.InvalidReason = false, ApprovalInvalidContentMismatch
+		return view, nil
+	}
+	if err := validatePlanCanonicalHash(version); err != nil {
+		view.Valid, view.InvalidReason = false, ApprovalInvalidContentMismatch
+		return view, nil
+	}
+	actionHash, err := ApprovalActionHash(approval)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	if actionHash != approval.ActionHash {
+		view.Valid, view.InvalidReason = false, ApprovalInvalidContentMismatch
+		return view, nil
+	}
+	if approval.Action != ApprovalActionExecute ||
+		approval.Scope != ApprovalScopeExecuteMock ||
+		version.Budget.TotalMinor > approval.BudgetLimitMinor ||
+		version.Budget.Currency != approval.Currency {
+		view.Valid, view.InvalidReason = false, ApprovalInvalidScopeExceeded
+	}
+	return view, nil
+}
+
+func (s Service) GetPlanDetail(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, planID string) (PlanDetail, error) {
+	plan, err := s.GetPlan(ctx, actor, projectID, planID)
 	if err != nil {
 		return PlanDetail{}, err
 	}
-	changeSets, err := s.Repository.ListChangeSets(ctx, actor.OrganizationID, projectID, 100)
+	changeSets, err := s.ListChangeSets(ctx, actor, projectID, 100)
 	if err != nil {
 		return PlanDetail{}, err
 	}
@@ -277,7 +736,7 @@ func (s Service) GetPlanDetail(ctx context.Context, actor contract.ActorContext,
 			filtered = append(filtered, value)
 		}
 	}
-	executions, err := s.Repository.ListExecutions(ctx, actor.OrganizationID, projectID, 100)
+	executions, err := s.ListExecutions(ctx, actor, projectID, 100)
 	if err != nil {
 		return PlanDetail{}, err
 	}
@@ -296,12 +755,18 @@ func (s Service) CreateChangeSet(ctx context.Context, actor contract.ActorContex
 	if err := s.ready(actor, projectID, ScopeWrite); err != nil {
 		return ChangeSet{}, err
 	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return ChangeSet{}, err
+	}
 	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, planID)
 	if err != nil {
 		return ChangeSet{}, err
 	}
 	if plan.Version != expectedPlanVersion {
 		return ChangeSet{}, ErrVersionConflict
+	}
+	if err := validatePlanCanonicalHash(plan.CurrentVersion); err != nil {
+		return ChangeSet{}, err
 	}
 	id, err := s.idGenerator()("deliverychangeset")
 	if err != nil {
@@ -310,13 +775,18 @@ func (s Service) CreateChangeSet(ctx context.Context, actor contract.ActorContex
 	now := s.now()
 	return s.Repository.CreateChangeSet(ctx, ChangeSet{
 		ID: id, OrganizationID: actor.OrganizationID, ProjectID: projectID, PlanID: plan.ID,
-		PlanVersion: plan.Version, Status: ChangeSetDraft, RiskLevel: "low",
-		PreflightNotes: []string{}, Version: 1, CreatedBy: actor.Principal.ID, CreatedAt: now, UpdatedAt: now,
+		PlanName: plan.CurrentVersion.Name, PlanVersion: plan.Version, PlanCanonicalHash: plan.CurrentVersion.CanonicalHash,
+		BudgetLimit: plan.CurrentVersion.Budget, Status: ChangeSetDraft, RiskLevel: "low",
+		PreflightNotes: []string{}, Source: plan.Source, Scenario: plan.Scenario,
+		Version: 1, CreatedBy: actor.Principal.ID, CreatedAt: now, UpdatedAt: now,
 	})
 }
 
 func (s Service) Preflight(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID string, expectedVersion int64) (ChangeSet, error) {
 	if err := s.ready(actor, projectID, ScopeWrite); err != nil {
+		return ChangeSet{}, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
 		return ChangeSet{}, err
 	}
 	value, err := s.Repository.GetChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
@@ -326,14 +796,40 @@ func (s Service) Preflight(ctx context.Context, actor contract.ActorContext, pro
 	if value.Status != ChangeSetDraft {
 		return ChangeSet{}, ErrInvalidState
 	}
-	if _, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, value.PlanID); err != nil {
+	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, value.PlanID)
+	if err != nil {
 		return ChangeSet{}, err
 	}
-	return s.Repository.TransitionChangeSet(ctx, actor.OrganizationID, projectID, changeSetID, expectedVersion, ChangeSetPreflightPassed, actor.Principal.ID, s.now())
+	if plan.Version != value.PlanVersion {
+		return ChangeSet{}, ErrStalePlanVersion
+	}
+	version, err := s.Repository.GetPlanVersion(ctx, actor.OrganizationID, projectID, value.PlanID, int(value.PlanVersion))
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	preflightVersion, err := changeSetPreflightVersion(version, value)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	next := ChangeSetPreflightPassed
+	for _, check := range RunPreflight(preflightVersion) {
+		if !check.Passed && check.Severity == CheckSeverityError {
+			next = ChangeSetPreflightFailed
+			break
+		}
+	}
+	transitioned, err := s.Repository.TransitionChangeSet(ctx, actor.OrganizationID, projectID, changeSetID, expectedVersion, next, actor.Principal.ID, s.now())
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	return s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, transitioned)
 }
 
 func (s Service) Approve(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID string, expectedVersion int64) (ChangeSet, error) {
 	if err := s.ready(actor, projectID, ScopeApprove); err != nil {
+		return ChangeSet{}, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
 		return ChangeSet{}, err
 	}
 	value, err := s.Repository.GetChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
@@ -343,47 +839,310 @@ func (s Service) Approve(ctx context.Context, actor contract.ActorContext, proje
 	if value.Status != ChangeSetPreflightPassed {
 		return ChangeSet{}, ErrInvalidState
 	}
-	return s.Repository.TransitionChangeSet(ctx, actor.OrganizationID, projectID, changeSetID, expectedVersion, ChangeSetApproved, actor.Principal.ID, s.now())
+	if value.Version != expectedVersion {
+		return ChangeSet{}, ErrVersionConflict
+	}
+	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, value.PlanID)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	if plan.Version != value.PlanVersion {
+		return ChangeSet{}, ErrStalePlanVersion
+	}
+	version, err := s.Repository.GetPlanVersion(ctx, actor.OrganizationID, projectID, value.PlanID, int(value.PlanVersion))
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	if err := validatePlanCanonicalHash(version); err != nil {
+		return ChangeSet{}, err
+	}
+	preflightVersion, err := changeSetPreflightVersion(version, value)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	for _, check := range RunPreflight(preflightVersion) {
+		if !check.Passed && check.Severity == CheckSeverityError {
+			return ChangeSet{}, ErrInvalidState
+		}
+	}
+	approvalID, err := s.idGenerator()("deliveryapproval")
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	now := s.now()
+	approval := DeliveryApproval{
+		ApprovalID: approvalID, OrganizationID: actor.OrganizationID, ProjectID: projectID,
+		PlanID: value.PlanID, PlanVersion: value.PlanVersion,
+		ChangeSetID: value.ID, ChangeSetVersion: value.Version + 1,
+		PlanCanonicalHash:  version.CanonicalHash,
+		TargetSnapshotHash: value.TargetSnapshotHash,
+		Action:             ApprovalActionExecute, Scope: ApprovalScopeExecuteMock,
+		BudgetLimitMinor: version.Budget.TotalMinor, Currency: version.Budget.Currency,
+		ApprovedBy: actor.Principal.ID, ApprovedAt: now, ExpiresAt: now.Add(ApprovalTTL),
+		Source: SourceMock, Scenario: preflightVersion.Scenario,
+	}
+	approval.ActionHash, err = ApprovalActionHash(approval)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	approved, err := s.Repository.ApproveChangeSet(ctx, value, approval)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	return s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, approved)
 }
 
-func (s Service) Execute(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID string, expectedVersion int64) (ExecutionResult, error) {
-	if err := s.ready(actor, projectID, ScopeExecute); err != nil {
-		return ExecutionResult{}, err
+func (s Service) RejectChangeSet(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID string, request RejectChangeSetRequest) (ChangeSet, error) {
+	if err := s.ready(actor, projectID, ScopeApprove); err != nil {
+		return ChangeSet{}, err
+	}
+	if err := request.Validate(); err != nil || strings.TrimSpace(changeSetID) == "" {
+		return ChangeSet{}, ErrInvalidRequest
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return ChangeSet{}, err
 	}
 	value, err := s.Repository.GetChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
 	if err != nil {
-		return ExecutionResult{}, err
+		return ChangeSet{}, err
 	}
-	if value.Version != expectedVersion {
-		return ExecutionResult{}, ErrVersionConflict
+	if value.Status != ChangeSetPreflightPassed {
+		return ChangeSet{}, ErrInvalidState
+	}
+	repository, ok := s.Repository.(changeSetRejectionRepository)
+	if !ok {
+		transitioned, transitionErr := s.Repository.TransitionChangeSet(ctx, actor.OrganizationID, projectID, changeSetID, request.ExpectedVersion, ChangeSetRejected, actor.Principal.ID, s.now())
+		if transitionErr != nil {
+			return ChangeSet{}, transitionErr
+		}
+		transitioned.RejectedBy, transitioned.RejectionReason = actor.Principal.ID, strings.TrimSpace(request.Reason)
+		rejectedAt := s.now()
+		transitioned.RejectedAt = &rejectedAt
+		return s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, transitioned)
+	}
+	transitioned, err := repository.RejectChangeSet(ctx, actor.OrganizationID, projectID, changeSetID, request.ExpectedVersion, actor.Principal.ID, strings.TrimSpace(request.Reason), s.now())
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	return s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, transitioned)
+}
+
+func (s Service) Execute(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID, idempotencyKey string, request ExecuteRequest) (ExecutionResult, bool, error) {
+	if err := s.ready(actor, projectID, ScopeExecute); err != nil {
+		return ExecutionResult{}, false, err
+	}
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if err := request.Validate(); err != nil || len(idempotencyKey) < 1 || len(idempotencyKey) > 255 {
+		return ExecutionResult{}, false, ErrInvalidRequest
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return ExecutionResult{}, false, err
+	}
+	value, err := s.Repository.GetChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	requestHash, err := contract.CanonicalJSONHash(struct {
+		OrganizationID  contract.OrganizationID `json:"organization_id"`
+		ProjectID       contract.ProjectID      `json:"project_id"`
+		ChangeSetID     string                  `json:"change_set_id"`
+		Operation       string                  `json:"operation"`
+		ExpectedVersion int64                   `json:"expected_version"`
+		Scenario        ExecutionScenario       `json:"scenario"`
+	}{actor.OrganizationID, projectID, value.ID, "execute_mock", request.ExpectedVersion, request.Scenario})
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	if existing, found, findErr := s.Repository.FindExecutionByIdempotency(ctx, actor.OrganizationID, projectID, idempotencyKey); findErr != nil {
+		return ExecutionResult{}, false, findErr
+	} else if found {
+		if existing.Execution.RequestHash != requestHash {
+			return ExecutionResult{}, false, ErrIdempotencyConflict
+		}
+		existing, err = s.hydrateExecutionResult(ctx, actor.OrganizationID, projectID, existing)
+		return existing, true, err
+	}
+	if value.Version != request.ExpectedVersion {
+		return ExecutionResult{}, false, ErrVersionConflict
 	}
 	if value.Status != ChangeSetApproved {
-		return ExecutionResult{}, ErrInvalidState
+		return ExecutionResult{}, false, ErrInvalidState
+	}
+	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, value.PlanID)
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	if plan.Version != value.PlanVersion {
+		return ExecutionResult{}, false, ErrStalePlanVersion
+	}
+	version, err := s.Repository.GetPlanVersion(ctx, actor.OrganizationID, projectID, value.PlanID, int(value.PlanVersion))
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	value.PlanName = version.Name
+	value.Source, value.Scenario = version.Source, version.Scenario
+	value.PlanCanonicalHash, value.BudgetLimit = version.CanonicalHash, version.Budget
+	approval, err := s.Repository.GetApproval(ctx, actor.OrganizationID, projectID, value.ID)
+	if errors.Is(err, ErrNotFound) {
+		return ExecutionResult{}, false, ErrApprovalRequired
+	}
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	view, err := s.approvalView(value, plan, version, approval)
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	if !view.Valid {
+		switch view.InvalidReason {
+		case ApprovalInvalidExpired:
+			return ExecutionResult{}, false, ErrApprovalExpired
+		case ApprovalInvalidStalePlan:
+			return ExecutionResult{}, false, ErrStalePlanVersion
+		case ApprovalInvalidScopeExceeded:
+			return ExecutionResult{}, false, ErrApprovalScopeExceeded
+		default:
+			return ExecutionResult{}, false, ErrApprovalContentMismatch
+		}
 	}
 	executionID, err := s.idGenerator()("deliveryexecution")
 	if err != nil {
-		return ExecutionResult{}, err
+		return ExecutionResult{}, false, err
 	}
 	evidenceID, err := s.idGenerator()("deliveryevidence")
 	if err != nil {
-		return ExecutionResult{}, err
+		return ExecutionResult{}, false, err
 	}
 	now := s.now()
+	actions := []string{"create_platform_project", "create_promotion", "verify_platform_state"}
+	steps := make([]ExecutionStep, len(actions))
+	for index, action := range actions {
+		steps[index].ID, err = s.idGenerator()("deliveryexecutionstep")
+		if err != nil {
+			return ExecutionResult{}, false, err
+		}
+		steps[index].Sequence = index + 1
+		steps[index].Action = action
+		steps[index].Status = StepPending
+		steps[index].Effect = "none"
+		steps[index].OutcomeSummary = "queued; no adapter call has occurred"
+		steps[index].Version = 1
+	}
+	adapter := s.platformAdapter()
+	if adapter.Source() != SourceMock {
+		return ExecutionResult{}, false, fmt.Errorf("%w: A04 only permits the mock platform adapter", ErrInvalidRequest)
+	}
 	execution := Execution{
 		ID: executionID, OrganizationID: actor.OrganizationID, ProjectID: projectID,
-		ChangeSetID: value.ID, Status: "succeeded", Mode: ExecutionModeLocalSimulation,
-		ExecutedBy: actor.Principal.ID, StartedAt: now, CompletedAt: now,
+		ChangeSetID: value.ID, ApprovalID: approval.ApprovalID, Status: ExecutionQueued, Version: 1,
+		Mode: ExecutionModeLocalSimulation, Adapter: MockOceanEngineAdapter, Source: SourceMock,
+		Scenario: request.Scenario, IdempotencyKey: idempotencyKey, RequestHash: requestHash,
+		ExecutedBy: actor.Principal.ID, StartedAt: now, RetryAllowed: false,
+		RecoveryAction: "none", RecoveryReason: "", CompensationCandidates: []string{}, Steps: steps,
 	}
 	evidence := Evidence{
 		ID: evidenceID, OrganizationID: actor.OrganizationID, ProjectID: projectID,
-		ExecutionID: execution.ID, Summary: "本地模拟执行完成，无真实广告平台写入。",
-		Mode: ExecutionModeLocalSimulation, Reversible: true, CreatedAt: now,
+		ExecutionID: execution.ID, Summary: "本地模拟执行记录，无真实广告平台写入。",
+		Mode: ExecutionModeLocalSimulation, Reversible: false,
+		Source: SourceMock, Scenario: request.Scenario, References: []string{"mock://execution/" + string(request.Scenario)}, CreatedAt: now,
 	}
-	return s.Repository.RecordExecution(ctx, value, execution, evidence)
+	value.Approval = &view
+	created, replay, err := s.Repository.CreateOrReplayExecution(ctx, value, approval, execution, evidence)
+	if err != nil {
+		return created, replay, err
+	}
+	if replay {
+		created, err = s.hydrateExecutionResult(ctx, actor.OrganizationID, projectID, created)
+		return created, true, err
+	}
+	for _, state := range []ExecutionStatus{ExecutionValidatingApproval, ExecutionExecuting} {
+		created, err = s.Repository.AdvanceExecution(ctx, created.Execution, state, nil, "none", "", []string{})
+		if err != nil {
+			return ExecutionResult{}, false, err
+		}
+	}
+
+	adapterUnknown := false
+	for index := range created.Execution.Steps {
+		current := created.Execution.Steps[index]
+		if current.Action == "verify_platform_state" {
+			created, err = s.Repository.AdvanceExecution(ctx, created.Execution, ExecutionVerifying, nil, "none", "", []string{})
+			if err != nil {
+				return ExecutionResult{}, false, err
+			}
+			current = created.Execution.Steps[index]
+		}
+		if (request.Scenario == ExecutionScenarioFailed && current.Sequence > 1) || adapterUnknown {
+			skipped := current
+			skipped.Status = StepSkipped
+			skipped.Effect = "none"
+			skipped.OutcomeSummary = "not run after a prior terminal step outcome"
+			skipped.EvidenceRef = "mock://execution/skipped"
+			completedAt := s.now()
+			skipped.CompletedAt = &completedAt
+			created.Execution.Steps[index], err = s.Repository.AdvanceStep(ctx, created.Execution, current, skipped)
+			if err != nil {
+				return ExecutionResult{}, false, err
+			}
+			continue
+		}
+
+		running := current
+		running.Status = StepRunning
+		running.Attempt++
+		running.Effect = "none"
+		running.OutcomeSummary = "adapter call in progress"
+		startedAt := s.now()
+		running.StartedAt = &startedAt
+		running, err = s.Repository.AdvanceStep(ctx, created.Execution, current, running)
+		if err != nil {
+			return ExecutionResult{}, false, err
+		}
+		created.Execution.Steps[index] = running
+
+		stepResult, adapterErr := adapter.ExecuteStep(ctx, PlatformStepRequest{
+			ExecutionID: executionID, Scenario: request.Scenario, Action: running.Action, Sequence: running.Sequence,
+		})
+		completedAt := s.now()
+		terminal := running
+		terminal.CompletedAt = &completedAt
+		if adapterErr != nil {
+			adapterUnknown = true
+			terminal.Status = StepResultUnknown
+			terminal.Effect = "unknown"
+			terminal.OutcomeSummary = "adapter returned an error after the step began; target effect is unknown"
+			terminal.EvidenceRef = "mock://execution/adapter-error"
+		} else {
+			terminal.Status = stepResult.Status
+			terminal.Effect = stepResult.Effect
+			terminal.OutcomeSummary = stepResult.Summary
+			terminal.EvidenceRef = stepResult.EvidenceRef
+		}
+		created.Execution.Steps[index], err = s.Repository.AdvanceStep(ctx, created.Execution, running, terminal)
+		if err != nil {
+			return ExecutionResult{}, false, err
+		}
+	}
+
+	status, recoveryAction, recoveryReason, compensation := executionOutcome(request.Scenario)
+	if adapterUnknown {
+		status, recoveryAction = ExecutionResultUnknown, "query_and_reconcile"
+		recoveryReason, compensation = "adapter result is unknown; blind retry is prohibited", []string{}
+	}
+	completedAt := s.now()
+	created, err = s.Repository.AdvanceExecution(ctx, created.Execution, status, &completedAt, recoveryAction, recoveryReason, compensation)
+	if err != nil {
+		return ExecutionResult{}, false, err
+	}
+	created, err = s.hydrateExecutionResult(ctx, actor.OrganizationID, projectID, created)
+	return created, false, err
 }
 
 func (s Service) Rollback(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, changeSetID string, expectedVersion int64) (ChangeSet, error) {
 	if err := s.ready(actor, projectID, ScopeExecute); err != nil {
+		return ChangeSet{}, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
 		return ChangeSet{}, err
 	}
 	value, err := s.Repository.GetChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
@@ -393,7 +1152,21 @@ func (s Service) Rollback(ctx context.Context, actor contract.ActorContext, proj
 	if value.Status != ChangeSetExecuted {
 		return ChangeSet{}, ErrInvalidState
 	}
-	return s.Repository.TransitionChangeSet(ctx, actor.OrganizationID, projectID, changeSetID, expectedVersion, ChangeSetRolledBack, actor.Principal.ID, s.now())
+	execution, err := s.Repository.GetExecutionByChangeSet(ctx, actor.OrganizationID, projectID, changeSetID)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	if execution.Execution.Status != ExecutionSucceeded || execution.Execution.CompletedAt == nil {
+		return ChangeSet{}, ErrInvalidState
+	}
+	transitioned, err := s.Repository.TransitionChangeSet(
+		ctx, actor.OrganizationID, projectID, changeSetID, expectedVersion,
+		ChangeSetRolledBack, actor.Principal.ID, s.now(),
+	)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	return s.hydrateChangeSet(ctx, actor.OrganizationID, projectID, transitioned)
 }
 
 func (s Service) ListExecutions(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, limit int) ([]ExecutionResult, error) {
@@ -403,7 +1176,52 @@ func (s Service) ListExecutions(ctx context.Context, actor contract.ActorContext
 	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
 		return nil, err
 	}
-	return s.Repository.ListExecutions(ctx, actor.OrganizationID, projectID, normalizeLimit(limit))
+	values, err := s.Repository.ListExecutions(ctx, actor.OrganizationID, projectID, normalizeLimit(limit))
+	if err != nil {
+		return nil, err
+	}
+	for index := range values {
+		values[index], err = s.hydrateExecutionResult(ctx, actor.OrganizationID, projectID, values[index])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
+func (s Service) GetExecution(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, executionID string) (ExecutionResult, error) {
+	if err := s.ready(actor, projectID, ScopeRead); err != nil {
+		return ExecutionResult{}, err
+	}
+	if _, err := s.Projects.RequireActiveContext(ctx, actor, projectID); err != nil {
+		return ExecutionResult{}, err
+	}
+	if strings.TrimSpace(executionID) == "" {
+		return ExecutionResult{}, ErrInvalidRequest
+	}
+	value, err := s.Repository.GetExecution(ctx, actor.OrganizationID, projectID, executionID)
+	if err != nil {
+		return ExecutionResult{}, err
+	}
+	return s.hydrateExecutionResult(ctx, actor.OrganizationID, projectID, value)
+}
+
+func (s Service) hydrateExecutionResult(ctx context.Context, organizationID contract.OrganizationID, projectID contract.ProjectID, value ExecutionResult) (ExecutionResult, error) {
+	changeSet, err := s.hydrateChangeSet(ctx, organizationID, projectID, value.ChangeSet)
+	if err != nil {
+		return ExecutionResult{}, err
+	}
+	value.ChangeSet = changeSet
+	if value.Execution.CompensationCandidates == nil {
+		value.Execution.CompensationCandidates = []string{}
+	}
+	if value.Evidence.References == nil {
+		value.Evidence.References = []string{}
+	}
+	if value.Execution.Steps == nil {
+		value.Execution.Steps = []ExecutionStep{}
+	}
+	return value, nil
 }
 
 func (s Service) CreateDemoMetricSnapshot(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, executionID string, request CreateMetricSnapshotRequest) (DeliveryMetricSnapshot, error) {
@@ -426,24 +1244,18 @@ func (s Service) CreateDemoMetricSnapshot(ctx context.Context, actor contract.Ac
 	if execution.Execution.Mode != ExecutionModeLocalSimulation || execution.Execution.Status != "succeeded" {
 		return DeliveryMetricSnapshot{}, ErrInvalidState
 	}
-	plan, err := s.Repository.GetPlan(ctx, actor.OrganizationID, projectID, execution.ChangeSet.PlanID)
+	result, err := s.CreateOutcomeSimulation(ctx, actor, projectID, execution.Execution.ID, CreateOutcomeSimulationRequest{Scenario: OutcomeScenarioCostPressure})
 	if err != nil {
 		return DeliveryMetricSnapshot{}, err
 	}
-	id, err := s.idGenerator()("deliverymetric")
-	if err != nil {
-		return DeliveryMetricSnapshot{}, err
+	return result.MetricSnapshots[len(result.MetricSnapshots)-1], nil
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
 	}
-	value := DeliveryMetricSnapshot{
-		ID: id, OrganizationID: actor.OrganizationID, ProjectID: projectID,
-		ExecutionID: execution.Execution.ID, PlanID: plan.ID, CreativePackageID: plan.CreativePackageID,
-		Source: MetricSourceDemoFixture, IsSimulated: true, DatasetVersion: DemoMetricDatasetVersion,
-		Currency: "CNY", WindowStart: plan.StartAt, WindowEnd: plan.EndAt,
-		RawMetrics: RawMetrics{Impressions: 10000, Clicks: 420, Conversions: 31, SpendCents: 50000},
-		CreatedBy:  actor.Principal.ID, CreatedAt: s.now(),
-	}
-	stored, _, err := s.Repository.CreateMetricSnapshot(ctx, value)
-	return stored, err
+	return right
 }
 
 func (s Service) ListMetricSnapshots(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, executionID string, limit int) ([]DeliveryMetricSnapshot, error) {
@@ -459,10 +1271,6 @@ func (s Service) ListMetricSnapshots(ctx context.Context, actor contract.ActorCo
 	return s.Repository.ListMetricSnapshots(ctx, actor.OrganizationID, projectID, executionID, normalizeLimit(limit))
 }
 
-// ListExecutionEvidence is the narrow internal projection used by the
-// Delivery→Insights integration. The Insights service authorizes its own
-// caller before using this method; Delivery still enforces tenant and active
-// project boundaries here without requiring a second end-user Delivery scope.
 func (s Service) ListExecutionEvidence(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, limit int) ([]ExecutionResult, error) {
 	if s.Repository == nil || s.Projects == nil {
 		return nil, fmt.Errorf("delivery evidence dependencies are incomplete")
@@ -476,9 +1284,6 @@ func (s Service) ListExecutionEvidence(ctx context.Context, actor contract.Actor
 	return s.Repository.ListExecutions(ctx, actor.OrganizationID, projectID, normalizeLimit(limit))
 }
 
-// ReadExecutionEvidence is the narrow cross-domain projection for Insights.
-// It deliberately carries immutable metric and CreativePackage lineage rather
-// than exposing Delivery's repository to another domain.
 func (s Service) ReadExecutionEvidence(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, executionID string) (ExecutionResult, *DeliveryMetricSnapshot, DeliveryPlan, error) {
 	if s.Repository == nil || s.Projects == nil {
 		return ExecutionResult{}, nil, DeliveryPlan{}, fmt.Errorf("delivery evidence dependencies are incomplete")
@@ -514,6 +1319,10 @@ func (s Service) findExecution(ctx context.Context, organizationID contract.Orga
 	}
 	for _, value := range values {
 		if value.Execution.ID == executionID {
+			value.ChangeSet, err = s.hydrateChangeSet(ctx, organizationID, projectID, value.ChangeSet)
+			if err != nil {
+				return ExecutionResult{}, err
+			}
 			return value, nil
 		}
 	}
@@ -521,7 +1330,7 @@ func (s Service) findExecution(ctx context.Context, organizationID contract.Orga
 }
 
 func (s Service) ready(actor contract.ActorContext, projectID contract.ProjectID, scope contract.Scope) error {
-	if s.Repository == nil || s.Projects == nil || s.Packages == nil {
+	if s.Repository == nil || s.Projects == nil {
 		return fmt.Errorf("delivery dependencies are incomplete")
 	}
 	if actor.OrganizationID == "" || projectID == "" || !actor.HasScope(scope) {

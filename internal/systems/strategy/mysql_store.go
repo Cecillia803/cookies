@@ -38,29 +38,47 @@ func scanConversation(row rowScanner) (Conversation, error) {
 
 const taskSelect = `SELECT id, organization_id, project_id, workspace_id, conversation_id,
 	brief_id, COALESCE(current_agent_task_id, ''), COALESCE(current_strategy_id, ''),
-	status, version, created_at, updated_at FROM strategy_tasks`
+	status, discarded_at, COALESCE(discarded_by, ''), COALESCE(discard_reason, ''),
+	version, created_at, updated_at FROM strategy_tasks`
 
 func scanTask(row rowScanner) (Task, error) {
 	var value Task
+	var discardedAt sql.NullTime
 	if err := row.Scan(&value.ID, &value.OrganizationID, &value.ProjectID, &value.WorkspaceID,
 		&value.ConversationID, &value.BriefID, &value.CurrentAgentTaskID, &value.CurrentStrategyID,
-		&value.Status, &value.Version, &value.CreatedAt, &value.UpdatedAt); err != nil {
+		&value.Status, &discardedAt, &value.DiscardedBy, &value.DiscardReason,
+		&value.Version, &value.CreatedAt, &value.UpdatedAt); err != nil {
 		return Task{}, mapNotFound(err)
+	}
+	if discardedAt.Valid {
+		value.DiscardedAt = &discardedAt.Time
 	}
 	return value, nil
 }
 
 const messageSelect = `SELECT id, organization_id, project_id, conversation_id, role,
-	content_type, content, ai_generated, COALESCE(agent_task_id, ''), skill_run_ids,
+	content_type, content, content_blocks, requested_policy, ai_generated, COALESCE(agent_task_id, ''), skill_run_ids,
 	created_by, created_at FROM strategy_messages`
 
 func scanMessage(row rowScanner) (Message, error) {
 	var value Message
-	var skillRuns []byte
+	var contentBlocks, requestedPolicy, skillRuns []byte
 	if err := row.Scan(&value.ID, &value.OrganizationID, &value.ProjectID, &value.ConversationID,
-		&value.Role, &value.ContentType, &value.Content, &value.AIGenerated, &value.AgentTaskID,
+		&value.Role, &value.ContentType, &value.Content, &contentBlocks, &requestedPolicy, &value.AIGenerated, &value.AgentTaskID,
 		&skillRuns, &value.CreatedBy, &value.CreatedAt); err != nil {
 		return Message{}, mapNotFound(err)
+	}
+	if len(contentBlocks) > 0 {
+		if err := json.Unmarshal(contentBlocks, &value.ContentBlocks); err != nil {
+			return Message{}, err
+		}
+	}
+	if len(requestedPolicy) > 0 {
+		var policy MessageRequestedPolicy
+		if err := json.Unmarshal(requestedPolicy, &policy); err != nil {
+			return Message{}, err
+		}
+		value.RequestedPolicy = &policy
 	}
 	if len(skillRuns) > 0 {
 		_ = json.Unmarshal(skillRuns, &value.SkillRunIDs)
@@ -117,6 +135,8 @@ func scanBriefVersion(row rowScanner) (BriefVersion, error) {
 	}
 	value.Snapshot = stored.Document
 	value.FieldStates = stored.FieldStates
+	readiness := computeFullStrategyReadiness(value.Snapshot, value.FieldStates)
+	value.FullStrategyReadiness = &readiness
 	return value, nil
 }
 
@@ -127,12 +147,20 @@ func insertMessage(ctx context.Context, executor interface {
 	if len(message.SkillRunIDs) > 0 {
 		skillRuns = mustJSON(message.SkillRunIDs)
 	}
+	contentBlocks := any(nil)
+	if message.ContentBlocks != nil {
+		contentBlocks = mustJSON(message.ContentBlocks)
+	}
+	requestedPolicy := any(nil)
+	if message.RequestedPolicy != nil {
+		requestedPolicy = mustJSON(message.RequestedPolicy)
+	}
 	_, err := executor.ExecContext(ctx, `INSERT INTO strategy_messages
-		(id, organization_id, project_id, conversation_id, role, content_type, content,
-		 ai_generated, agent_task_id, skill_run_ids, created_by, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`, message.ID,
+		(id, organization_id, project_id, conversation_id, role, content_type, content, content_blocks,
+		 requested_policy, ai_generated, agent_task_id, skill_run_ids, created_by, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`, message.ID,
 		message.OrganizationID, message.ProjectID, message.ConversationID, message.Role,
-		message.ContentType, message.Content, message.AIGenerated, message.AgentTaskID,
+		message.ContentType, message.Content, contentBlocks, requestedPolicy, message.AIGenerated, message.AgentTaskID,
 		skillRuns, message.CreatedBy, message.CreatedAt)
 	return err
 }
@@ -188,17 +216,23 @@ func mapNotFound(err error) error {
 }
 
 const draftSelect = `SELECT id, organization_id, project_id, task_id, brief_id, brief_version,
-	project_context_version, status, current_revision, COALESCE(current_review_id, ''),
+	project_context_version, status, archived_at, COALESCE(archived_by, ''),
+	COALESCE(archive_reason, ''), current_revision, COALESCE(current_review_id, ''),
 	version, skill_versions, created_at, updated_at FROM strategy_drafts`
 
 func scanDraft(row rowScanner) (Draft, error) {
 	var value Draft
 	var skills json.RawMessage
+	var archivedAt sql.NullTime
 	if err := row.Scan(&value.ID, &value.OrganizationID, &value.ProjectID, &value.TaskID,
 		&value.BriefID, &value.BriefVersion, &value.ProjectContextVersion, &value.Status,
+		&archivedAt, &value.ArchivedBy, &value.ArchiveReason,
 		&value.CurrentRevision, &value.CurrentReviewID, &value.Version, &skills,
 		&value.CreatedAt, &value.UpdatedAt); err != nil {
 		return Draft{}, mapNotFound(err)
+	}
+	if archivedAt.Valid {
+		value.ArchivedAt = &archivedAt.Time
 	}
 	if err := json.Unmarshal(skills, &value.SkillVersions); err != nil {
 		return Draft{}, err
