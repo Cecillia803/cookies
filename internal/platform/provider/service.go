@@ -155,6 +155,8 @@ type JobRecord struct {
 	ExecutionDeadlineAt   *time.Time
 	SubmittedAt           *time.Time
 	ResponseReceivedAt    *time.Time
+	Usage                 *JobUsage
+	Events                []JobEvent
 }
 
 type SubmissionState string
@@ -202,6 +204,7 @@ type GeneratedIntakeClient interface {
 // Service is the small application seam used by transport and workers.
 type Service struct {
 	Store         JobStore
+	JobQueryStore JobQueryStore
 	Scheduler     ExecutionScheduler
 	ImageAdapter  ImageProviderAdapter
 	VideoAdapter  VideoProviderAdapter
@@ -212,8 +215,13 @@ type Service struct {
 	OutputHandles OutputHandleStore
 	Routes        ImageRouteResolver
 	VideoRoutes   VideoRouteResolver
-	NewID         func() (string, error)
-	Now           func() time.Time
+	// VideoRouteOptional lets video generation fall back to the adapter's own
+	// environment credential when MySQL holds no enabled route. It is set when
+	// COOKIES_ARK_VIDEO_API_KEY is present, so a deployment that has never
+	// opened the Settings page still has a working pipeline.
+	VideoRouteOptional bool
+	NewID              func() (string, error)
+	Now                func() time.Time
 }
 
 // ProcessVideoJob uses the same Assets intake protocol as image generation.

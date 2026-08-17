@@ -3,7 +3,7 @@ import type { ApiProjectMediaAsset } from '../../data/api'
 export type ShortDramaStep = 'understanding' | 'direction' | 'first-frame' | 'video'
 export type AsyncStatus = 'idle' | 'loading' | 'ready' | 'error'
 export type HookCategory = 'curiosity' | 'summary'
-export type PrerollDuration = 5 | 6 | 10 | 12 | 15
+export type PrerollDuration = 10 | 12 | 15
 
 export type StoryAnalysis = {
   title: string
@@ -27,11 +27,21 @@ export type HookDirection = {
 export type FirstFrameCandidate = {
   id: string
   label: string
-  imageUrl: string
+  imageUrl?: string
   composition: string
+  status?: 'queued' | 'running' | 'ready' | 'failed' | 'cancelled'
+  errorCode?: string
+  errorMessage?: string
+  recoverable?: boolean
+  recoveryState?: string
+  currentAttemptId?: string
+  attemptCount?: number
+  rewriteProfile?: string
   variantKey?: string
   visualMechanism?: string
   styleProfile?: string
+  primaryTestVariable?: string
+  panels?: Array<{ slot: string; role: string; description: string }>
 }
 
 export type GeneratedPreroll = {
@@ -59,6 +69,7 @@ export type ShortDramaPrerollState = {
   images: FirstFrameCandidate[]
   selectedImageId: string
   selectingImageId: string
+  retryingImageId: string
   videoStatus: AsyncStatus
   output: GeneratedPreroll | null
   error: string

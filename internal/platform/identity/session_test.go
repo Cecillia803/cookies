@@ -86,3 +86,47 @@ func TestAdminSessionCanCreateProviderJobs(t *testing.T) {
 		t.Fatal("admin login must include provider.job.create for image and video generation")
 	}
 }
+
+func TestOnlyAdministratorsCanConfigureModelServices(t *testing.T) {
+	t.Parallel()
+	for _, role := range []string{"owner", "admin"} {
+		scopes, err := ScopesForOrganizationRole(role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !(&contract.ActorContext{Scopes: scopes}).HasScope("provider.configuration.write") {
+			t.Fatalf("%s must be able to save the video model configuration", role)
+		}
+	}
+	for _, role := range []string{"member", "auditor"} {
+		scopes, err := ScopesForOrganizationRole(role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (&contract.ActorContext{Scopes: scopes}).HasScope("provider.configuration.write") {
+			t.Fatalf("%s unexpectedly received the model configuration scope", role)
+		}
+	}
+}
+
+func TestOnlyAdministratorsReceiveDocumentVisionReconciliationScope(t *testing.T) {
+	t.Parallel()
+	for _, role := range []string{"owner", "admin"} {
+		scopes, err := ScopesForOrganizationRole(role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !(&contract.ActorContext{Scopes: scopes}).HasScope("knowledge.document_vision.reconcile") {
+			t.Fatalf("%s must receive document vision reconciliation scope", role)
+		}
+	}
+	for _, role := range []string{"member", "auditor"} {
+		scopes, err := ScopesForOrganizationRole(role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (&contract.ActorContext{Scopes: scopes}).HasScope("knowledge.document_vision.reconcile") {
+			t.Fatalf("%s unexpectedly received document vision reconciliation scope", role)
+		}
+	}
+}

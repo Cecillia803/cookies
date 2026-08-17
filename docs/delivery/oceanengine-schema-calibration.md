@@ -1,5 +1,7 @@
 # 巨量引擎业务 Schema 校准
 
+> 2026-08-11 运行时说明：本文件保留页面观察与历史差异分析。早期操作包步骤不属于当前活动运行时；当前实现止于第二次人工审批，不包含行为工作流编译或平台写入。
+
 | 属性 | 内容 |
 | --- | --- |
 | 状态 | 只读业务校准已达到 v0.1 冻结条件并完成阶段收口：电商手动路径为首条业务路径，应用下载 Android 记录到真实事件资产门禁，其余入口进入覆盖矩阵；真实写入统一留待受控写入阶段 |
@@ -87,9 +89,9 @@ PlatformAccount
 
 ### 2.2 Delivery 自主职责与稳定引用
 
-文件夹归属即职责边界：`docs/delivery/**` 与 `internal/systems/delivery/**` 内的 ThreeTier 语义、真实页面 Schema、字段拆分和预检由 Delivery 负责，不再作为 Owner 确认项向上抛；Delivery 不修改 Connector 或 Insights 文件。
+文件夹归属即职责边界：`docs/delivery/**` 与 `internal/systems/delivery/**` 内的平台配置语义、真实页面 Schema、字段拆分和预检由 Delivery 负责，不再作为 Owner 确认项向上抛；Delivery 不修改 Connector 或 Insights 文件。
 
-内部 ThreeTier 只作为 Delivery 的编排结构：
+以下 ThreeTier 解释只用于记录历史 mock 与页面校准之间的差异，不是当前目标领域模型：
 
 - `ThreeTierGroup` 是内部组织单元，不强行等同某个巨量对象；
 - `ThreeTierPlan` 按真实页面字段拆入项目或单元；
@@ -330,6 +332,7 @@ carrier
 | `comment_setting` | 单元评论 | `dynamic_enum` | 单元设置 | 显式必填；当前集合为不启用/启用，黄金路径新建初始为启用 | `observed` / `sample_only` |
 | `category_ref` | 所属类别 | `dynamic_reference` | 单元设置 | 新建页有显式必填标记且初始为空；选择器支持搜索和分级类别，当前只观察到顶层样例，完整树待确认 | `observed` / `sample_only` |
 | `brand_ref` | 品牌名称 | `dynamic_reference_or_custom` | 单元设置 | 新建页有显式必填标记且初始为空；选择器支持搜索、平台候选和“自定义品牌名称”分支 | `observed` / `sample_only` |
+| `budget_and_bidding` | 单元预算与出价 | `object` | Promotion 自有字段；与父项目预算/出价分开 | 当前手动 `app内下单` 分支支持每日/总预算、单元预算和单元出价；范围仍按当前页面校验 | `observed` / `operator_reviewed` |
 | `promotion_name` | 单元名称 | `string` | 单元设置 | 新建页有显式必填标记，按产品/时间生成初始名称且可编辑；长度与唯一性待确认 | `observed` |
 | `platform_status` | 单元投放状态 | `dynamic_enum` | 列表/详情，不等于审核或诊断状态 | `observed_readonly / sample_only` | `sample_only` |
 | `review_status` | 平台审核状态 | `dynamic_enum` | 与投放状态独立 | `observed_readonly / unknown` | `platform_pending` |
@@ -426,6 +429,20 @@ PlatformPromotionDraft
 
 上述两个资产弹层的“管理落地页/管理原生锚点”均是写入相邻入口，本阶段没有进入。机器契约已同步到 selector fixture。
 
+### 5.4.1 2026-08-13 条件分支复核
+
+本次复核纠正了把不同父项目分支误判为页面漂移的问题：单元表单的落地页标签由父项目的“投放载体”决定。父项目选择“橙子落地页”时显示橙子落地页输入；选择“自研落地页”时显示自研落地页输入。两者是受配置驱动的合法页面分支，不是可互换的固定标签。
+
+素材容量同样不能冻结为跨场景常量。阶段 B 曾观察到视频/图片/图文 `30/50/10`，本次“电商 + 短视频/图文 + 自研落地页 + app内下单 + 手动投放”分支显示 `10/10/10`；平台页面说明基础素材通常上限 10，部分场景可达 30。因此 Skill 必须读取当前页面容量并与受批准配置做上限检查，不能把任一历史样本写成全局能力矩阵。
+
+本分支还确认“单元预算与出价”属于 Promotion：当前显示每日/总预算、单元预算输入和单元出价输入。稳定定位分别为 `new-landing-id=NONE|SELECT`、`createad_adBudget` 和 `createad_adBid`。这些字段不应继续遗漏在 Promotion Schema，也不能错误归入父项目预算/出价。
+
+标题库存在新的动态行为：打开推荐标题弹层时会自动预选一条候选，但只有点击“确定”才会应用；点击弹层自身的“取消”会保留主表原始标题。Skill 必须记录这一自动预选并始终使用弹层范围内的取消入口，不能用页面上未限定范围的重复“取消”文本。
+
+橙子落地页/按钮跳转分支的补充复核确认，`账户信息` 对应稳定控件 `createad_nativetype_0`；选中态由控件的 `ovui-radio-item--checked` 类回读，选中后抖音号配置区隐藏但相关 DOM 仍可能存在。类别级联选择器必须点击 `createad_yuntuCategory__ocCascader` 内的输入容器，而不是只点击只读 `input`；弹层显示搜索框和顶层类别后可用 Escape 无选择退出。该观察仅证明跨分支控件语义，不提供获批类别引用，也不把橙子落地页分支等同于自研落地页分支。
+
+投手随后授权使用测试账户中的全部既有资产。素材库和落地页库首次打开均短暂返回 0 条，切换页签并等待后分别恢复为数百条视频和多条落地页；因此“0 条”只能作为瞬时加载状态，不能直接冻结为账户无资产。自研落地页分支最终选择并回读了一条既有视频、一条既有自研落地页、一个类别和一个既有品牌。自研落地页输入的实际稳定容器为 `createad_thirdPageUrl__createExternalUrl_input_component`；早先记录的 `createad_normalPageUrl__createExternalUrl_input_component` 不适用于该分支。资产名称、URL、平台 ID 和品牌原值仍按敏感数据策略脱敏。
+
 ### 5.5 最终提交事件的只读定位
 
 本批只定位动作元素、父项目门禁和页面状态，没有点击任何保存、创建、开启或状态切换动作：
@@ -461,9 +478,9 @@ PlatformPromotionDraft
 | `review_status` | 平台审核状态只读结果 | `not_input` | 不能作为创建草稿输入字段；应从写后查询/Connector 读取 |
 | `disclosure` | 人工合规确认/平台披露字段候选 | `platform_pending` | 当前值仅为 mock 审核提示，没有页面字段证据 |
 
-这意味着不能通过简单改名把 `group → plan → creative` 变成 `project → promotion → creative`。Delivery 自主形成独立的 `PlatformProjectDraft`、`PlatformPromotionDraft` 与引用集合，再由后续行为编译消费；不需要把拆分问题提交给其他模块 Owner。
+这意味着不能通过简单改名把 `group → plan → creative` 变成 `project → promotion → creative`。该表保留为历史分析证据；新领域模型不实现 ThreeTier 兼容 projector，而是从版本化平台无关 intent 直接形成目标平台 profile。
 
-新配置的根模型冻结为 `DeliveryPlanVersion → PlatformProjectDraft → PlatformPromotionDraft[]`，机器契约为 [`delivery-platform-configuration/v1`](./schemas/delivery-platform-configuration-v1.json)。`delivery-three-tier/v1` 仍是不可变历史 mock 快照；编辑历史配置必须创建新的 PlanVersion 和 canonical hash，不得原地迁移历史记录。字段归属、条件表达、稳定引用和 PR 切片以[收口文档](./read-only-calibration-closeout.md)为准。
+当前根模型冻结为平台无关 [`DeliveryIntent`](./schemas/delivery-intent-v1.json) 绑定判别式 [`PlatformConfiguration`](./schemas/delivery-platform-configuration-v2.json)。巨量 profile 明确为一个 Project 与零个或多个 Promotions，父关系结构隐式；磁力引擎仅表达 `CAPABILITY_PENDING`，不猜测平台字段。`delivery-three-tier/v1` 与 [`delivery-platform-configuration/v1`](./schemas/delivery-platform-configuration-v1.json) 都保持不可变历史语义。完整版本、引用、hash 与切换边界见[新契约说明](./platform-configuration-contracts.md)。
 
 ## 7. 当前批次进度
 
@@ -531,7 +548,7 @@ PlatformPromotionDraft
 - 将黄金业务流前移到商品、落地页、锚点、人群包和素材准备，并覆盖素材上传、平台审核/质量过滤、多项目/多单元创建、最终开启与投后优化；
 - 明确首个真实电商场景以手动投放为主，重点覆盖版位、人群包、行为兴趣、智能放量、连续时段、学习期和数据驱动调价；
 - 将深度优化方式和倍数调价改为数据驱动策略，不固化为静态推荐；
-- 确认 ThreeTier 拆分、页面 Schema 和稳定引用由 Delivery 自主维护，不再列为其他 Owner 的确认问题；
+- 确认历史 ThreeTier 差异分析、页面 Schema 和稳定引用由 Delivery 自主维护；当前目标以 `DeliveryIntent` + 平台 profile 建模，不要求其他 Owner 或兼容 projector 解释 ThreeTier；
 - 冻结完整场景覆盖目标，缺少的营销目的、载体、目标、模式、定向、竞价和单元形态持续加入覆盖矩阵；
 - 纠正投放身份语义：字段必选，账户信息分支无需更多输入，抖音号分支必须引用已授权账号；
 - 将两段固定审批修正为历史 mock 行为；目标流程默认只在最终真实创建/开启前进行一次确认，高风险动作按风险追加确认。

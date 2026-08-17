@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext } from '@playwright/test'
+import { createRuntimePlan } from './delivery-runtime-fixture'
 
 const projectId = 'project_investor_precision_evidence'
 
@@ -13,7 +14,7 @@ test('complete delivery mock tour is repeatable, resumable, observable, and safe
   expect(preparedResponse.status()).toBe(201)
   const prepared = await preparedResponse.json() as TourRun
   expectTourContract(prepared, runId)
-  expect(prepared.current_step).toBe('configuration')
+  expect(prepared.current_step).toBe('first_approval')
   expect(Object.fromEntries(prepared.cases.filter(tourCase => tourCase.key !== 'golden_path').map(tourCase => [tourCase.key, tourCase.status]))).toEqual({
     preflight_failure: 'observed',
     approval_expired: 'observed',
@@ -30,7 +31,7 @@ test('complete delivery mock tour is repeatable, resumable, observable, and safe
   expect(Object.fromEntries(replay.cases.map(tourCase => [tourCase.key, tourCase.plan_id]))).toEqual(originalPlanIDs)
 
   await page.goto(`/projects/${projectId}/delivery/tour?tour_run_id=${runId}`)
-  await expect(page.getByRole('heading', { name: '从计划创建到优化操作包，一次走完上线后闭环' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '从计划创建到优化审批，一次走完上线后闭环' })).toBeVisible()
   await expect(page.locator('.delivery-tour-cases article')).toHaveCount(6)
   await expect(page.locator('.delivery-tour-case-status.observed')).toHaveCount(5)
   await expect(page.getByText('Mock 环境', { exact: true }).first()).toBeVisible()
@@ -46,19 +47,16 @@ test('complete delivery mock tour is repeatable, resumable, observable, and safe
   await expect(page.getByRole('heading', { name: `上线后优化闭环 · 黄金路径 · ${runId}` })).toBeVisible()
   await expect(page.getByLabel('账户边界')).toHaveValue('mock-tour-advertiser')
   await expect.poll(() => new URL(page.url()).searchParams.get('plan_id')).toBe(goldenPlanId)
-  await page.goto(`/projects/${projectId}/delivery/three-tier?plan_id=${goldenPlanId}&tour_case=golden_path&tour_run_id=${runId}&view=${encodeURIComponent('配置映射')}`)
-  await expect(page.getByRole('heading', { name: '广告组、广告计划与广告创意配置' })).toBeVisible()
+  await page.goto(`/projects/${projectId}/delivery/configuration?plan_id=${goldenPlanId}&tour_case=golden_path&tour_run_id=${runId}&view=${encodeURIComponent('配置映射')}`)
+  await expect(page.getByRole('heading', { name: '平台投放配置' })).toBeVisible()
   await expect(page.getByRole('button', { name: '创建投放计划' })).toHaveCount(0)
-  await expect(page.getByRole('definition').filter({ hasText: '巨量引擎' })).toBeVisible()
-  await expect(page.getByRole('definition').filter({ hasText: '巨量内部配置 v1' })).toBeVisible()
-  await page.getByRole('button', { name: '编译三层配置' }).click()
-  await expect(page.getByText('已编译', { exact: true })).toBeVisible()
-  await expect(page.getByText('当前计划 V2', { exact: true })).toBeVisible()
+  await expect(page.getByText('内容随当前计划版本锁定', { exact: true })).toBeVisible()
+  await expect(page.getByText('当前计划 V1', { exact: true })).toBeVisible()
   await page.reload()
-  await expect(page.getByText('已编译', { exact: true })).toBeVisible()
-  await expect(page.getByText('当前计划 V2', { exact: true })).toBeVisible()
+  await expect(page.getByText('内容随当前计划版本锁定', { exact: true })).toBeVisible()
+  await expect(page.getByText('当前计划 V1', { exact: true })).toBeVisible()
   await page.getByRole('link', { name: '返回走测总览' }).click()
-  await expect(page.getByText('2 / 9 步完成', { exact: true })).toBeVisible()
+  await expect(page.getByText('2 / 8 步完成', { exact: true })).toBeVisible()
   await expect(page.getByText('下一步：提交首个变更申请并前往审批中心', { exact: true })).toBeVisible()
   let plan = await apiJSON<Plan>(request, 'get', planURL(goldenPlanId), undefined, 200)
   let firstChangeSet = await apiJSON<ChangeSet>(request, 'post', `${planURL(goldenPlanId)}:create-change-set`, { expected_version: plan.version }, 201)
@@ -76,16 +74,15 @@ test('complete delivery mock tour is repeatable, resumable, observable, and safe
   const accepted = await apiJSON<RecommendationAcceptance>(request, 'post', `/api/delivery/v1/projects/${projectId}/recommendations/${recommendation.id}:accept`, { expected_version: recommendation.version }, 201, { 'Idempotency-Key': `tour-accept-${suffix}` })
   let secondChangeSet = await apiJSON<ChangeSet>(request, 'post', changeSetAction(accepted.change_set.id, 'preflight'), { expected_version: accepted.change_set.version }, 200)
   secondChangeSet = await apiJSON<ChangeSet>(request, 'post', changeSetAction(secondChangeSet.id, 'approve'), { expected_version: secondChangeSet.version }, 200)
-  await apiJSON(request, 'post', `/api/delivery/v1/projects/${projectId}/change-sets/${secondChangeSet.id}/manual-action-package`, { expected_version: secondChangeSet.version }, 201)
 
   const completed = await apiJSON<TourRun>(request, 'get', tourURL(runId), undefined, 200)
   expect(completed.current_step).toBe('complete')
-  expect(completed.steps).toHaveLength(9)
+  expect(completed.steps).toHaveLength(8)
   expect(completed.steps.every(step => step.complete)).toBe(true)
   expect(completed.steps.every(step => step.evidence.length > 0)).toBe(true)
 
   await page.reload()
-  await expect(page.locator('.delivery-tour-steps li.complete')).toHaveCount(9)
+  await expect(page.locator('.delivery-tour-steps li.complete')).toHaveCount(8)
   await expect(page.getByText('黄金路径已经完成，可检查异常场景或安全复位。')).toBeVisible()
   await page.locator('.delivery-tour-steps li').first().getByRole('link').click()
   await expect.poll(() => new URL(page.url()).searchParams.get('tour_run_id')).toBe(runId)
@@ -120,7 +117,7 @@ test('complete delivery mock tour is repeatable, resumable, observable, and safe
 function expectTourContract(run: TourRun, runId: string) {
   expect(run).toMatchObject({ id: runId, project_id: projectId, owner_id: 'user_local', status: 'prepared', source: 'mock', scenario: 'delivery_tour' })
   expect(run.cases).toHaveLength(7)
-  expect(run.steps).toHaveLength(9)
+  expect(run.steps).toHaveLength(8)
   expect(new Set(run.cases.map(tourCase => tourCase.key))).toEqual(new Set(['golden_path', 'preflight_failure', 'approval_expired', 'plan_stale', 'partial_execution', 'result_unknown', 'review_rejected_alert']))
   for (const tourCase of run.cases) {
     expect(tourCase).toMatchObject({ source: 'mock', scenario: tourCase.key, observed_at: expect.any(String), start_url: expect.stringContaining(`tour_run_id=${runId}`) })
@@ -129,17 +126,7 @@ function expectTourContract(run: TourRun, runId: string) {
 }
 
 async function createOrdinaryPlan(request: APIRequestContext, name: string): Promise<Plan> {
-  return apiJSON<Plan>(request, 'post', `/api/delivery/v1/projects/${projectId}/plans`, {
-    name,
-    objective: 'Reset isolation sentinel',
-    advertiser: { id: 'mock-advertiser-001', name: 'Mock advertiser', platform: 'ocean_engine' },
-    budget: { total_minor: 300000, currency: 'CNY' },
-    schedule: { start_at: '2026-08-12T00:00:00Z', end_at: '2026-08-26T00:00:00Z', timezone: 'Asia/Shanghai' },
-    tracking: { landing_page: 'https://example.test/sentinel', pixel_id: 'PX-SENTINEL', conversion_event: 'submit' },
-    creative_references: [{ asset_id: 'asset_demo_investor_creative_video', version: 1, confirmed: true }],
-    strategy_reference: { task_id: 'task_demo_precision_strategy', version: 1 },
-    source_strategy_version: 'v1',
-  }, 201)
+  return createRuntimePlan(request, projectId, `sentinel-${Date.now().toString(36)}-${name.length}`) as Promise<Plan>
 }
 
 async function apiJSON<T = unknown>(request: APIRequestContext, method: 'get' | 'post', url: string, data: unknown, status: number, headers?: Record<string, string>): Promise<T> {

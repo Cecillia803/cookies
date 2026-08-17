@@ -34,18 +34,20 @@ type LocalIdentity struct {
 }
 
 type Config struct {
-	Environment   Environment
-	HTTPAddr      string
-	MySQL         MySQL
-	Auth          Auth
-	ObjectStorage ObjectStorage
-	Scanner       Scanner
-	Media         Media
-	Provider      Provider
-	Creative      Creative
-	Strategy      Strategy
-	Research      Research
-	LocalIdentity *LocalIdentity
+	Environment        Environment
+	HTTPAddr           string
+	MySQL              MySQL
+	Auth               Auth
+	ObjectStorage      ObjectStorage
+	Scanner            Scanner
+	Media              Media
+	MediaUnderstanding MediaUnderstanding
+	Provider           Provider
+	Creative           Creative
+	Strategy           Strategy
+	Research           Research
+	Miyun              Miyun
+	LocalIdentity      *LocalIdentity
 }
 
 type Auth struct {
@@ -81,6 +83,14 @@ type Media struct {
 	VideoWorkRoot string
 }
 
+// MediaUnderstanding owns multimodal inference rollout independently from
+// Strategy generation and other Creative model features.
+type MediaUnderstanding struct {
+	RealProviderEnabled bool
+	ASREnabled          bool
+	VisionModelAlias    string
+}
+
 // Strategy controls gradual rollout independently from the Creative system.
 // Package-to-Creative permits only the explicit package-to-Intake handoff;
 // approval never creates a Creative task implicitly.
@@ -93,6 +103,7 @@ type Strategy struct {
 	CreativeTaskPlanningEnabled bool
 	QuickViralRemakeEnabled     bool
 	TextModelAlias              string
+	LiteTextModelAlias          string
 	DeepReviewModelAlias        string
 	PromptVersion               string
 	ConversationPromptVersion   string
@@ -122,21 +133,42 @@ type Creative struct {
 // Research configures backend-owned web research. MCP fields are retained only
 // for decoding older local configuration and are not used by the API process.
 type Research struct {
-	SeedEnabled        bool
-	SeedModelAlias     string
-	MaxConcurrent      int
-	TikaEnabled        bool
-	TikaBaseURL        string
-	TikaVersion        string
-	TikaTimeoutSeconds int
-	TikaMaxOutputBytes int
-	MCPStdioCommand    string
-	MCPStdioArgs       []string
-	MCPToolName        string
-	MCPProtocolVersion string
-	MCPEnvAllowlist    []string
-	TimeoutSeconds     int
-	MaxOutputBytes     int
+	SeedEnabled                  bool
+	SeedModelAlias               string
+	DocumentVisionEnabled        bool
+	DocumentVisionModelAlias     string
+	DocumentConverterEnabled     bool
+	DocumentConverterBaseURL     string
+	DocumentConverterVersion     string
+	DocumentConverterTimeout     int
+	DocumentConverterMaxPDFBytes int
+	DocumentConverterAllowHTTP   bool
+	MaxConcurrent                int
+	TikaEnabled                  bool
+	TikaBaseURL                  string
+	TikaVersion                  string
+	TikaTimeoutSeconds           int
+	TikaMaxOutputBytes           int
+	MCPStdioCommand              string
+	MCPStdioArgs                 []string
+	MCPToolName                  string
+	MCPProtocolVersion           string
+	MCPEnvAllowlist              []string
+	TimeoutSeconds               int
+	MaxOutputBytes               int
+}
+
+// Miyun controls the real third-party collection path. It is disabled by
+// default; enabling it requires an application key and explicit CDN allowlist.
+type Miyun struct {
+	Enabled              bool
+	Endpoint             string
+	MasterKey            string
+	MasterKeyVersion     string
+	DownloadAllowedHosts []string
+	MaxConcurrent        int
+	RequestsPerSecond    int
+	CooldownSeconds      int
 }
 
 // Provider contains only local composition choices. Credentials are read from
@@ -147,16 +179,19 @@ type Provider struct {
 	TextAdapter       string
 	AudioAdapter      string
 	SpeechAdapter     string
+	SoundAssetAdapter string
 	MasterKey         string
 	MasterKeyVersion  string
 	OutputBucket      string
 	AllowInsecureHTTP bool
+	AllowDirectVideo  bool
 	ArkImage          ArkImage
 	ArkVideo          ArkVideo
 	ArkText           ArkText
 	OpenAIImage       OpenAIImage
 	VolcengineASR     VolcengineASR
 	VolcengineSpeech  VolcengineSpeech
+	SoundAsset        SoundAsset
 }
 
 type ArkImage struct {
@@ -177,16 +212,28 @@ type ArkVideo struct {
 	BaseURL string
 }
 
+// DefaultArkVideoBaseURL is Ark's public API base. It is applied when
+// COOKIES_ARK_VIDEO_BASE_URL is left empty so a local operator only has to
+// supply an API key and a model.
+const DefaultArkVideoBaseURL = "https://ark.cn-beijing.volces.com/api/v3"
+
+// ArkVideoDirect reports whether Seedance video generation reads its
+// credential straight from the environment instead of the encrypted
+// credential stored in MySQL. Direct mode keeps local setup to editing .env;
+// stored mode remains available for rotation-controlled deployments.
+func (p Provider) ArkVideoDirect() bool {
+	return p.VideoAdapter == "ark_video" && strings.TrimSpace(p.ArkVideo.APIKey) != ""
+}
+
 type OpenAIImage struct {
 	APIKey  string
 	Model   string
 	BaseURL string
 }
 
-// VolcengineASR is the local-only preconfiguration for the recording-file
-// recognition capability. The actual audio.transcribe execution adapter is
-// introduced with the Creative Phase 2 runtime, so keeping this separate from
-// Ark text/video prevents one credential from being used for the wrong API.
+// VolcengineASR configures the shared recording-file recognition adapter.
+// Keeping it separate from Ark text/video prevents one credential from being
+// used for the wrong API.
 type VolcengineASR struct {
 	Endpoint    string
 	AuthMode    string
@@ -202,6 +249,15 @@ type VolcengineSpeech struct {
 	APIKey       string
 	ResourceID   string
 	DefaultVoice string
+}
+
+// SoundAsset configures the optional provider-normalizer used for AI music,
+// ambience and sound-effect generation. It is intentionally independent from
+// TTS: a MiniMax speech credential cannot be used as an AI music credential.
+type SoundAsset struct {
+	Endpoint string
+	APIKey   string
+	Model    string
 }
 
 // MySQL contains only connection-pool configuration. No business module owns
@@ -294,6 +350,14 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaUnderstandingRealProviderEnabled, err := strictBoolValueOr(lookup, "COOKIES_MEDIA_UNDERSTANDING_REAL_PROVIDER_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaUnderstandingASREnabled, err := strictBoolValueOr(lookup, "COOKIES_MEDIA_UNDERSTANDING_ASR_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	strategyApproveEnabled, err := strictBoolValueOr(lookup, "COOKIES_STRATEGY_APPROVE_ENABLED", true)
 	if err != nil {
 		return Config{}, err
@@ -382,6 +446,22 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	documentVisionEnabled, err := strictBoolValueOr(lookup, "COOKIES_DOCUMENT_VISION_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	documentConverterEnabled, err := strictBoolValueOr(lookup, "COOKIES_DOCUMENT_CONVERTER_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	documentConverterAllowHTTP, err := strictBoolValueOr(lookup, "COOKIES_DOCUMENT_CONVERTER_ALLOW_INSECURE_HTTP", false)
+	if err != nil {
+		return Config{}, err
+	}
+	miyunEnabled, err := strictBoolValueOr(lookup, "COOKIES_MIYUN_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	generatePromptDefault := "strategy.generate.v2"
 	conversationPromptDefault := "strategy.conversation.v3"
 	revisePromptDefault := "strategy.revise.v2"
@@ -393,6 +473,15 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 		revisePromptDefault = "strategy.revise.v3"
 		reviewPromptDefault = "strategy.review.deep.v2"
 		repairPromptDefault = "strategy.repair.v2"
+	}
+	tosBucket := valueOrCompatibility(lookup, "COOKIES_TOS_BUCKET", "OBJECT_STORAGE_BUCKET_NAME", "")
+	quarantineBucket := valueOrCompatibility(lookup, "COOKIES_TOS_QUARANTINE_BUCKET", "OBJECT_STORAGE_QUARANTINE_BUCKET", "cookies-quarantine")
+	assetsBucket := valueOrCompatibility(lookup, "COOKIES_TOS_ASSETS_BUCKET", "OBJECT_STORAGE_ASSETS_BUCKET", "cookies-assets")
+	providerOutputBucket := valueOr(lookup, "COOKIES_PROVIDER_OUTPUT_BUCKET", "cookies-provider-output")
+	if tosBucket != "" {
+		quarantineBucket = tosBucket
+		assetsBucket = tosBucket
+		providerOutputBucket = tosBucket
 	}
 	config := Config{
 		Environment: environment,
@@ -416,14 +505,19 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			AccessKey:        valueOrCompatibility(lookup, "COOKIES_TOS_ACCESS_KEY", "OBJECT_STORAGE_ACCESS_KEY", "OBJECT_STORAGE_ACCESS_KEY_ID", ""),
 			SecretKey:        valueOrCompatibility(lookup, "COOKIES_TOS_SECRET_KEY", "OBJECT_STORAGE_SECRET_KEY", "OBJECT_STORAGE_ACCESS_KEY_SECRET", ""),
 			SecurityToken:    valueOrCompatibility(lookup, "COOKIES_TOS_SECURITY_TOKEN", "OBJECT_STORAGE_SECURITY_TOKEN", ""),
-			QuarantineBucket: valueOrCompatibility(lookup, "COOKIES_TOS_QUARANTINE_BUCKET", "OBJECT_STORAGE_QUARANTINE_BUCKET", "cookies-quarantine"),
-			AssetsBucket:     valueOrCompatibility(lookup, "COOKIES_TOS_ASSETS_BUCKET", "OBJECT_STORAGE_ASSETS_BUCKET", "OBJECT_STORAGE_BUCKET_NAME", "cookies-assets"),
+			QuarantineBucket: quarantineBucket,
+			AssetsBucket:     assetsBucket,
 		},
 		Scanner: Scanner{Mode: valueOr(lookup, "COOKIES_SCANNER_MODE", "noop"), Address: valueOr(lookup, "COOKIES_CLAMAV_ADDRESS", "")},
 		Media: Media{
 			FFmpegPath:    valueOr(lookup, "COOKIES_FFMPEG_PATH", ""),
 			FFprobePath:   valueOr(lookup, "COOKIES_FFPROBE_PATH", ""),
 			VideoWorkRoot: valueOr(lookup, "COOKIES_VIDEO_WORK_ROOT", ".data/video-work"),
+		},
+		MediaUnderstanding: MediaUnderstanding{
+			RealProviderEnabled: mediaUnderstandingRealProviderEnabled,
+			ASREnabled:          mediaUnderstandingASREnabled,
+			VisionModelAlias:    valueOr(lookup, "COOKIES_MEDIA_UNDERSTANDING_VISION_MODEL_ALIAS", "cookies.vision.standard"),
 		},
 		Creative: Creative{
 			DirectionPlanningEnabled:       directionPlanningEnabled,
@@ -447,6 +541,7 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			CreativeTaskPlanningEnabled: strategyCreativeTaskPlanningEnabled,
 			QuickViralRemakeEnabled:     strategyQuickViralRemakeEnabled,
 			TextModelAlias:              valueOr(lookup, "COOKIES_STRATEGY_TEXT_MODEL_ALIAS", "cookies.text.standard"),
+			LiteTextModelAlias:          valueOr(lookup, "COOKIES_STRATEGY_LITE_TEXT_MODEL_ALIAS", "cookies.text.lite"),
 			DeepReviewModelAlias:        valueOr(lookup, "COOKIES_STRATEGY_DEEP_REVIEW_MODEL_ALIAS", "cookies.text.deep_review"),
 			PromptVersion:               valueOr(lookup, "COOKIES_STRATEGY_PROMPT_VERSION", generatePromptDefault),
 			ConversationPromptVersion:   valueOr(lookup, "COOKIES_STRATEGY_CONVERSATION_PROMPT_VERSION", conversationPromptDefault),
@@ -459,20 +554,35 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			OrganizationAllowlist:       splitCSV(valueOr(lookup, "COOKIES_STRATEGY_ORGANIZATION_ALLOWLIST", "")),
 		},
 		Research: Research{
-			SeedEnabled:        researchSeedEnabled,
-			SeedModelAlias:     valueOr(lookup, "COOKIES_RESEARCH_SEED_MODEL_ALIAS", "cookies.research.web.standard"),
-			MaxConcurrent:      intValueOr(lookup, "COOKIES_RESEARCH_MAX_CONCURRENT", 3),
-			TikaEnabled:        researchTikaEnabled,
-			TikaBaseURL:        valueOr(lookup, "COOKIES_RESEARCH_TIKA_BASE_URL", "http://127.0.0.1:9998"),
-			TikaVersion:        valueOr(lookup, "COOKIES_RESEARCH_TIKA_VERSION", "3.2.3.0"),
-			TikaTimeoutSeconds: intValueOr(lookup, "COOKIES_RESEARCH_TIKA_TIMEOUT_SECONDS", 120),
-			TikaMaxOutputBytes: intValueOr(lookup, "COOKIES_RESEARCH_TIKA_MAX_OUTPUT_BYTES", 20*1024*1024),
-			MCPStdioCommand:    strings.TrimSpace(valueOr(lookup, "COOKIES_RESEARCH_MCP_STDIO_COMMAND", "")),
-			MCPToolName:        valueOr(lookup, "COOKIES_RESEARCH_MCP_TOOL_NAME", "research"),
-			MCPProtocolVersion: valueOr(lookup, "COOKIES_RESEARCH_MCP_PROTOCOL_VERSION", "2025-11-25"),
-			MCPEnvAllowlist:    splitCSV(valueOr(lookup, "COOKIES_RESEARCH_MCP_ENV_ALLOWLIST", "PATH,PATHEXT,SystemRoot,TEMP,TMP,ComSpec")),
-			TimeoutSeconds:     intValueOr(lookup, "COOKIES_RESEARCH_TIMEOUT_SECONDS", 120),
-			MaxOutputBytes:     intValueOr(lookup, "COOKIES_RESEARCH_MAX_OUTPUT_BYTES", 4*1024*1024),
+			SeedEnabled:                  researchSeedEnabled,
+			SeedModelAlias:               valueOr(lookup, "COOKIES_RESEARCH_SEED_MODEL_ALIAS", "cookies.research.web.standard"),
+			DocumentVisionEnabled:        documentVisionEnabled,
+			DocumentVisionModelAlias:     valueOr(lookup, "COOKIES_DOCUMENT_VISION_MODEL_ALIAS", "cookies.document.vision.standard"),
+			DocumentConverterEnabled:     documentConverterEnabled,
+			DocumentConverterBaseURL:     valueOr(lookup, "COOKIES_DOCUMENT_CONVERTER_BASE_URL", "http://127.0.0.1:3000"),
+			DocumentConverterVersion:     valueOr(lookup, "COOKIES_DOCUMENT_CONVERTER_VERSION", "gotenberg-8.34.0"),
+			DocumentConverterTimeout:     intValueOr(lookup, "COOKIES_DOCUMENT_CONVERTER_TIMEOUT_SECONDS", 120),
+			DocumentConverterMaxPDFBytes: intValueOr(lookup, "COOKIES_DOCUMENT_CONVERTER_MAX_PDF_BYTES", 32*1024*1024),
+			DocumentConverterAllowHTTP:   documentConverterAllowHTTP,
+			MaxConcurrent:                intValueOr(lookup, "COOKIES_RESEARCH_MAX_CONCURRENT", 3),
+			TikaEnabled:                  researchTikaEnabled,
+			TikaBaseURL:                  valueOr(lookup, "COOKIES_RESEARCH_TIKA_BASE_URL", "http://127.0.0.1:9998"),
+			TikaVersion:                  valueOr(lookup, "COOKIES_RESEARCH_TIKA_VERSION", "3.2.3.0"),
+			TikaTimeoutSeconds:           intValueOr(lookup, "COOKIES_RESEARCH_TIKA_TIMEOUT_SECONDS", 120),
+			TikaMaxOutputBytes:           intValueOr(lookup, "COOKIES_RESEARCH_TIKA_MAX_OUTPUT_BYTES", 20*1024*1024),
+			MCPStdioCommand:              strings.TrimSpace(valueOr(lookup, "COOKIES_RESEARCH_MCP_STDIO_COMMAND", "")),
+			MCPToolName:                  valueOr(lookup, "COOKIES_RESEARCH_MCP_TOOL_NAME", "research"),
+			MCPProtocolVersion:           valueOr(lookup, "COOKIES_RESEARCH_MCP_PROTOCOL_VERSION", "2025-11-25"),
+			MCPEnvAllowlist:              splitCSV(valueOr(lookup, "COOKIES_RESEARCH_MCP_ENV_ALLOWLIST", "PATH,PATHEXT,SystemRoot,TEMP,TMP,ComSpec")),
+			TimeoutSeconds:               intValueOr(lookup, "COOKIES_RESEARCH_TIMEOUT_SECONDS", 120),
+			MaxOutputBytes:               intValueOr(lookup, "COOKIES_RESEARCH_MAX_OUTPUT_BYTES", 4*1024*1024),
+		},
+		Miyun: Miyun{
+			Enabled: miyunEnabled, Endpoint: valueOr(lookup, "COOKIES_MIYUN_ENDPOINT", "https://api.youshu.youcloud.com/graphql"),
+			MasterKey: valueOr(lookup, "COOKIES_MIYUN_MASTER_KEY", ""), MasterKeyVersion: valueOr(lookup, "COOKIES_MIYUN_MASTER_KEY_VERSION", "v1"),
+			DownloadAllowedHosts: splitCSV(valueOr(lookup, "COOKIES_MIYUN_DOWNLOAD_ALLOWED_HOSTS", "")),
+			MaxConcurrent:        intValueOr(lookup, "COOKIES_MIYUN_MAX_CONCURRENT", 1), RequestsPerSecond: intValueOr(lookup, "COOKIES_MIYUN_REQUESTS_PER_SECOND", 5),
+			CooldownSeconds: intValueOr(lookup, "COOKIES_MIYUN_COOLDOWN_SECONDS", 300),
 		},
 		Provider: Provider{
 			ImageAdapter:      valueOr(lookup, "COOKIES_PROVIDER_IMAGE_ADAPTER", "fake"),
@@ -480,10 +590,12 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			TextAdapter:       valueOr(lookup, "COOKIES_PROVIDER_TEXT_ADAPTER", "fake"),
 			AudioAdapter:      valueOr(lookup, "COOKIES_PROVIDER_AUDIO_ADAPTER", "fake"),
 			SpeechAdapter:     valueOr(lookup, "COOKIES_PROVIDER_SPEECH_ADAPTER", "fake"),
+			SoundAssetAdapter: valueOr(lookup, "COOKIES_PROVIDER_SOUND_ASSET_ADAPTER", "disabled"),
 			MasterKey:         valueOr(lookup, "COOKIES_PROVIDER_MASTER_KEY", ""),
 			MasterKeyVersion:  valueOr(lookup, "COOKIES_PROVIDER_MASTER_KEY_VERSION", "v1"),
-			OutputBucket:      valueOr(lookup, "COOKIES_PROVIDER_OUTPUT_BUCKET", "cookies-provider-output"),
+			OutputBucket:      providerOutputBucket,
 			AllowInsecureHTTP: boolValueOr(lookup, "COOKIES_PROVIDER_ALLOW_INSECURE_HTTP", false),
+			AllowDirectVideo:  boolValueOr(lookup, "COOKIES_PROVIDER_ALLOW_DIRECT_VIDEO", false),
 			ArkImage: ArkImage{
 				APIKey:  valueOr(lookup, "COOKIES_ARK_IMAGE_API_KEY", ""),
 				Model:   valueOr(lookup, "COOKIES_ARK_IMAGE_MODEL", ""),
@@ -492,7 +604,7 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			ArkVideo: ArkVideo{
 				APIKey:  valueOr(lookup, "COOKIES_ARK_VIDEO_API_KEY", ""),
 				Model:   valueOr(lookup, "COOKIES_ARK_VIDEO_MODEL", ""),
-				BaseURL: valueOr(lookup, "COOKIES_ARK_VIDEO_BASE_URL", ""),
+				BaseURL: valueOr(lookup, "COOKIES_ARK_VIDEO_BASE_URL", DefaultArkVideoBaseURL),
 			},
 			ArkText: ArkText{
 				APIKey:  valueOr(lookup, "COOKIES_ARK_TEXT_API_KEY", ""),
@@ -519,6 +631,11 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 				ResourceID:   valueOr(lookup, "COOKIES_VOLCENGINE_SPEECH_RESOURCE_ID", "seed-tts-2.0"),
 				DefaultVoice: valueOr(lookup, "COOKIES_VOLCENGINE_SPEECH_DEFAULT_VOICE", ""),
 			},
+			SoundAsset: SoundAsset{
+				Endpoint: valueOr(lookup, "COOKIES_SOUND_ASSET_ENDPOINT", ""),
+				APIKey:   valueOr(lookup, "COOKIES_SOUND_ASSET_API_KEY", ""),
+				Model:    valueOr(lookup, "COOKIES_SOUND_ASSET_MODEL", ""),
+			},
 		},
 	}
 	if raw := strings.TrimSpace(valueOr(lookup, "COOKIES_RESEARCH_MCP_STDIO_ARGS_JSON", "")); raw != "" {
@@ -542,6 +659,12 @@ func FromLookup(lookup func(string) (string, bool)) (Config, error) {
 			ProjectID:      identityValues["project_id"],
 			Scopes:         splitCSV(identityValues["scopes"]),
 		}
+	}
+
+	// An empty COOKIES_ARK_VIDEO_BASE_URL means "use Ark's public API", so a
+	// local operator only has to paste a key and a model.
+	if strings.TrimSpace(config.Provider.ArkVideo.BaseURL) == "" {
+		config.Provider.ArkVideo.BaseURL = DefaultArkVideoBaseURL
 	}
 
 	if err := config.Validate(); err != nil {
@@ -576,8 +699,8 @@ func (c Config) Validate() error {
 	if c.ObjectStorage.Provider != "memory" && c.ObjectStorage.Provider != "filesystem" && c.ObjectStorage.Provider != "tos" {
 		return fmt.Errorf("COOKIES_BLOB_PROVIDER must be memory, filesystem, or tos")
 	}
-	if strings.TrimSpace(c.ObjectStorage.QuarantineBucket) == "" || strings.TrimSpace(c.ObjectStorage.AssetsBucket) == "" || c.ObjectStorage.QuarantineBucket == c.ObjectStorage.AssetsBucket {
-		return fmt.Errorf("object storage requires distinct quarantine and assets buckets")
+	if strings.TrimSpace(c.ObjectStorage.QuarantineBucket) == "" || strings.TrimSpace(c.ObjectStorage.AssetsBucket) == "" {
+		return fmt.Errorf("object storage requires quarantine and assets bucket names")
 	}
 	if c.ObjectStorage.Provider == "tos" && (c.ObjectStorage.Endpoint == "" || c.ObjectStorage.Region == "" || c.ObjectStorage.AccessKey == "" || c.ObjectStorage.SecretKey == "") {
 		return fmt.Errorf("TOS storage requires endpoint, region, access key, and secret key")
@@ -615,6 +738,43 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Research.SeedModelAlias) == "" {
 		return fmt.Errorf("COOKIES_RESEARCH_SEED_MODEL_ALIAS must not be empty")
 	}
+	if strings.TrimSpace(c.Research.DocumentVisionModelAlias) == "" {
+		return fmt.Errorf("COOKIES_DOCUMENT_VISION_MODEL_ALIAS must not be empty")
+	}
+	if c.Research.DocumentVisionEnabled {
+		if c.ObjectStorage.Provider != "tos" {
+			return fmt.Errorf("COOKIES_DOCUMENT_VISION_ENABLED requires TOS object storage")
+		}
+		if c.ObjectStorage.AssetsBucket != c.ObjectStorage.QuarantineBucket ||
+			c.ObjectStorage.AssetsBucket != c.Provider.OutputBucket {
+			return fmt.Errorf("document vision requires one shared TOS bucket for quarantine, assets, and provider output")
+		}
+		if strings.TrimSpace(c.Provider.MasterKey) == "" {
+			return fmt.Errorf("document vision requires COOKIES_PROVIDER_MASTER_KEY for encrypted LAS credentials")
+		}
+	}
+	if c.Research.DocumentConverterEnabled {
+		if !c.Research.DocumentVisionEnabled {
+			return fmt.Errorf("COOKIES_DOCUMENT_CONVERTER_ENABLED requires COOKIES_DOCUMENT_VISION_ENABLED")
+		}
+		converterURL, err := url.Parse(strings.TrimSpace(c.Research.DocumentConverterBaseURL))
+		if err != nil || converterURL.Host == "" || (converterURL.Scheme != "http" && converterURL.Scheme != "https") ||
+			converterURL.User != nil || converterURL.RawQuery != "" || converterURL.Fragment != "" {
+			return fmt.Errorf("COOKIES_DOCUMENT_CONVERTER_BASE_URL must be an absolute HTTP(S) URL without credentials, query, or fragment")
+		}
+		if converterURL.Scheme == "http" && !c.Research.DocumentConverterAllowHTTP {
+			return fmt.Errorf("HTTP document converter requires COOKIES_DOCUMENT_CONVERTER_ALLOW_INSECURE_HTTP=true")
+		}
+		if strings.TrimSpace(c.Research.DocumentConverterVersion) == "" {
+			return fmt.Errorf("COOKIES_DOCUMENT_CONVERTER_VERSION must not be empty")
+		}
+		if c.Research.DocumentConverterTimeout < 10 || c.Research.DocumentConverterTimeout > 600 {
+			return fmt.Errorf("COOKIES_DOCUMENT_CONVERTER_TIMEOUT_SECONDS must be between 10 and 600")
+		}
+		if c.Research.DocumentConverterMaxPDFBytes < 1024*1024 || c.Research.DocumentConverterMaxPDFBytes > 64*1024*1024 {
+			return fmt.Errorf("COOKIES_DOCUMENT_CONVERTER_MAX_PDF_BYTES must be between 1048576 and 67108864")
+		}
+	}
 	if c.Research.MaxConcurrent < 1 || c.Research.MaxConcurrent > 4 {
 		return fmt.Errorf("COOKIES_RESEARCH_MAX_CONCURRENT must be between 1 and 4")
 	}
@@ -637,6 +797,33 @@ func (c Config) Validate() error {
 		(strings.TrimSpace(c.Research.MCPToolName) == "" || strings.TrimSpace(c.Research.MCPProtocolVersion) == "") {
 		return fmt.Errorf("MCP stdio research requires a tool name and protocol version")
 	}
+	if c.Miyun.MaxConcurrent < 1 || c.Miyun.MaxConcurrent > 2 {
+		return fmt.Errorf("COOKIES_MIYUN_MAX_CONCURRENT must be between 1 and 2")
+	}
+	if c.Miyun.RequestsPerSecond < 1 || c.Miyun.RequestsPerSecond > 8 {
+		return fmt.Errorf("COOKIES_MIYUN_REQUESTS_PER_SECOND must be between 1 and 8")
+	}
+	if c.Miyun.CooldownSeconds < 60 || c.Miyun.CooldownSeconds > 3600 {
+		return fmt.Errorf("COOKIES_MIYUN_COOLDOWN_SECONDS must be between 60 and 3600")
+	}
+	if c.Miyun.Enabled {
+		endpoint, err := url.Parse(strings.TrimSpace(c.Miyun.Endpoint))
+		if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
+			return fmt.Errorf("COOKIES_MIYUN_ENDPOINT must be an absolute HTTPS URL")
+		}
+		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(c.Miyun.MasterKey))
+		if err != nil || len(key) != 32 || strings.TrimSpace(c.Miyun.MasterKeyVersion) == "" {
+			return fmt.Errorf("COOKIES_MIYUN_MASTER_KEY must be a base64-encoded 32-byte key with a version")
+		}
+		if len(c.Miyun.DownloadAllowedHosts) == 0 {
+			return fmt.Errorf("COOKIES_MIYUN_DOWNLOAD_ALLOWED_HOSTS is required when Miyun is enabled")
+		}
+		for _, host := range c.Miyun.DownloadAllowedHosts {
+			if strings.TrimSpace(host) == "" || strings.ContainsAny(host, "/@?#") {
+				return fmt.Errorf("COOKIES_MIYUN_DOWNLOAD_ALLOWED_HOSTS must contain hostnames only")
+			}
+		}
+	}
 	if c.Provider.ImageAdapter != "fake" && c.Provider.ImageAdapter != "ark_image" && c.Provider.ImageAdapter != "openai_image" && c.Provider.ImageAdapter != "adapter_gateway" {
 		return fmt.Errorf("COOKIES_PROVIDER_IMAGE_ADAPTER must be fake, ark_image, openai_image, or adapter_gateway")
 	}
@@ -646,17 +833,35 @@ func (c Config) Validate() error {
 	if c.Provider.VideoAdapter != "fake" && c.Provider.VideoAdapter != "adapter_gateway" && c.Provider.VideoAdapter != "ark_video" {
 		return fmt.Errorf("COOKIES_PROVIDER_VIDEO_ADAPTER must be fake, adapter_gateway, or ark_video")
 	}
+	if c.Provider.VideoAdapter == "ark_video" && !c.Provider.AllowDirectVideo {
+		return fmt.Errorf("ark_video requires explicit COOKIES_PROVIDER_ALLOW_DIRECT_VIDEO=true; use adapter_gateway by default")
+	}
 	if c.Provider.AudioAdapter != "fake" && c.Provider.AudioAdapter != "volcengine_asr" {
 		return fmt.Errorf("COOKIES_PROVIDER_AUDIO_ADAPTER must be fake or volcengine_asr")
 	}
 	if c.Provider.SpeechAdapter != "fake" && c.Provider.SpeechAdapter != "volcengine_speech" && c.Provider.SpeechAdapter != "minimax_speech" {
 		return fmt.Errorf("COOKIES_PROVIDER_SPEECH_ADAPTER must be fake, volcengine_speech, or minimax_speech")
 	}
+	if c.Provider.SoundAssetAdapter != "disabled" && c.Provider.SoundAssetAdapter != "http" {
+		return fmt.Errorf("COOKIES_PROVIDER_SOUND_ASSET_ADAPTER must be disabled or http")
+	}
 	if c.Strategy.RealProviderEnabled && c.Provider.TextAdapter != "adapter_gateway" && c.Provider.TextAdapter != "ark_text" {
 		return fmt.Errorf("COOKIES_STRATEGY_REAL_PROVIDER_ENABLED requires a real text adapter")
 	}
+	if strings.TrimSpace(c.MediaUnderstanding.VisionModelAlias) == "" {
+		return fmt.Errorf("COOKIES_MEDIA_UNDERSTANDING_VISION_MODEL_ALIAS must not be empty")
+	}
+	if c.MediaUnderstanding.RealProviderEnabled && c.Provider.TextAdapter != "adapter_gateway" {
+		return fmt.Errorf("COOKIES_MEDIA_UNDERSTANDING_REAL_PROVIDER_ENABLED requires COOKIES_PROVIDER_TEXT_ADAPTER=adapter_gateway")
+	}
+	if c.MediaUnderstanding.ASREnabled && c.Provider.AudioAdapter != "volcengine_asr" {
+		return fmt.Errorf("COOKIES_MEDIA_UNDERSTANDING_ASR_ENABLED requires COOKIES_PROVIDER_AUDIO_ADAPTER=volcengine_asr")
+	}
 	if strings.TrimSpace(c.Strategy.TextModelAlias) == "" {
 		return fmt.Errorf("COOKIES_STRATEGY_TEXT_MODEL_ALIAS must not be empty")
+	}
+	if strings.TrimSpace(c.Strategy.LiteTextModelAlias) == "" {
+		return fmt.Errorf("COOKIES_STRATEGY_LITE_TEXT_MODEL_ALIAS must not be empty")
 	}
 	if strings.TrimSpace(c.Strategy.DeepReviewModelAlias) == "" {
 		return fmt.Errorf("COOKIES_STRATEGY_DEEP_REVIEW_MODEL_ALIAS must not be empty")
@@ -703,6 +908,15 @@ func (c Config) Validate() error {
 	if c.Provider.VideoAdapter == "ark_video" && c.Environment != EnvironmentLocal {
 		return fmt.Errorf("ark_video is local-only in Phase 1")
 	}
+	if c.Provider.ArkVideoDirect() {
+		if strings.TrimSpace(c.Provider.ArkVideo.Model) == "" {
+			return fmt.Errorf("COOKIES_ARK_VIDEO_API_KEY requires COOKIES_ARK_VIDEO_MODEL")
+		}
+		base, err := url.Parse(c.Provider.ArkVideo.BaseURL)
+		if err != nil || base.Host == "" || (base.Scheme != "https" && !(base.Scheme == "http" && c.Provider.AllowInsecureHTTP)) {
+			return fmt.Errorf("COOKIES_ARK_VIDEO_BASE_URL must be an absolute HTTPS URL")
+		}
+	}
 	if c.Provider.ImageAdapter == "openai_image" && (c.Environment != EnvironmentLocal || strings.TrimSpace(c.Provider.OpenAIImage.APIKey) == "" || strings.TrimSpace(c.Provider.OpenAIImage.Model) == "" || strings.TrimSpace(c.Provider.OpenAIImage.BaseURL) == "") {
 		return fmt.Errorf("openai_image is local-only and requires COOKIES_OPENAI_IMAGE_API_KEY, COOKIES_OPENAI_IMAGE_MODEL, and COOKIES_OPENAI_IMAGE_BASE_URL")
 	}
@@ -710,9 +924,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("ark_text is local-only and requires COOKIES_ARK_TEXT_API_KEY and COOKIES_ARK_TEXT_MODEL")
 	}
 	if c.Provider.AudioAdapter == "volcengine_asr" {
-		if c.Environment != EnvironmentLocal {
-			return fmt.Errorf("volcengine_asr is local-only until the audio.transcribe runtime is introduced")
-		}
 		endpoint, err := url.Parse(c.Provider.VolcengineASR.Endpoint)
 		if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
 			return fmt.Errorf("COOKIES_VOLCENGINE_ASR_ENDPOINT must be an absolute HTTPS URL")
@@ -742,12 +953,28 @@ func (c Config) Validate() error {
 			return fmt.Errorf("volcengine_speech requires API key, resource ID and default voice")
 		}
 	}
+	if c.Provider.SoundAssetAdapter == "http" {
+		endpoint, err := url.Parse(c.Provider.SoundAsset.Endpoint)
+		if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
+			return fmt.Errorf("COOKIES_SOUND_ASSET_ENDPOINT must be an absolute HTTPS URL")
+		}
+		if strings.TrimSpace(c.Provider.SoundAsset.APIKey) == "" || strings.TrimSpace(c.Provider.SoundAsset.Model) == "" {
+			return fmt.Errorf("sound_asset http requires endpoint, API key and model")
+		}
+	}
+	// ark_video only needs an output bucket when it reads its key from the
+	// encrypted store. With COOKIES_ARK_VIDEO_API_KEY set the adapter talks to
+	// Ark directly and keeps its outputs local.
 	usesGenerationBroker := c.Provider.ImageAdapter == "adapter_gateway" ||
 		c.Provider.TextAdapter == "adapter_gateway" ||
 		c.Provider.VideoAdapter == "adapter_gateway" ||
-		c.Provider.VideoAdapter == "ark_video" ||
+		(c.Provider.VideoAdapter == "ark_video" && !c.Provider.ArkVideoDirect()) ||
 		c.Provider.SpeechAdapter == "minimax_speech"
-	usesCredentialBroker := usesGenerationBroker || c.Research.SeedEnabled
+	// ark_video always needs the master key, direct credential or not: the
+	// Settings page encrypts whatever the operator saves there, and the stored
+	// route takes precedence over the environment once it exists.
+	usesCredentialBroker := usesGenerationBroker || c.Research.SeedEnabled ||
+		c.Provider.VideoAdapter == "ark_video"
 	if usesCredentialBroker && (strings.TrimSpace(c.Provider.MasterKey) == "" || strings.TrimSpace(c.Provider.MasterKeyVersion) == "") {
 		return fmt.Errorf("configured Provider adapter requires COOKIES_PROVIDER_MASTER_KEY and COOKIES_PROVIDER_MASTER_KEY_VERSION")
 	}
@@ -756,11 +983,8 @@ func (c Config) Validate() error {
 		if err != nil || len(key) != 32 {
 			return fmt.Errorf("COOKIES_PROVIDER_MASTER_KEY must be base64-encoded 32 bytes")
 		}
-		if usesGenerationBroker &&
-			(strings.TrimSpace(c.Provider.OutputBucket) == "" ||
-				c.Provider.OutputBucket == c.ObjectStorage.AssetsBucket ||
-				c.Provider.OutputBucket == c.ObjectStorage.QuarantineBucket) {
-			return fmt.Errorf("adapter_gateway requires a distinct COOKIES_PROVIDER_OUTPUT_BUCKET")
+		if usesGenerationBroker && strings.TrimSpace(c.Provider.OutputBucket) == "" {
+			return fmt.Errorf("adapter_gateway requires an output bucket")
 		}
 		if c.Provider.AllowInsecureHTTP && c.Environment != EnvironmentLocal {
 			return fmt.Errorf("COOKIES_PROVIDER_ALLOW_INSECURE_HTTP is permitted only when COOKIES_ENV=local")

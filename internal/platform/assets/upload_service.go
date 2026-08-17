@@ -12,6 +12,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	"net/http"
 	"path"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/shikanon/cookies/internal/platform/contract"
 	"github.com/shikanon/cookies/internal/platform/ids"
+	_ "golang.org/x/image/webp"
 )
 
 type ActiveProjectResolver interface {
@@ -39,6 +41,13 @@ type UploadService struct {
 	NewID            ids.Generator
 	VideoProbe       VideoMetadataProbe
 	AudioProbe       AudioMetadataProbe
+	UsePolicy        AssetUseAuthorizer
+	// Ledger 是洞察那边的素材台账。留空就不记，素材库照常工作——
+	// 台账是个旁路账本，不该有能力让上传失败。
+	Ledger LedgerRecorder
+	// Derivatives 是派生物（现在只有视频首帧图）。和 Ledger 一样是旁路：
+	// 留空就不排任务，上传照常成功。
+	Derivatives *DerivativeService
 }
 
 func (s UploadService) Create(ctx context.Context, requestContext contract.RequestContext, projectID contract.ProjectID, key contract.IdempotencyKey, request CreateUploadRequest) (CreateUploadResponse, error) {
@@ -78,7 +87,7 @@ func (s UploadService) Create(ctx context.Context, requestContext contract.Reque
 		ID: sessionID, OrganizationID: requestContext.Actor.OrganizationID, ProjectID: projectID,
 		Principal: requestContext.Actor.Principal, Status: UploadCreated, Filename: request.Filename,
 		DeclaredMIMEType: request.DeclaredMIMEType, DeclaredSizeBytes: request.DeclaredSizeBytes,
-		DeclaredSHA256: request.DeclaredSHA256, Quarantine: ObjectLocation{Provider: s.BlobProvider(), Bucket: s.QuarantineBucket, Key: quarantineKey(requestContext.Actor.OrganizationID, sessionID)},
+		DeclaredSHA256: request.DeclaredSHA256, Quarantine: ObjectLocation{Provider: s.BlobProvider(), Bucket: s.QuarantineBucket, Key: quarantineKey(requestContext.Actor.OrganizationID, projectID, sessionID)},
 		IdempotencyKey: key, RequestHash: requestHash, ProjectContextVersion: projectContext.ProjectContextVersion,
 		TargetAssetID: contract.AssetID(assetID), TargetBlobID: blobID, RequestID: requestContext.RequestID,
 		TraceID: requestContext.TraceID, ExpiresAt: now.Add(s.uploadTTL()), CreatedAt: now, UpdatedAt: now,
@@ -96,6 +105,9 @@ func (s UploadService) Create(ctx context.Context, requestContext contract.Reque
 	ttl := stored.ExpiresAt.Sub(s.now())
 	if ttl <= 0 {
 		return CreateUploadResponse{}, ErrInvalidState
+	}
+	if err := s.validateQuarantineScope(stored); err != nil {
+		return CreateUploadResponse{}, err
 	}
 	signed, err := s.Blobs.SignPut(ctx, stored.Quarantine.Bucket, stored.Quarantine.Key, stored.DeclaredMIMEType, stored.DeclaredSizeBytes, ttl)
 	if err != nil {
@@ -119,6 +131,9 @@ func (s UploadService) PutContent(ctx context.Context, actor contract.ActorConte
 	}
 	if session.Principal != actor.Principal {
 		return ErrNotFound
+	}
+	if err := s.validateQuarantineScope(session); err != nil {
+		return err
 	}
 	if session.Status != UploadCreated || s.now().After(session.ExpiresAt) {
 		return ErrInvalidState
@@ -145,6 +160,9 @@ func (s UploadService) Finalize(ctx context.Context, requestContext contract.Req
 	}
 	if session.Principal != requestContext.Actor.Principal {
 		return UploadSession{}, ErrNotFound
+	}
+	if err := s.validateQuarantineScope(session); err != nil {
+		return UploadSession{}, err
 	}
 	if session.Status == UploadSucceeded {
 		return session, nil
@@ -190,6 +208,14 @@ func (s UploadService) Finalize(ctx context.Context, requestContext contract.Req
 		return UploadSession{}, err
 	}
 	_ = s.Blobs.Delete(ctx, session.Quarantine)
+	s.recordLedger(ctx, LedgerEntry{
+		OrganizationID: session.OrganizationID, ProjectID: session.ProjectID,
+		ActorID: session.Principal.ID,
+		AssetID: ref.AssetVersion.AssetID, Version: ref.AssetVersion.Version,
+		Kind: commit.Kind, SourceType: commit.SourceType,
+		Title: LedgerTitle(session.Filename, commit.SourceType, s.now()),
+	})
+	s.ensurePoster(ctx, session.OrganizationID, session.ProjectID, ref.AssetVersion, commit.Kind)
 	session.Status = UploadSucceeded
 	session.ProjectAssetRef = &ref
 	session.UpdatedAt = s.now()
@@ -203,7 +229,15 @@ func (s UploadService) List(ctx context.Context, actor contract.ActorContext, pr
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	return s.Repository.ListProjectAssets(ctx, actor.OrganizationID, projectID, limit)
+	items, err := s.Repository.ListProjectAssets(ctx, actor.OrganizationID, projectID, limit)
+	if err != nil || s.UsePolicy == nil {
+		return items, err
+	}
+	for index := range items {
+		decision, _ := s.UsePolicy.Authorize(ctx, AssetUseRequest{OrganizationID: actor.OrganizationID, ProjectID: projectID, AssetRef: items[index].Version.Ref(), Purpose: AssetUsePreview})
+		items[index].UseDecision = &decision
+	}
+	return items, nil
 }
 
 func (s UploadService) Get(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, ref contract.AssetVersionRef) (ProjectAsset, error) {
@@ -230,6 +264,9 @@ func (s UploadService) Preview(ctx context.Context, actor contract.ActorContext,
 	if asset.Version.Status != AssetReady {
 		return SignedRequest{}, ErrAssetNotReady
 	}
+	if err := s.authorizeAssetUse(ctx, actor, projectID, ref, AssetUsePreview); err != nil {
+		return SignedRequest{}, err
+	}
 	return s.Blobs.SignGet(ctx, asset.Version.Blob, s.previewTTL())
 }
 
@@ -250,6 +287,9 @@ func (s UploadService) OpenPreview(ctx context.Context, actor contract.ActorCont
 	if asset.Version.Status != AssetReady {
 		return nil, ObjectInfo{}, ErrAssetNotReady
 	}
+	if err := s.authorizeAssetUse(ctx, actor, projectID, ref, AssetUsePreview); err != nil {
+		return nil, ObjectInfo{}, err
+	}
 	reader, info, err := s.Blobs.Open(ctx, asset.Version.Blob)
 	if err != nil {
 		return nil, ObjectInfo{}, err
@@ -260,6 +300,14 @@ func (s UploadService) OpenPreview(ctx context.Context, actor contract.ActorCont
 	}
 	info.MIMEType = asset.Version.MIMEType
 	return reader, info, nil
+}
+
+func (s UploadService) authorizeAssetUse(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, ref contract.AssetVersionRef, purpose AssetUsePurpose) error {
+	if s.UsePolicy == nil {
+		return nil
+	}
+	_, err := s.UsePolicy.Authorize(ctx, AssetUseRequest{OrganizationID: actor.OrganizationID, ProjectID: projectID, AssetRef: ref, Purpose: purpose})
+	return err
 }
 
 func (s UploadService) Remove(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, ref contract.AssetVersionRef) error {
@@ -276,17 +324,19 @@ func (s UploadService) Remove(ctx context.Context, actor contract.ActorContext, 
 // The render job remains Creative-owned; Assets validates and persists a new
 // immutable video version and makes retries idempotent by render_job_id.
 func (s UploadService) IngestRenderedVideo(ctx context.Context, requestContext contract.RequestContext, projectID contract.ProjectID, renderJobID string, content io.Reader, sizeBytes int64) (contract.ProjectAssetRef, error) {
-	if err := s.validateDependencies(); err != nil {
+	return s.ingestRenderedVideo(ctx, requestContext, projectID, renderJobID, nil, content, sizeBytes)
+}
+
+// IngestRenderedVideoWithSources records immutable input resources alongside
+// the rendered AssetVersion. It is used by timeline renderers whose outputs
+// must remain traceable to exact source assets and a frozen timeline version.
+func (s UploadService) IngestRenderedVideoWithSources(ctx context.Context, requestContext contract.RequestContext, projectID contract.ProjectID, renderJobID string, sources []contract.ResourceRef, content io.Reader, sizeBytes int64) (contract.ProjectAssetRef, error) {
+	return s.ingestRenderedVideo(ctx, requestContext, projectID, renderJobID, sources, content, sizeBytes)
+}
+
+func (s UploadService) ingestRenderedVideo(ctx context.Context, requestContext contract.RequestContext, projectID contract.ProjectID, renderJobID string, sources []contract.ResourceRef, content io.Reader, sizeBytes int64) (contract.ProjectAssetRef, error) {
+	if err := s.validateRenderedVideoIngest(requestContext, renderJobID, content, sizeBytes); err != nil {
 		return contract.ProjectAssetRef{}, err
-	}
-	if err := requestContext.Validate(); err != nil {
-		return contract.ProjectAssetRef{}, err
-	}
-	if !requestContext.Actor.HasScope("assets.write") {
-		return contract.ProjectAssetRef{}, fmt.Errorf("assets.write scope is required")
-	}
-	if strings.TrimSpace(renderJobID) == "" || len(renderJobID) > 96 || content == nil || sizeBytes < 1 || sizeBytes > MaxVideoBytes {
-		return contract.ProjectAssetRef{}, fmt.Errorf("render_job_id and supported video content are required")
 	}
 	project, err := s.Projects.RequireActiveContext(ctx, requestContext.Actor, projectID)
 	if err != nil {
@@ -305,7 +355,7 @@ func (s UploadService) IngestRenderedVideo(ctx context.Context, requestContext c
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
-	staged, err := s.Blobs.Put(ctx, s.QuarantineBucket, quarantineKey(requestContext.Actor.OrganizationID, stagingID), io.LimitReader(content, MaxVideoBytes+1), sizeBytes, "video/mp4")
+	staged, err := s.Blobs.Put(ctx, s.QuarantineBucket, quarantineKey(requestContext.Actor.OrganizationID, projectID, stagingID), io.LimitReader(content, MaxVideoBytes+1), sizeBytes, "video/mp4")
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
@@ -315,15 +365,54 @@ func (s UploadService) IngestRenderedVideo(ctx context.Context, requestContext c
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
+	for _, source := range sources {
+		if err := source.Validate(); err != nil {
+			return contract.ProjectAssetRef{}, fmt.Errorf("rendered video source: %w", err)
+		}
+		commit.Relations = append(commit.Relations, AssetRelation{
+			OrganizationID: requestContext.Actor.OrganizationID,
+			ProjectID:      projectID,
+			OutputAsset:    contract.AssetVersionRef{AssetID: commit.AssetID, Version: commit.Version},
+			RelationType:   AssetRelationDerivedFrom,
+			Source:         source,
+		})
+	}
 	ref, err := s.Repository.CompleteRender(ctx, renderJobID, commit, s.now())
 	if err != nil {
 		_ = s.Blobs.Delete(ctx, commit.Location)
 		return contract.ProjectAssetRef{}, err
 	}
 	if ref.AssetVersion.AssetID != commit.AssetID || ref.AssetVersion.Version != commit.Version {
+		// 仓库返回的是别的版本，说明这个渲染任务先前已经落过库了。
+		// 这一次不该再记一条台账——同一个素材版本在账本里只该有一行。
 		_ = s.Blobs.Delete(ctx, commit.Location)
+		return ref, nil
 	}
+	s.recordLedger(ctx, LedgerEntry{
+		OrganizationID: requestContext.Actor.OrganizationID, ProjectID: projectID,
+		ActorID: requestContext.Actor.Principal.ID,
+		AssetID: ref.AssetVersion.AssetID, Version: ref.AssetVersion.Version,
+		Kind: commit.Kind, SourceType: commit.SourceType,
+		Title: LedgerTitle("", commit.SourceType, s.now()),
+	})
+	s.ensurePoster(ctx, requestContext.Actor.OrganizationID, projectID, ref.AssetVersion, commit.Kind)
 	return ref, nil
+}
+
+func (s UploadService) validateRenderedVideoIngest(requestContext contract.RequestContext, renderJobID string, content io.Reader, sizeBytes int64) error {
+	if err := s.validateDependencies(); err != nil {
+		return err
+	}
+	if err := requestContext.Validate(); err != nil {
+		return err
+	}
+	if !requestContext.Actor.HasScope("assets.write") {
+		return fmt.Errorf("assets.write scope is required")
+	}
+	if strings.TrimSpace(renderJobID) == "" || len(renderJobID) > 96 || content == nil || sizeBytes < 1 || sizeBytes > MaxVideoBytes {
+		return fmt.Errorf("render_job_id and supported video content are required")
+	}
+	return nil
 }
 
 // IngestDerivedImage persists a processor-produced image as an immutable Asset
@@ -369,7 +458,7 @@ func (s UploadService) IngestDerivedImage(ctx context.Context, requestContext co
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
-	staged, err := s.Blobs.Put(ctx, s.QuarantineBucket, quarantineKey(requestContext.Actor.OrganizationID, stagingID), io.LimitReader(content, MaxImageBytes+1), sizeBytes, mimeType)
+	staged, err := s.Blobs.Put(ctx, s.QuarantineBucket, quarantineKey(requestContext.Actor.OrganizationID, projectID, stagingID), io.LimitReader(content, MaxImageBytes+1), sizeBytes, mimeType)
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
@@ -445,7 +534,7 @@ func (s UploadService) IngestDerivedAudio(ctx context.Context, requestContext co
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
-	staged, err := s.Blobs.Put(ctx, s.QuarantineBucket, quarantineKey(requestContext.Actor.OrganizationID, stagingID), io.LimitReader(content, MaxAudioBytes+1), sizeBytes, mimeType)
+	staged, err := s.Blobs.Put(ctx, s.QuarantineBucket, quarantineKey(requestContext.Actor.OrganizationID, projectID, stagingID), io.LimitReader(content, MaxAudioBytes+1), sizeBytes, mimeType)
 	if err != nil {
 		return contract.ProjectAssetRef{}, err
 	}
@@ -541,7 +630,7 @@ func (s UploadService) IngestRenderedImage(
 	}
 	staged, err := s.Blobs.Put(
 		ctx, s.QuarantineBucket,
-		quarantineKey(requestContext.Actor.OrganizationID, stagingID),
+		quarantineKey(requestContext.Actor.OrganizationID, projectID, stagingID),
 		io.LimitReader(content, MaxImageBytes+1), sizeBytes, "image/png",
 	)
 	if err != nil {
@@ -582,8 +671,18 @@ func (s UploadService) IngestRenderedImage(
 		return contract.ProjectAssetRef{}, err
 	}
 	if ref.AssetVersion != outputRef {
+		// 同上：这一版先前已经落过库，台账里已经有它了。
 		_ = s.Blobs.Delete(ctx, commit.Location)
+		return ref, nil
 	}
+	s.recordLedger(ctx, LedgerEntry{
+		OrganizationID: requestContext.Actor.OrganizationID, ProjectID: projectID,
+		ActorID: requestContext.Actor.Principal.ID,
+		AssetID: ref.AssetVersion.AssetID, Version: ref.AssetVersion.Version,
+		Kind: commit.Kind, SourceType: commit.SourceType,
+		Title: LedgerTitle("", commit.SourceType, s.now()),
+	})
+	s.ensurePoster(ctx, requestContext.Actor.OrganizationID, projectID, ref.AssetVersion, commit.Kind)
 	return ref, nil
 }
 
@@ -652,6 +751,9 @@ func (s UploadService) ingestStoredObject(ctx context.Context, organizationID co
 		if !allowedDeclaredImageMIME(mimeType) {
 			return AssetCommit{}, fmt.Errorf("%w: detected content is not a supported image", ErrInvalidAssetContent)
 		}
+		if mimeType != info.MIMEType {
+			return AssetCommit{}, fmt.Errorf("%w: detected image type does not match declared type", ErrInvalidAssetContent)
+		}
 		imageConfig, _, decodeErr := image.DecodeConfig(bytes.NewReader(data))
 		if decodeErr != nil {
 			return AssetCommit{}, fmt.Errorf("%w: decode image metadata: %v", ErrInvalidAssetContent, decodeErr)
@@ -703,7 +805,7 @@ func (s UploadService) ingestStoredObject(ctx context.Context, organizationID co
 	digest := sha256.Sum256(data)
 	sha256Value := hex.EncodeToString(digest[:])
 	media := MediaMetadata{ProbeStatus: MediaProbeNotRequired}
-	durableKey := fmt.Sprintf("assets/%s/%s/versions/1/original", organizationID, assetID)
+	durableKey := fmt.Sprintf("assets/%s/%s/%s/versions/1/original", organizationID, projectID, assetID)
 	durable, err := s.Blobs.Put(ctx, s.AssetsBucket, durableKey, bytes.NewReader(data), int64(len(data)), mimeType)
 	if err != nil {
 		return AssetCommit{}, err
@@ -804,6 +906,37 @@ func (s UploadService) validateDependencies() error {
 	return nil
 }
 
+// recordLedger 把刚落库的素材版本记进洞察的台账。
+//
+// 失败只记日志不回滚：上传已经成功了，用户的文件在库里躺着，为了一条账目把它退掉
+// 是本末倒置。漏掉的那条由 cookies-maintain backfill-ledger 补。
+//
+// 派生物（derived）不收：缩略图、转码档、抽出来的音轨都是同一个素材的不同形态，
+// 收进台账只会让「我有多少素材」这个数字翻好几倍。
+func (s UploadService) recordLedger(ctx context.Context, entry LedgerEntry) {
+	if s.Ledger == nil || entry.SourceType == contract.AssetSourceDerived {
+		return
+	}
+	if err := s.Ledger.Record(ctx, entry); err != nil {
+		log.Printf("记素材台账失败 asset=%s version=%d: %v", entry.AssetID, entry.Version, err)
+	}
+}
+
+// ensurePoster 给刚入库的视频排一个抽帧任务。
+//
+// 只对视频排：图片自己就是自己的缩略图，音频和文档没有画面。
+// 失败只记日志：封面做不出来不影响素材本身，清单退回类型图标就是了。
+func (s UploadService) ensurePoster(ctx context.Context, organizationID contract.OrganizationID, projectID contract.ProjectID, ref contract.AssetVersionRef, kind contract.AssetKind) {
+	if s.Derivatives == nil || kind != contract.AssetVideo {
+		return
+	}
+	if _, _, _, err := s.Derivatives.EnsureDerivative(ctx, EnsureDerivativeRequest{
+		OrganizationID: organizationID, ProjectID: projectID, AssetRef: ref, Profile: DerivativePoster,
+	}); err != nil {
+		log.Printf("排素材封面任务失败 asset=%s version=%d: %v", ref.AssetID, ref.Version, err)
+	}
+}
+
 func (s UploadService) now() time.Time {
 	if s.Now != nil {
 		return s.Now().UTC()
@@ -850,8 +983,16 @@ func (s UploadService) BlobProvider() string {
 	}
 }
 
-func quarantineKey(organizationID contract.OrganizationID, sessionID string) string {
-	return fmt.Sprintf("quarantine/%s/%s", organizationID, sessionID)
+func quarantineKey(organizationID contract.OrganizationID, projectID contract.ProjectID, sessionID string) string {
+	return fmt.Sprintf("quarantine/%s/%s/%s", organizationID, projectID, sessionID)
+}
+
+func (s UploadService) validateQuarantineScope(session UploadSession) error {
+	expectedKey := quarantineKey(session.OrganizationID, session.ProjectID, session.ID)
+	if session.Quarantine.Bucket != s.QuarantineBucket || session.Quarantine.Key != expectedKey {
+		return fmt.Errorf("%w: quarantine object is outside the upload scope", ErrInvalidState)
+	}
+	return nil
 }
 
 func safeFilename(value string) string {

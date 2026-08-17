@@ -19,7 +19,11 @@ import {
   unsupportedKanonWrite,
 } from '../backend/kanon-api.js'
 import type { CreativeIntakeStatus, CreativeTaskStatus } from '../contracts/creative'
+// 纯类型的循环引用：verdict.ts 反过来从这里取 ApiConfidenceLevel。
+// import type 会被 TS 完全擦除，运行时不成环。
+import type { Judgement, UpgradePath, Verdict } from './verdict'
 import { platformClient } from './platformClient.js'
+import { uploadProjectAssetFile } from './projectAssetUpload.js'
 
 export type ApiProject = {
   id: string
@@ -267,7 +271,7 @@ export type ApiAssetVersionPointer = {
   organizationId: string
   projectId: string
   assetId: string
-  mediaKind?: 'image' | 'video'
+  mediaKind?: 'image' | 'video' | 'audio'
   contentUrl?: string
   sourceJobId?: string
   workingVersion: number
@@ -316,7 +320,7 @@ export type ApiProjectMediaAsset = {
   id: string
   projectId: string
   version: number
-  kind: 'video' | 'image' | 'document'
+  kind: 'video' | 'image' | 'audio' | 'document'
   sourceType?: 'upload' | 'provider_generated' | 'imported' | 'captured' | 'rendered'
   mimeType: string
   sizeBytes: number
@@ -325,6 +329,9 @@ export type ApiProjectMediaAsset = {
   height?: number
   createdAt: string
   contentUrl: string
+  rightsStatus?: 'unverified' | 'active' | 'revoked'
+  useAllowed?: boolean
+  useDenialCode?: string
 }
 
 export type ApiAssetFeature = {
@@ -636,6 +643,7 @@ export type ApiCreativeIntakeBootstrap = {
   id: string
   source: string
   status: string
+  input_identity_hash?: string
   selected_route_id?: string
   request?: {
     objective?: string
@@ -664,8 +672,30 @@ export type ApiCreativeIntakeBootstrap = {
   }
 }
 
+/**
+ * 一个创意版本。字段只取洞察这边用得上的那几个，完整结构在
+ * internal/systems/creative/model.go 的 CreativeVersion。
+ *
+ * 洞察要它只为一件事：把创意组已经批准的素材登记进分析索引。批准过的版本是
+ * 不可变的，所以拿它当分析对象不会出现「分析完了原件又改了」。
+ */
+export type ApiCreativeVersionSummary = {
+  id: string
+  creative_task_id: string
+  format: 'image_text' | 'video'
+  version: number
+  status: 'created' | 'checked' | 'approved' | 'superseded'
+  created_at: string
+  snapshot?: { selected_title?: string; title_candidates?: string[] }
+  // 视频版本才有成品文件引用。图文版本的正文和配图存在 snapshot 里，
+  // 没有单一的媒体资产 ID——所以导进来的图文素材不带 platform_asset_id。
+  video_snapshot?: { final_video?: { asset_id: string; version: number } }
+  approval?: { approved_by?: string; approved_at?: string }
+}
+
 export type ApiCreativeTaskSummary = {
   id: string
+  display_name: string
   organization_id: string
   project_id: string
   intake_id: string
@@ -689,6 +719,19 @@ export type ApiCreativeTaskSummary = {
   version: number
   created_at: string
   updated_at: string
+}
+
+export type ApiStrategyBrandWorkflow = {
+  contract_version: 'creative-strategy-brand-workflow/v1'
+  mode: 'brief_review_required' | 'direction_ready' | 'direction_selection_required' | 'task_ready' | 'legacy_task_upgrade_required'
+  intake_id: string
+  input_identity_hash: string
+  brand_brief?: ApiBrandBriefReview
+  latest_direction_batch?: ApiCreativeDirectionBatch
+  confirmed_direction?: ApiCreativeDirection
+  task?: ApiCreativeTaskSummary
+  issues: Array<{ code: string; stage: string; path?: string; message: string; source: string }>
+  next_action: 'prepare_brief' | 'review_brief' | 'generate_directions' | 'wait_for_directions' | 'retry_directions' | 'select_direction' | 'create_task' | 'open_task' | 'review_legacy_task'
 }
 
 export type ApiCreateManualImageTextInput = {
@@ -896,7 +939,8 @@ export type ApiBrandBriefAnalysis = {
   prohibited_claims: string[]
   image_requirements: string[]
   video_requirements: string[]
-  voice_direction: string
+  voice_direction?: string
+  sound_design_intent?: ApiSoundDesignIntent
   asset_candidates: ApiBrandBriefAssetCandidate[]
   uncertainties: string[]
   confirmed: boolean
@@ -907,6 +951,13 @@ export type ApiBrandBriefAnalysis = {
   route_revision_id?: string
   prompt_version: string
   created_at: string
+}
+
+export type ApiSoundDesignIntent = {
+  music_direction: string
+  sound_effect_focus: string[]
+  source_audio_policy: 'mute' | 'optional' | 'include'
+  avoid?: string[]
 }
 
 export type ApiBrandCreativeConcept = {
@@ -933,7 +984,7 @@ export type ApiBrandFilmShot = {
   action: string
   camera: string
   lighting: string
-  voiceover: string
+  voiceover?: string
   on_screen_text: string
   reference_role: string
   continuity_notes: string
@@ -945,8 +996,9 @@ export type ApiBrandFilmPlan = {
   concept_id: string
   title: string
   story_summary: string
-  voice_direction: string
-  music_direction: string
+  voice_direction?: string
+  music_direction?: string
+  sound_design_intent?: ApiSoundDesignIntent
   shots: ApiBrandFilmShot[]
   confirmed: boolean
   confirmed_by?: string
@@ -979,7 +1031,7 @@ export type ApiBrandAudioClip = {
 
 export type ApiBrandAudioTrack = {
   id: string
-  type: 'source_audio' | 'voiceover' | 'music' | 'sfx'
+  type: 'source_audio' | 'voiceover' | 'ambience' | 'music' | 'sfx'
   role: string
   muted: boolean
   solo: boolean
@@ -990,7 +1042,7 @@ export type ApiBrandAudioTrack = {
 }
 
 export type ApiBrandAudioWorkspace = {
-  contract_version: 'creative-brand-audio-workspace/v1'
+  contract_version: 'creative-brand-audio-workspace/v1' | 'creative-brand-sound-design-workspace/v2'
   plan_revision: number
   master_duration_ms: number
   visual_preview_asset_ref: ApiAssetVersionRef
@@ -998,11 +1050,12 @@ export type ApiBrandAudioWorkspace = {
     revision: number
     plan_revision: number
     master_duration_ms: number
-    voice_profile: { voice_alias: string; language: string; direction: string; speed: number; volume: number; pitch: number; emotion: string }
-    narration_cues: Array<{ id: string; shot_id: string; start_ms: number; end_ms: number; text: string; reason: string; confidence: number; estimated_duration_ms: number; available_duration_ms: number; fit_status: 'fits' | 'spacious' | 'overrun'; suggested_text?: string }>
+    voice_profile?: { voice_alias: string; language: string; direction: string; speed: number; volume: number; pitch: number; emotion: string }
+    sound_design_intent?: ApiSoundDesignIntent
+    narration_cues?: Array<{ id: string; shot_id: string; start_ms: number; end_ms: number; text: string; reason: string; confidence: number; estimated_duration_ms: number; available_duration_ms: number; fit_status: 'fits' | 'spacious' | 'overrun'; suggested_text?: string }>
     music_arc: { start_ms: number; end_ms: number; direction: string }
-    sound_effect_cues: Array<{ id: string; shot_id: string; start_ms: number; end_ms: number; label: string; reason: string }>
-    pronunciations: Array<{ term: string; spoken_as: string; reason: string }>
+    sound_effect_cues: Array<{ id: string; shot_id: string; track_type?: 'ambience' | 'music' | 'sfx'; start_ms: number; end_ms: number; label: string; purpose?: string; prompt?: string; negative_prompt?: string; intensity?: 'subtle' | 'medium' | 'accent'; status?: 'planned' | 'generating' | 'ready' | 'failed' | 'removed'; reason: string }>
+    pronunciations?: Array<{ term: string; spoken_as: string; reason: string }>
     director_decisions: Array<{ id: string; kind: string; target_id: string; summary: string; reason: string; confidence: number; editable: boolean }>
     semantic_checks: Array<{ id: string; shot_id: string; status: 'pass' | 'warning'; summary: string; evidence: string; suggestion?: string }>
     planner_version: string
@@ -1074,6 +1127,11 @@ export type ApiBrandAudioMixOperation =
   | { op: 'set_track_muted'; track_id: string; muted: boolean }
   | { op: 'replace_clip_asset'; clip_id: string; asset_ref: ApiAssetVersionRef }
   | { op: 'set_clip_timing'; clip_id: string; timeline_start_ms: number; timeline_end_ms: number }
+  | { op: 'set_clip_label'; clip_id: string; label: string }
+  | { op: 'set_clip_gain'; clip_id: string; gain_db: number }
+  | { op: 'set_clip_fade'; clip_id: string; fade_in_ms: number; fade_out_ms: number }
+  | { op: 'remove_clip'; clip_id: string }
+  | { op: 'add_fixture_clip'; track_id: string; label: string; timeline_start_ms: number; timeline_end_ms: number }
 
 export type ApiBrandFilmGenerationAttempt = {
   id: string
@@ -1149,8 +1207,10 @@ export type ApiBrandFilmQualityRun = {
 export type ApiBrandFilmWorkspace = {
   task: {
     id: string
+    display_name: string
     status: string
     performance_mode: 'brand_video'
+    version: number
     updated_at: string
   }
   intake: {
@@ -1458,8 +1518,26 @@ export type ApiShortDramaOutputCanvas = {
   normalize_mode: string
 }
 
+export type ApiShortDramaReferenceBoardPlan = {
+  version: string
+  layout: '2x2_v1'
+  vibe_intent: {
+    version: string
+    visual_anchor: string
+    behavior_state: string
+    local_tone: string
+    theme: string
+    hard_constraints: string[]
+    evidence_ids: string[]
+  }
+  panels: Array<{ slot: 'A' | 'B' | 'C' | 'D'; role: string; description: string; evidence_ids: string[] }>
+  global_style: string
+  negative_rules: string[]
+  content_hash: string
+}
+
 export type ApiShortDramaV2Workspace = {
-  contract_version: 'creative-short-drama-preroll-workspace/v2' | 'creative-short-drama-preroll-workspace/v3'
+  contract_version: 'creative-short-drama-preroll-workspace/v2' | 'creative-short-drama-preroll-workspace/v3' | 'creative-short-drama-preroll-workspace/v4'
   task_id: string
   revision: number
   active_stage: 'source_ready' | 'analyzing' | 'analysis_ready' | 'directions_ready' | 'prompts_ready' | 'first_frames_generating' | 'first_frames_ready' | 'first_frame_selected' | 'video_generating' | 'normalizing_output' | 'completed'
@@ -1486,7 +1564,7 @@ export type ApiShortDramaV2Workspace = {
   prompt_draft?: {
     revision: number
     direction_id: string
-    duration_seconds: 5 | 6 | 10 | 12 | 15
+    duration_seconds: 10 | 12 | 15
     image_prompt: string
     video_description: string
     video_prompt: string
@@ -1494,6 +1572,7 @@ export type ApiShortDramaV2Workspace = {
     selected_variant_key?: string
     compiler_version: string
     content_hash: string
+    reference_board_plan?: ApiShortDramaReferenceBoardPlan
   }
   first_frame_batch?: {
     status: string
@@ -1516,19 +1595,79 @@ export type ApiShortDramaV2Workspace = {
     selected_asset?: ApiShortDramaV2ProjectAssetRef
     selected_output_asset?: ApiShortDramaV2ProjectAssetRef
   }
+  reference_board_batch?: {
+    status: string
+    id: string
+    revision: number
+    prompt_revision: number
+    analysis_revision: number
+    candidates: Array<{
+      id: string
+      variant_index: number
+      primary_test_variable: string
+      plan: ApiShortDramaReferenceBoardPlan
+      provider_job_id?: string
+      status: string
+      asset?: ApiShortDramaV2ProjectAssetRef
+      model_reference_asset?: ApiShortDramaV2ProjectAssetRef
+      error_code?: string
+      error_message?: string
+      current_attempt_id?: string
+      recovery_state?: string
+      failure_class?: string
+      recoverable?: boolean
+      attempts?: Array<{
+        id: string
+        ordinal: number
+        mode: 'initial' | 'transient_retry' | 'policy_rewrite' | 'style_fallback'
+        rewrite_policy_version?: string
+        source_prompt_hash?: string
+        prompt_hash: string
+        provider_job_id?: string
+        status: string
+        provider_error_code?: string
+        failure_class?: string
+        retryable?: boolean
+        created_at: string
+        completed_at?: string
+      }>
+    }>
+    selected_candidate_id?: string
+    selected_asset?: ApiShortDramaV2ProjectAssetRef
+    desired_count?: number
+    ready_count?: number
+    running_count?: number
+    failed_count?: number
+    recoverable_failed_count?: number
+  }
   source_opening_frame?: { status: string; asset?: ApiShortDramaV2ProjectAssetRef; timestamp_ms: number }
   trusted_materials?: {
     provider_code: 'ark-video'
     first_frame_asset_id: string
     last_frame_asset_id: string
   }
+  generation_spec?: {
+    input_mode: 'text_only' | 'reference_image' | 'first_last_frame'
+    fallback_mode?: 'text_only_realistic'
+    fallback_reason?: string
+    spec_hash: string
+  }
   latest_video_attempt_id?: string
+  video_error?: { code: string; message: string; retryable: boolean }
   raw_output_asset?: ApiShortDramaV2ProjectAssetRef
   output_asset?: ApiShortDramaV2ProjectAssetRef
 }
 
 export type ApiShortDramaV2TaskDetail = {
-  task: { id: string; performance_mode: 'short_drama_preroll'; status: string }
+  task: {
+    id: string
+    display_name: string
+    performance_mode: 'short_drama_preroll'
+    status: string
+    version: number
+    created_at: string
+    updated_at: string
+  }
   video_draft: { revision: number; short_drama_preroll_v2: ApiShortDramaV2Workspace }
 }
 
@@ -1883,11 +2022,28 @@ export type ApiReportSectionKind = 'asset_performance' | 'experiment' | 'experie
 export type ApiReportFinding = {
   kind: ApiReportSectionKind
   text: string
+  // pinned 是人在分析页记的，system 是复盘时按规则补的。复盘页要把两者分开标
+  // （● 我记的 / ○ 系统补的）：混在一起，人就分不清哪几条是自己挑的。
+  origin: 'system' | 'pinned'
   // 出自素材对比的发现才有。可归因的排在方向性前面。
   strength?: ApiVariantVerdict
   confidence?: ApiConfidenceLevel
-  // 这条发现的来源 ID（实验或经验），供人跳回去核对。
+  // 三档判定平铺在这里（后端是内嵌结构体）。档位文案由后端给，前端不自己翻译。
+  verdict?: Verdict
+  verdict_label?: string
+  upgrade?: UpgradePath
+  note?: string
+  // 判出这条时生效的阈值版本。定格在发现上，之后改阈值也不会改写它——
+  // 一份复盘里的发现可能来自不同时间的分析，报告顶部标一个号是不够的。
+  threshold_version?: number
+  // 这条出自哪个视图、说的哪个变量。两者构成去重键：人记过的，系统不再补一条。
+  dimension?: string
+  variable?: string
+  // 这条发现的来源 ID（素材、实验或经验），供人跳回去核对。
   source_ref?: string
+  // 记这一笔的人和时刻。origin 是 pinned 才有。
+  pinned_by?: string
+  pinned_at?: string
   // 被人工删掉的条目留在数组里，只是标记为 true——报告要能说清
   // 「系统给了什么、人拿掉了哪几条」。
   dropped: boolean
@@ -1923,7 +2079,11 @@ export type ApiInsightReport = {
   updated_at: string
 }
 
-export type ApiExperienceStatus = 'pending' | 'confirmed' | 'needs_review' | 'retired'
+// 三态：待定 → 在用 → 停用。
+// 「待复审」不在这里，它是「在用」上的一个标记（见 ApiExperience.needs_review）：
+// 被标记的经验仍然在用、仍然能被引用，只是该重新看一眼。做成状态的话，每个读
+// 经验的地方都得判断「confirmed 或者 needs_review」，漏一处它就凭空消失。
+export type ApiExperienceStatus = 'pending' | 'confirmed' | 'retired'
 
 export type ApiExperience = {
   id: string
@@ -1944,11 +2104,22 @@ export type ApiExperience = {
   // 经验库详情要靠这几项判断一条结论该不该确认，缺了就只能看结论一句话点确认。
   card_type: ApiInsightCardType
   confidence: ApiConfidenceLevel
+  // 三档判定平铺在这里（后端是内嵌结构体）。档位文案由后端给，前端不自己翻译。
+  verdict: Verdict
+  verdict_label: string
+  upgrade: UpgradePath
+  note: string
+  // 判这一档时生效的阈值版本。**缺失表示不知道**（人自己填的档位、老数据），
+  // 此时界面上一个阈值标注都不许出现——替一条来历不明的结论盖印，比不盖更糟。
+  // 0 是「按出厂设定判的」，是个确定答案，不是缺失。
+  threshold_version?: number
   recommended_action: string
   applicability: ApiApplicability
   data_basis: ApiDataBasis
   content_basis: ApiContentBasis
   status: ApiExperienceStatus
+  // 「该看一眼了」。它不影响这条经验能不能用，只影响界面上要不要挂个提示。
+  needs_review: boolean
   status_reason: string
   status_changed_by: string
   status_changed_at?: string
@@ -1958,6 +2129,32 @@ export type ApiExperience = {
   created_by: string
   created_at: string
   updated_at: string
+}
+
+// 一条命中。matched 说清「凭什么推给你」，default 说清「能不能直接照着做」。
+//
+// default 是后端算的两道闸（状态在用 + 判定 ✅ 能归因），前端不重算：
+// 重算一次就多一套规则，两边哪天不一致，同一条经验会在两个页面上一个能用一个不能用。
+export type ApiExperienceMatch = {
+  experience: ApiExperience
+  matched: string[]
+  default: boolean
+  // 抄到别处时的完整说法（结论 + 适用条件 + 来源）。后端拼好发过来，
+  // 前端不自己再拼一遍——两处拼法迟早对不上，而对不上的时候没人知道该信哪个。
+  citation_text: string
+}
+
+// 「查」的条件。每一格空着表示不限。字段名跟后端 ExperienceLookup 逐字对齐。
+export type ApiExperienceLookup = {
+  brand?: string
+  product?: string
+  channel?: string
+  ad_type?: string
+  objective?: string
+  audience?: string
+  feature?: string
+  include_observed?: boolean
+  limit?: number
 }
 
 export type ApiExperienceAudit = {
@@ -2050,6 +2247,8 @@ export type ApiInsightCard = {
   content_basis: ApiContentBasis
   confidence: ApiConfidenceLevel
   confidence_hint: string
+  // 跟着经验投影过来的阈值版本，缺失表示不知道（见 ApiExperience.threshold_version）。
+  threshold_version?: number
   counterexamples: string[]
   recommended_action: string
   status: ApiExperienceStatus
@@ -2060,7 +2259,15 @@ export type ApiInsightCard = {
 }
 
 export type ApiFeaturePattern = {
+  // 分桶键，**不要显示给人看**。入表的是特征体系里的字段键（hook_type），
+  // 没入表的是原样文本。显示一律用 label。
   feature: string
+  label: string
+  // 这个名字有没有落在特征体系里。没入表的照样列出来（藏起来会丢掉真实的内容依据），
+  // 但得让人知道它的同义写法可能被拆成了好几个桶。
+  governed: boolean
+  // 够不够得上这一屏标题里的「反复」：入了表，且至少两条结论提到。
+  repeated: boolean
   card_count: number
   channels: string[]
   // 取最强置信而不是平均：一条充分证据和一条样本不足不该被平均成方向性。
@@ -2110,10 +2317,16 @@ export type ApiInsightAssetType =
   | 'xiaohongshu_note' | 'wechat_article' | 'brand_ad'
   | 'digital_human_ad' | 'preroll_ad' | 'hit_replica_ad'
 
-export type ApiAssetSourceKind = 'creative' | 'upload' | 'external'
+export type ApiAssetSourceKind = 'creative' | 'upload' | 'external' | 'miyun'
 
-/** AI 推断与人工结论是两层，互不覆盖（03 §14）。 */
-export type ApiFeatureSource = 'ai' | 'human'
+/**
+ * AI 推断与人工结论是两层，互不覆盖（03 §14）。
+ *
+ * 三类的可信度不是一回事：derived 客观可测（从文件本身算出来的时长、分辨率、镜头数，
+ * 同一个文件算两遍结果一样）、human 人工标注、ai 模型推断。只有前两类能进归因结论；
+ * ai 行被人复核认可之后按 human 算。这条规则由后端执行，前端只读 admissible。
+ */
+export type ApiFeatureSource = 'ai' | 'human' | 'derived'
 
 export type ApiConfidence = 'low' | 'medium' | 'high'
 
@@ -2134,10 +2347,18 @@ export type ApiFeatureValue = {
   bool?: boolean
 }
 
+/**
+ * 素材身份。ledger 是台账——平台里所有素材的账本，绝大多数永远不会投流；
+ * analysis 是分析对象——真投过、有花费、要跑归因的成品。
+ * 四个队列和红点一律只数 analysis，否则几千条台账会把它们全部灌满。
+ */
+export type ApiAssetRole = 'ledger' | 'analysis'
+
 export type ApiInsightAsset = {
   id: string
   organization_id: string
   project_id: string
+  role: ApiAssetRole
   lineage_id: string
   revision: number
   title: string
@@ -2170,6 +2391,10 @@ export type IndexInsightAssetBody = {
   source_kind: ApiAssetSourceKind
   source_ref?: string
   lineage_id?: string
+  // 媒体资产引用。后端要求这两个要么都给要么都不给（assets.go 的 validate），
+  // 给了才能从洞察点回素材库看原件。
+  platform_asset_id?: string
+  platform_asset_version?: number
   asset_type?: ApiInsightAssetType
   asset_type_source?: ApiFeatureSource
   asset_type_confidence?: ApiConfidence
@@ -2274,6 +2499,10 @@ export type ApiFeatureSchema = {
   label: string
   source: string
   fields: ApiFeatureField[]
+  // 这类素材的本体是不是一段视频。是的话，提取时人不用再写一遍画面描述——
+  // 后端把视频交给多模态自己去看。判断放在后端（insights.AssetType.IsVideo），
+  // 这里只读结果，不再自己列一份类型清单。
+  is_video: boolean
 }
 
 export type ApiFeatureMatrixCell = {
@@ -2299,11 +2528,68 @@ export type ApiFeatureMatrix = {
   disclosure: string
 }
 
+// 相似素材（internal/systems/insights/similar.go）。
+//
+// 「像在哪」必须说得出来，所以每条结果都带 reasons；带 source 是因为读的人有权
+// 知道这一条相似是量出来的、人标的，还是模型猜的——三者在复盘会上的分量不一样。
+export type ApiSimilarityReason = {
+  key: string
+  label: string
+  value: string
+  source: ApiFeatureSource
+}
+
+export type ApiSimilarAsset = {
+  asset_id: string
+  title: string
+  // overlap 是重叠的变量数，admissible_overlap 是其中能进归因的那些（量出来的 + 人标的）。
+  // 前者回答「像不像」，后者回答「拉进来之后能不能真的做归因」。
+  overlap: number
+  admissible_overlap: number
+  score: number
+  reasons: ApiSimilarityReason[]
+}
+
+export type ApiSimilarAssetResult = {
+  // probe 是这次检索按哪几个变量找的。不给出来，人没法判断结果值不值得信。
+  probe: ApiSimilarityReason[]
+  items: ApiSimilarAsset[]
+  note?: string
+}
+
+// 外部素材（internal/systems/insights/external.go）。没有版本、没有血缘、没有状态。
+export type ApiExternalPurpose = 'benchmark' | 'reference'
+
+export type ApiExternalAsset = {
+  id: string
+  organization_id: string
+  project_id: string
+  title: string
+  source_note?: string
+  asset_type?: ApiInsightAssetType
+  purpose: ApiExternalPurpose
+  purpose_note?: string
+  storage_key?: string
+  // original_purged 为 true 表示原件已按留存期清掉，只剩下人标的变量。
+  original_purged: boolean
+  features: Record<string, ApiFeatureValue>
+  retention_until: string
+  created_by: string
+  created_at: string
+  updated_at: string
+}
+
 export type ApiInsightAssetFilter = {
   statuses?: ApiAnalysisStatus[]
   assetTypes?: ApiInsightAssetType[]
   sourceKinds?: ApiAssetSourceKind[]
+  /** 不传等于只看分析对象。台账要显式要，免得谁忘了传就拉回来几千条。 */
+  roles?: ApiAssetRole[]
   lineageId?: string
+  /** 上一页返回的 next_cursor，不透明串。 */
+  cursor?: string
+  /** 按标题模糊搜。 */
+  query?: string
   limit?: number
 }
 
@@ -2408,6 +2694,11 @@ export type ApiImportBatch = {
   updated_at: string
 }
 
+/**
+ * 带三档判定的类型一律写成 `{...} & Judgement`：后端那边是 embedded struct，
+ * 四个字段在 JSON 里平铺在宿主对象上。抄八遍字段的话，改一次要改八处，
+ * 改漏一处就有一页在说另一套话——这正是这轮重构要消灭的东西。
+ */
 export type ApiAssetMetricPerformance = {
   asset_id?: string
   asset_title: string
@@ -2416,8 +2707,7 @@ export type ApiAssetMetricPerformance = {
   counts: ApiMetricCounts
   rates: ApiMetricRates
   attributable: boolean
-  confidence: ApiConfidenceLevel
-}
+} & Judgement
 
 export type ApiPerformancePoint = {
   date: string
@@ -2436,6 +2726,13 @@ export type ApiSourceHealth = {
   data_source_id: string
   platform: ApiPlatform
   label: string
+  /** 生命周期状态（草稿/已启用/已暂停/已吊销）。和 quality_status 是两件事。 */
+  status: ApiDataSourceStatus
+  /**
+   * 这一条有没有真的进新鲜度判定。false 有两种情形：源没启用，或者滞后还在容忍
+   * 范围内。有它，底表才解释得了「这里写着滞后 2 天，队列里却没有滞后问题」。
+   */
+  freshness_judged: boolean
   quality_status: ApiQualityStatus
   quality_note?: string
   data_through?: string
@@ -2451,8 +2748,6 @@ export type ApiMetricOverview = {
   totals: ApiMetricCounts
   rates: ApiMetricRates
   ctr_interval?: ApiRateInterval
-  confidence: ApiConfidenceLevel
-  confidence_note: string
   series: ApiPerformancePoint[]
   assets: ApiAssetMetricPerformance[]
   unmatched_objects: number
@@ -2460,7 +2755,8 @@ export type ApiMetricOverview = {
   sources: ApiSourceHealth[]
   warnings?: string[]
   platforms: ApiPlatformTotal[]
-}
+  /** note 原来叫 confidence_note。同一个意思两个键名，前端要写两套渲染，已统一。 */
+} & Judgement
 
 /**
  * AM-009 的判定阶梯，从严到松。**只有 attributable 是「能归到这个变量」**，
@@ -2475,8 +2771,16 @@ export type ApiFeatureDiff = {
   group: string
   baseline: string
   variant: string
-  /** 该特征只能人工判定（AM-006），AI 不产出，缺失属正常。 */
-  human_only: boolean
+  /**
+   * 变量来源。derived 从文件算出、human 人工标注、ai 模型推断。
+   * 两侧来源不同时取更弱的那一个——只要有一边是猜的，这条差异就是猜的。
+   */
+  source: ApiFeatureSource
+  /**
+   * 这条差异能否进入归因结论。ai 来源恒为 false。为 false 的差异照样要显示出来，
+   * 只是不参与「改了几个变量」的计数——准入规则由后端定，前端不要再实现一遍。
+   */
+  admissible: boolean
 }
 
 /**
@@ -2501,10 +2805,13 @@ export type ApiVariantComparison = {
   /** 任一侧区间算不出来时为 true——不知道差异是否显著，就不能说它显著。 */
   intervals_overlap: boolean
   ctr_lift?: number
-  verdict: ApiVariantVerdict
-  confidence: ApiConfidenceLevel
-  note: string
-}
+  /**
+   * 素材对比专有的五档，比三档更细：它还回答「归不了因是因为变量太多，
+   * 还是因为压根没有特征数据」。**键名不是 verdict**——那个键归三档
+   * （见后端 internal/systems/insights/verdict.go）。
+   */
+  variant_verdict: ApiVariantVerdict
+} & Judgement
 
 /** direction 为 unknown 表示天数不足或前半段无曝光，不能当成持平。 */
 export type ApiAssetTrend = {
@@ -2516,9 +2823,7 @@ export type ApiAssetTrend = {
   active_days: number
   direction: 'rising' | 'flat' | 'declining' | 'unknown'
   ctr_change?: number
-  confidence: ApiConfidenceLevel
-  note: string
-}
+} & Judgement
 
 /** likely 需要两项条件同时成立；单项恶化只到 watch。 */
 export type ApiFatigueSeverity = 'none' | 'watch' | 'likely'
@@ -2537,9 +2842,7 @@ export type ApiFatigueSignal = {
   severity: ApiFatigueSeverity
   /** 没能排除的其他解释。这里列的是「排除不了」，不是「已排除」。 */
   alternative_explanations?: string[]
-  confidence: ApiConfidenceLevel
-  note: string
-}
+} & Judgement
 
 export type ApiAnomalyKind = 'spike' | 'drop' | 'gap'
 
@@ -2555,8 +2858,8 @@ export type ApiMetricAnomaly = {
   median: number
   /** 偏离中位数多少个 MAD。 */
   deviation: number
-  note: string
-}
+  /** 异常永远只到 👁：这一天不对劲是事实，为什么不对劲这里答不了。 */
+} & Judgement
 
 /**
  * 驱动因素：某个特征取值的素材组与其余素材的对比。**这不是因果**——
@@ -2580,9 +2883,7 @@ export type ApiFeatureDriver = {
   ctr_lift?: number
   /** 与本特征完全同向变化的其他特征，分不开谁在起作用。 */
   covarying_features?: string[]
-  confidence: ApiConfidenceLevel
-  note: string
-}
+} & Judgement
 
 /**
  * 投后分析五个二级视图（素材对比 / 趋势 / 疲劳 / 异常 / 驱动因素）的共用载荷。
@@ -2602,6 +2903,19 @@ export type ApiPerformanceAnalysis = {
   assets_in_window: number
   /** 其中有内容特征的素材数。远小于 assets_in_window 时，对比和驱动因素都会大面积空着。 */
   assets_with_features: number
+  /**
+   * **跨视图**档位，取五类结论里最弱的那一档。它回答「这次分析整体能信到什么
+   * 程度」，不回答「我现在看的这一屏能信到什么程度」。
+   *
+   * 不要拿它当屏级徽章：那样的话在「趋势」上会显示一个由「驱动因素」拉低的档位，
+   * 而这一屏自己每条都站得住。屏级徽章一律取 view_judgements。
+   */
+  judgement: Judgement
+  /**
+   * 每个视图只按自己那批结论算出来的档位，键是视图名。缺键时回落到 judgement
+   * ——后端老版本没有这个字段，回落比整屏不显示档位好。
+   */
+  view_judgements?: Record<string, Judgement>
   notes?: string[]
 }
 
@@ -2719,6 +3033,13 @@ export type ApiFeatureFieldUsage = ApiFeatureField & {
   /** 全项目只有一条素材用过的取值。是候选不是结论——系统不做语义猜测。 */
   merge_candidates?: string[]
   off_vocabulary?: string[]
+  /**
+   * 生效取值分别由谁写的，键是来源，值是素材条数。没人填过这个字段时缺省。
+   *
+   * 归因只认量出来的和人标的。一个八成取值都是模型猜的字段，拿它分组比出来的差异
+   * 说明不了问题，而只看 asset_count 看不出这一点——填得越满反而越像可信。
+   */
+  source_counts?: Partial<Record<ApiFeatureSource, number>>
 }
 
 export type ApiFeatureSystemHealth = {
@@ -2836,6 +3157,14 @@ export type ApiSettingItem = {
   source: string
   /** 文档依据；没有依据会显式写「无文档指定值」，不会留空。 */
   basis: string
+  /**
+   * 非空表示这一条可以改，值是它在保存请求 values 里的键名。
+   *
+   * 可写与否标在**条**上而不是标在组上：同一组里既有能改的判定阈值，也有不能改的
+   * 保护性上限（导入行数、异常判定倍数这类）。标在组上只能整组开或整组关——
+   * 要么把防呆开关暴露出去，要么把该调的锁死。
+   */
+  editable_key?: string
 }
 
 /**
@@ -2992,11 +3321,24 @@ export type ApiAttachExperimentAssetResult = {
   warnings: string[]
 }
 
+/**
+ * 这一组落在设置页的哪一段。空串表示不单开一段（后端只有 not_built 的组才允许为空）。
+ *
+ * 后端六个组和页面四个视图不是一一对应：样本门槛和观察窗口都归「判定阈值」，
+ * 通知和报告模板还没建设，不上页面。由后端给而不是前端映射，是因为「哪一组该出现在
+ * 哪一段」是设置本身的属性——前端另写一张表，加一个组就要改两处，漏改的那一处
+ * 会让新组在页面上凭空消失。
+ */
+export type ApiSettingsView = '' | 'thresholds' | 'health' | 'dictionary' | 'permission'
+
 export type ApiSettingGroup = {
   key: string
   label: string
   /** in_effect 现在真的在生效；not_built 还没有任何东西，此时 items 为空。 */
   state: 'in_effect' | 'not_built'
+  view: ApiSettingsView
+  /** 这一组里有至少一条 editable_key 非空。由后端汇总，前端不要自己数。 */
+  editable: boolean
   summary: string
   /** 只在 not_built 时有内容。 */
   missing: string[]
@@ -3005,12 +3347,40 @@ export type ApiSettingGroup = {
 
 export type ApiInsightSettings = {
   generated_at: string
-  /** 恒为 false。不要因此渲染禁用输入框——改不动的输入框比一句「这里改不了」更恼人。 */
+  /** 有东西可改。为 false 时整页只读，不要渲染禁用输入框。 */
   editable: boolean
   editable_note: string
-  /** 恒为 false：这些值对整个部署生效，路径上的 project 只用于鉴权。 */
+  /** 恒为 false：这些值对整个组织生效，路径上的 project 只用于鉴权。 */
   project_scoped: boolean
   groups: ApiSettingGroup[]
+}
+
+/**
+ * 现在生效的那一份阈值：每格都有值，且带着版本号。
+ *
+ * version 0 = 一版都没存过，跑的是代码里的出厂设定。
+ */
+export type ApiResolvedThresholds = {
+  version: number
+  sufficient_impressions: number
+  directional_impressions: number
+  min_trend_days: number
+  min_anomaly_days: number
+  min_driver_assets: number
+  max_comparison_assets: number
+  quality_window_days: number
+}
+
+/** 落库的一版。改动史用它，看的是「谁在什么时候、为什么改的」。 */
+export type ApiThresholdSet = {
+  id: string
+  organization_id: string
+  version: number
+  /** 只有被调过的格子有值；没有的格子跑出厂设定。 */
+  values: Partial<Omit<ApiResolvedThresholds, 'version'>>
+  reason: string
+  changed_by: string
+  changed_at: string
 }
 
 /** 一行 canonical 日指标。stat_date 是数据源时区下的当地日期 YYYY-MM-DD。 */
@@ -3250,6 +3620,7 @@ export type ApiViralRemakeWorkspace = {
           aspect_ratio: string
           resolution: string
           candidate_count: number
+          reference_image_mode?: 'reference_image' | 'text_only' | 'text_only_original_person'
         }
         confirmed_by: string
         confirmed_at: string
@@ -3503,6 +3874,7 @@ export type ApiProviderCapabilities = {
     capability: string
     model: string
     available: boolean
+    connectionType?: string
   }>
   credential?: {
     source?: 'environment' | 'workspace'
@@ -3546,14 +3918,39 @@ type PlatformLoginResult = PlatformRequestContext & {
   session_id: string
 }
 
-export type ApiProviderConfiguration = {
-  provider: 'ark'
-  status: 'configured' | 'not_configured'
+export type ApiVideoModelConfiguration = {
+  configured: boolean
+  base_url: string
+  model: string
+  masked_api_key: string
+  credential_readable: boolean
+  version: number
+  model_alias: string
+  updated_at?: string
+  last_verification: { ok?: boolean; message: string; verified_at?: string }
+  environment_fallback: { configured: boolean; model: string; base_url: string }
+}
+
+export type ApiVideoModelVerification = {
+  ok: boolean
+  outcome: string
+  message: string
+}
+
+export type ApiVideoModelConfigurationInput = {
   baseUrl: string
-  source?: 'environment' | 'workspace'
-  maskedApiKey?: string
-  updatedAt?: string
-  capabilities: ApiProviderCapabilities
+  model: string
+  apiKey?: string
+  expectedVersion?: number
+}
+
+function videoModelConfigurationBody(input: ApiVideoModelConfigurationInput) {
+  return {
+    base_url: input.baseUrl,
+    model: input.model,
+    api_key: input.apiKey ?? '',
+    expected_version: input.expectedVersion ?? null,
+  }
 }
 
 const viteEnv = (import.meta as unknown as { env?: { VITE_API_BASE_URL?: string } }).env
@@ -3660,28 +4057,104 @@ export class ApiRequestError extends Error {
   }
 }
 
-async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+async function request<T>(path: string, method = 'GET', body?: unknown, headers?: Record<string, string>): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, {
     method,
     credentials: 'include',
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(headers ?? {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const payloadText = await response.text()
-  const payload = payloadText ? JSON.parse(payloadText) as T | { error?: { message?: string; code?: string } } : undefined
+  let payload: T | { error?: { message?: string; code?: string } } | undefined
+  try {
+    payload = payloadText ? JSON.parse(payloadText) as T | { error?: { message?: string; code?: string } } : undefined
+  } catch {
+    payload = undefined
+  }
   if (!response.ok) {
     const error = (payload ?? {}) as { error?: { message?: string; code?: string } }
-    throw new ApiRequestError(error.error?.message ?? 'API 请求失败', response.status, error.error?.code ?? '')
+    const code = error.error?.code ?? ''
+    throw new ApiRequestError(
+      permissionMessage(response.status, code, error.error?.message)
+        ?? error.error?.message
+        ?? `API 请求失败（HTTP ${response.status}）`,
+      response.status, code)
   }
   return payload as T
 }
 
-function authSessionFromActor(actor: PlatformActor, username?: string): ApiAuthSession {
+/**
+ * 权限不够时那句话，换成人话。
+ *
+ * 后端两层各自说各自的：HTTP 那层回「The required permission scope is missing.」，
+ * 服务层回「insights.confirm scope is required」——两句都是英文，而且都没说缺的是
+ * 哪一档、去哪儿看。人按下「确认」只会收到一串洋文，第一反应是系统坏了，接着去
+ * 重试、去刷新，而这件事重试一百次也不会变。
+ *
+ * 前端不做权限判断（那是后端的事），只负责把这一类回复翻译成「你缺哪一档、去哪儿看」。
+ */
+function permissionMessage(status: number, code: string, raw?: string): string | undefined {
+  const scoped = /([a-z_]+\.[a-z_.]+) scope is required/.exec(raw ?? '')
+  if (status !== 403 && code !== 'SCOPE_REQUIRED' && !scoped) return undefined
+  const label = { 'insights.confirm': '确认', 'insights.write': '编辑', 'insights.read': '读取' }[scoped?.[1] ?? '']
+  return label
+    ? `你没有「${label}」这一档权限，这一步做不了。权限跟着组织角色走，`
+      + '在「设置 · 确认权限」能看到自己有哪几档；要变得找组织管理员改角色。'
+    : '你没有做这一步所需要的权限。权限跟着组织角色走，'
+      + '在「设置 · 确认权限」能看到自己有哪几档；要变得找组织管理员改角色。'
+}
+
+type PlatformOrganizationMembership = {
+  organization: { id: string; name: string; status: string }
+  membership: {
+    organization_id: string
+    user_id: string
+    role: 'owner' | 'admin' | 'member' | 'auditor'
+    status: string
+    updated_at: string
+  }
+}
+
+/**
+ * 把平台的 actor 翻成前端这边的登录态。
+ *
+ * **scopes 一定要带上**。以前这里只留了 user 一项，organization / membership / scopes
+ * 全丢掉了，于是前端看到的每个人都「一个权限都没有」：设置页的判定阈值永远存不下去
+ * （按钮所在的那一段被锁死），确认权限那一屏写着「你现在是当前角色」——那不是角色名，
+ * 是兜底字符串。而后端明明给了 insights.confirm。权限是后端拦的，前端这一层只负责
+ * 「按下去之前就说清楚行不行」；它读错了，说的每一句都是错的。
+ *
+ * 组织名和角色多取一次 `/organizations`：那个接口一次就把当前用户在各组织里的
+ * 身份和角色都给了。取不到就留空（比如某个角色连 organization.read 都没有），
+ * 界面各自有兜底文案——但不能因为这一次取失败就让整个登录失败。
+ */
+async function authSessionFromActor(actor: PlatformActor, username?: string): Promise<ApiAuthSession> {
   const identity = username?.trim() || actor.principal.id
-  return {
+  const session: ApiAuthSession = {
     authenticated: true,
     user: { id: actor.principal.id, email: '', displayName: identity },
+    scopes: actor.scopes ?? [],
   }
+  try {
+    const page = await platformRequest<{ items: PlatformOrganizationMembership[] }>('/organizations')
+    const current = page.items.find(item => item.organization.id === actor.organization_id) ?? page.items[0]
+    if (current) {
+      session.organization = {
+        id: current.organization.id,
+        name: current.organization.name,
+        status: current.organization.status,
+      }
+      session.membership = {
+        role: current.membership.role,
+        status: current.membership.status,
+        updatedAt: current.membership.updated_at,
+      }
+    }
+  } catch {
+    // 读不到组织不影响登录：scopes 已经拿到了，权限判断照样准确，
+    // 只是顶栏那一行显示成「本地组织」而已。
+  }
+  return session
 }
 
 async function platformRequest<T>(path: string, method = 'GET', body?: unknown, headers?: Record<string, string>): Promise<T> {
@@ -3708,6 +4181,24 @@ export class CreativeApiError extends Error {
     super(message)
     this.name = 'CreativeApiError'
   }
+}
+
+// Browser retries must identify the same user intent. Do not use a clock or
+// random suffix here: those turn a network retry into a second paid job.
+function stableIdempotencyKey(scope: string, parts: readonly (string | number | undefined)[]) {
+  let hash = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  const mask = 0xffffffffffffffffn
+  for (const part of parts) {
+    const value = String(part ?? '')
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= BigInt(value.charCodeAt(index))
+      hash = (hash * prime) & mask
+    }
+    hash ^= 0x1fn
+    hash = (hash * prime) & mask
+  }
+  return `${scope}-${hash.toString(36)}`
 }
 
 async function creativeRequest<T>(path: string, method = 'GET', body?: unknown, headers?: Record<string, string>): Promise<T> {
@@ -3765,6 +4256,28 @@ function prepareBrandBriefReview(projectId: string, intakeId: string) {
   )
 }
 
+function getStrategyBrandWorkflow(projectId: string, intakeId: string) {
+  return creativeRequest<ApiStrategyBrandWorkflow>(
+    `/projects/${encodeURIComponent(projectId)}/creative-intakes/${encodeURIComponent(intakeId)}/brand-workflow`,
+  )
+}
+
+function prepareStrategyBrandWorkflow(projectId: string, intake: ApiCreativeIntakeBootstrap) {
+  const selectedRouteId = intake.selected_route_id || intake.request?.selected_route_id || ''
+  const inputIdentityHash = intake.input_identity_hash || ''
+  if (!selectedRouteId || !inputIdentityHash) throw new Error('品牌策略交接缺少冻结 Route 或输入身份。')
+  return creativeRequest<ApiStrategyBrandWorkflow>(
+    `/projects/${encodeURIComponent(projectId)}/creative-intakes/${encodeURIComponent(intake.id)}/brand-workflow:prepare`,
+    'POST',
+    {
+      expected_input_identity_hash: inputIdentityHash,
+      selected_route_id: selectedRouteId,
+      accept_strategy_projection: true,
+    },
+    { 'Idempotency-Key': `strategy-brand-prepare-${inputIdentityHash}` },
+  )
+}
+
 function updateBrandBriefReview(projectId: string, intakeId: string, review: ApiBrandBriefReview) {
   return creativeRequest<ApiBrandBriefReview>(
     `/projects/${encodeURIComponent(projectId)}/creative-intakes/${encodeURIComponent(intakeId)}/brand-brief`,
@@ -3784,6 +4297,38 @@ function confirmBrandBriefReview(projectId: string, intakeId: string, expectedRe
 function listCreativeTasks(projectId: string, limit = 100) {
   return creativeRequest<{ items: ApiCreativeTaskSummary[] }>(
     `/projects/${encodeURIComponent(projectId)}/creative-tasks?limit=${limit}`,
+  )
+}
+
+export type ApiExtractedDocumentMedia = {
+  filename: string
+  mime_type: 'image/png' | 'image/jpeg'
+  page_number: number
+  page_text?: string
+  width: number
+  height: number
+  size_bytes: number
+  sha256: string
+  content: string
+}
+
+function renameCreativeTask(projectId: string, taskId: string, expectedVersion: number, displayName: string) {
+  return creativeRequest<ApiCreativeTaskSummary>(
+    `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(taskId)}/metadata`,
+    'PATCH',
+    { expected_version: expectedVersion, display_name: displayName },
+  )
+}
+
+/**
+ * 列这个 Project 的创意版本。不传 task_id 就是全项目。
+ *
+ * 后端不按状态筛（creative_handlers.go 的 listCreativeVersions 只认 task_id 和
+ * limit），要「只看已批准的」得在调用方自己过一遍。
+ */
+function listCreativeVersions(projectId: string, limit = 100) {
+  return creativeRequest<{ items: ApiCreativeVersionSummary[] }>(
+    `/projects/${encodeURIComponent(projectId)}/creative-versions?limit=${limit}`,
   )
 }
 
@@ -3816,7 +4361,14 @@ function getKnowledgeDocument(projectId: string, documentId: string) {
   )
 }
 
-function createManualBrandFilmIntake(projectId: string, document: ApiKnowledgeDocument, durationSeconds = 15) {
+function extractKnowledgeDocumentMedia(projectId: string, documentId: string) {
+  return platformRequest<{ items: ApiExtractedDocumentMedia[] }>(
+    `/projects/${encodeURIComponent(projectId)}/knowledge/documents/${encodeURIComponent(documentId)}/media:extract`,
+    'POST',
+  )
+}
+
+function createManualBrandFilmIntake(projectId: string, document: ApiKnowledgeDocument, durationSeconds = 15, assetCandidates: ApiBrandBriefAssetCandidate[] = []) {
   const filename = document.filename || document.title || '品牌 Brief.pdf'
   const productName = filename.replace(/\.(pdf|docx|md)$/i, '').trim() || '未命名品牌项目'
   const briefText = document.extracted_text?.trim() || ''
@@ -3847,7 +4399,7 @@ function createManualBrandFilmIntake(projectId: string, document: ApiKnowledgeDo
         reason: '用户上传 PDF Brief 后创建的品牌广告制作路线',
         target_duration_seconds: durationSeconds,
         aspect_ratio: '9:16',
-        source_asset_refs: [],
+        source_asset_refs: assetCandidates.flatMap(candidate => candidate.asset_ref ? [candidate.asset_ref] : []),
         evidence_refs: [`knowledge://documents/${document.id}`],
         requires_human_confirmation: true,
       }],
@@ -3859,6 +4411,7 @@ function createManualBrandFilmIntake(projectId: string, document: ApiKnowledgeDo
         brief_name: filename,
         brief_text: briefText,
         product_name: productName,
+        asset_candidates: assetCandidates,
       },
     },
     { 'Idempotency-Key': `manual-brand-film-${document.id}-${durationSeconds}` },
@@ -4093,39 +4646,8 @@ function deliverImageTextVersion(projectId: string, versionId: string) {
   )
 }
 
-async function putUploadedAsset(url: string, headers: Record<string, string>, file: File) {
-  const requestHeaders = new Headers()
-  for (const [name, value] of Object.entries(headers)) {
-    const normalized = name.toLowerCase()
-    if (normalized !== 'host' && normalized !== 'content-length') requestHeaders.set(name, value)
-  }
-  if (!requestHeaders.has('Content-Type')) requestHeaders.set('Content-Type', file.type)
-  const target = url.startsWith('/') ? `${backendOrigin}${url}` : url
-  const response = await fetch(target, { method: 'PUT', headers: requestHeaders, body: file })
-  if (!response.ok) throw new Error(`素材上传失败（HTTP ${response.status}）`)
-}
-
 async function uploadProjectAsset(projectId: string, file: File): Promise<ApiAssetVersionRef> {
-  const path = `/projects/${encodeURIComponent(projectId)}/assets/uploads`
-  const created = await platformRequest<{
-    session: { id: string; project_asset_ref: null | { asset_version: ApiAssetVersionRef } }
-    upload: null | { url: string; method: 'PUT'; headers: Record<string, string> }
-  }>(path, 'POST', {
-    filename: file.name,
-    declared_mime_type: file.type,
-    declared_size_bytes: file.size,
-    declared_sha256: null,
-  }, { 'Idempotency-Key': `viral-upload-${Date.now()}-${Math.random().toString(36).slice(2)}` })
-  const existing = created.session.project_asset_ref?.asset_version
-  if (existing) return existing
-  if (!created.upload) throw new Error('素材上传会话没有返回可用的上传地址。')
-  await putUploadedAsset(created.upload.url, created.upload.headers, file)
-  const completed = await platformRequest<{
-    project_asset_ref: null | { asset_version: ApiAssetVersionRef }
-  }>(`${path}/${encodeURIComponent(created.session.id)}:finalize`, 'POST')
-  const result = completed.project_asset_ref?.asset_version
-  if (!result) throw new Error('素材已经上传，但没有生成可用的 AssetVersionRef。')
-  return result
+  return uploadProjectAssetFile(backendOrigin, projectId, file, 'viral-upload')
 }
 
 async function createManualShortDramaPrerollV2Workspace(
@@ -4155,7 +4677,7 @@ async function createManualShortDramaPrerollV2Workspace(
         video_purpose: 'performance',
         channels: ['douyin'],
         reason: '用户在短剧前贴工作区选择项目视频并确认生成',
-        target_duration_seconds: 6,
+        target_duration_seconds: 10,
         aspect_ratio: '9:16',
         resolution: '720p',
         source_asset_refs: [sourceVideo],
@@ -4242,6 +4764,31 @@ const updateShortDramaV2Prompts = (projectId: string, taskId: string, expectedRe
 const prepareShortDramaV2OpeningFrame = (projectId: string, taskId: string, expectedRevision: number) =>
   shortDramaV2Command(projectId, taskId, 'prepare-opening-frame', { expected_revision: expectedRevision })
 
+const generateShortDramaReferenceBoards = (projectId: string, taskId: string, expectedRevision: number) =>
+  shortDramaV2Command(projectId, taskId, 'generate-reference-boards', { expected_revision: expectedRevision })
+
+const reconcileShortDramaReferenceBoard = (projectId: string, taskId: string, expectedRevision: number, candidateId: string, providerJobId: string) =>
+  shortDramaV2Command(projectId, taskId, 'reconcile-reference-board', {
+    expected_revision: expectedRevision,
+    candidate_id: candidateId,
+    provider_job_id: providerJobId,
+  })
+
+const retryShortDramaReferenceBoardCandidate = (projectId: string, taskId: string, expectedRevision: number, batchId: string, candidateId: string, failedAttemptId: string) =>
+  shortDramaV2Command(projectId, taskId, 'retry-reference-board-candidate', {
+    expected_revision: expectedRevision,
+    batch_id: batchId,
+    candidate_id: candidateId,
+    failed_attempt_id: failedAttemptId,
+  })
+
+const selectShortDramaReferenceBoard = (projectId: string, taskId: string, expectedRevision: number, batchId: string, candidateId: string) =>
+  shortDramaV2Command(projectId, taskId, 'select-reference-board', {
+    expected_revision: expectedRevision,
+    batch_id: batchId,
+    candidate_id: candidateId,
+  })
+
 const generateShortDramaV2FirstFrames = (projectId: string, taskId: string, expectedRevision: number) =>
   shortDramaV2Command(projectId, taskId, 'generate-first-frames', { expected_revision: expectedRevision })
 
@@ -4283,6 +4830,12 @@ async function createManualViralRemakeWorkspace(
   input: ApiCreateManualViralRemakeInput,
 ): Promise<ApiViralRemakeWorkspace> {
   const duration = Math.min(60, Math.max(4, Math.round(input.durationSeconds)))
+  const inputKey = stableIdempotencyKey('manual-viral', [
+    projectId, input.parentIntakeId, input.sourceVideo.asset_id, input.sourceVideo.version,
+    input.referenceImage?.asset_id, input.referenceImage?.version, input.productName,
+    ...input.sellingPoints, input.callToAction, input.userInstruction, input.objective,
+    input.audience, input.coreMessage, duration,
+  ])
   const intake = await creativeRequest<{ id: string }>(
     `/projects/${encodeURIComponent(projectId)}/creative-intakes`,
     'POST',
@@ -4323,7 +4876,7 @@ async function createManualViralRemakeWorkspace(
         reference_image_rights: input.referenceImage ? 'pending' : undefined,
       },
     },
-    { 'Idempotency-Key': `manual-viral-${Date.now()}-${Math.random().toString(36).slice(2)}` },
+    { 'Idempotency-Key': inputKey },
   )
   const task = await creativeRequest<{ id: string }>(
     `/projects/${encodeURIComponent(projectId)}/creative-intakes/${encodeURIComponent(intake.id)}:create-video-task`,
@@ -4339,6 +4892,7 @@ async function createManualViralRemakeWorkspace(
       prohibited_claims: ['不得复制原片受保护表达'],
       confirm_route: true,
     },
+    { 'Idempotency-Key': `${inputKey}-create-task` },
   )
   return creativeRequest<ApiViralRemakeWorkspace>(
     `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(task.id)}/viral-remake`,
@@ -4958,10 +5512,12 @@ async function getGamePrerollVideoJob(projectId: string, jobId: string): Promise
 }
 
 async function getLatestViralRemakeWorkspace(projectId: string): Promise<ApiViralRemakeWorkspace | null> {
-  const result = await creativeRequest<{ items: Array<{ id: string; performance_mode?: string; status: string }> }>(
+  const result = await creativeRequest<{ items: Array<Pick<ApiCreativeTaskSummary, 'id' | 'performance_mode' | 'status' | 'updated_at'>> }>(
     `/projects/${encodeURIComponent(projectId)}/creative-tasks?limit=100`,
   )
-  const task = result.items.find(item => item.performance_mode === 'viral_remake' && item.status !== 'archived')
+  const task = result.items
+    .filter(item => item.performance_mode === 'viral_remake' && item.status !== 'archived')
+    .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0]
   if (!task) return null
   return creativeRequest<ApiViralRemakeWorkspace>(
     `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(task.id)}/viral-remake`,
@@ -4974,12 +5530,37 @@ async function getViralRemakeWorkspace(projectId: string, taskId: string): Promi
   )
 }
 
-async function analyzeViralRemake(projectId: string, taskId: string): Promise<ApiViralRemakeWorkspace> {
+async function analyzeViralRemake(projectId: string, taskId: string, inputRevision: number): Promise<ApiViralRemakeWorkspace> {
   return creativeRequest<ApiViralRemakeWorkspace>(
     `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(taskId)}/viral-remake:analyze-reference`,
     'POST',
     undefined,
-    { 'Idempotency-Key': `viral-analysis-${taskId}-${Date.now()}` },
+    { 'Idempotency-Key': stableIdempotencyKey('viral-analysis', [projectId, taskId, inputRevision]) },
+  )
+}
+
+async function generateBrandFilmSoundAssets(projectId: string, taskId: string, expectedRevision: number) {
+  return creativeRequest<ApiBrandFilmWorkspace>(brandFilmPath(projectId, taskId, ':generate-sound-assets'), 'POST', {
+    expected_revision: expectedRevision,
+  }, { 'Idempotency-Key': `brand-film-sound-assets-${taskId}-${expectedRevision}` })
+}
+
+async function updateViralInput(
+  projectId: string,
+  taskId: string,
+  expectedRevision: number,
+  input: Pick<ApiCreateManualViralRemakeInput, 'productName' | 'sellingPoints' | 'callToAction' | 'userInstruction'>,
+): Promise<ApiViralRemakeWorkspace> {
+  return creativeRequest<ApiViralRemakeWorkspace>(
+    `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(taskId)}/viral-remake/input-draft`,
+    'PATCH',
+    {
+      expected_revision: expectedRevision,
+      product_name: input.productName,
+      selling_points: input.sellingPoints,
+      call_to_action: input.callToAction,
+      user_instruction: input.userInstruction,
+    },
   )
 }
 
@@ -5000,6 +5581,7 @@ async function confirmViralGeneration(
   projectId: string,
   taskId: string,
   expectedRevision: number,
+  confirmReferenceVideoRights: boolean,
   confirmReferenceImageRights: boolean,
 ): Promise<ApiViralRemakeWorkspace> {
   return creativeRequest<ApiViralRemakeWorkspace>(
@@ -5007,10 +5589,23 @@ async function confirmViralGeneration(
     'POST',
     {
       expected_revision: expectedRevision,
-      confirm_reference_video_rights: true,
+      confirm_reference_video_rights: confirmReferenceVideoRights,
       confirm_reference_image_rights: confirmReferenceImageRights,
     },
     { 'Idempotency-Key': `viral-confirm-${taskId}-${expectedRevision}` },
+  )
+}
+
+async function retryViralWithoutReferenceImage(
+  projectId: string,
+  taskId: string,
+  expectedRevision: number,
+): Promise<ApiViralRemakeWorkspace> {
+  return creativeRequest<ApiViralRemakeWorkspace>(
+    `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(taskId)}/viral-remake:retry-without-reference-image`,
+    'POST',
+    { expected_revision: expectedRevision },
+    { 'Idempotency-Key': stableIdempotencyKey('viral-text-only-retry', [projectId, taskId, expectedRevision]) },
   )
 }
 
@@ -5048,12 +5643,12 @@ function mapViralProviderJob(job: ApiProviderJobWire): ApiGenerationJob {
   }
 }
 
-async function createViralVideoJob(projectId: string, taskId: string): Promise<ApiGenerationJob> {
+async function createViralVideoJob(projectId: string, taskId: string, promptPackageHash: string): Promise<ApiGenerationJob> {
   const job = await creativeRequest<ApiProviderJobWire>(
     `/projects/${encodeURIComponent(projectId)}/creative-tasks/${encodeURIComponent(taskId)}:video-job`,
     'POST',
     {},
-    { 'Idempotency-Key': `viral-video-${taskId}-${Date.now()}` },
+    { 'Idempotency-Key': stableIdempotencyKey('viral-video', [projectId, taskId, promptPackageHash]) },
   )
   return mapViralProviderJob(job)
 }
@@ -5311,6 +5906,66 @@ export function buildRemixPrerollInput(
 	}
 }
 
+export type ApiMiyunConnection = {
+  id: string; organization_id: string; project_id: string
+  status: 'unverified' | 'ready' | 'auth_required' | 'disabled'
+  session_expires_at?: string; last_verified_at?: string; last_successful_request_at?: string; cooldown_until?: string
+  last_error_kind?: string; last_error_code?: string; last_error_message?: string; last_error_at?: string; version: number; created_by: string; created_at: string; updated_at: string
+}
+export type ApiMiyunAssetVersionRef = { asset_id: string; version: number }
+export type ApiMediaUnderstandingArtifact = {
+  id: string
+  status: 'running' | 'ready' | 'partial' | 'failed'
+  error_message?: string
+  warnings: string[]
+}
+export type ApiMediaUnderstandingCapabilities = {
+  vision_semantic_enabled: boolean
+  asr_enabled: boolean
+  vision_model_alias: string
+  profile_version: string
+}
+export type ApiMiyunProductSource = {
+  project_name: string
+  brand_name: string
+  category_name: string
+  products: Array<{ id: string; name: string }>
+}
+export type ApiMiyunProfileQuery = { product_name: string; category_id?: string; category_name?: string; keywords: string[]; material_types: string[]; material_content_types: string[]; window_start: string; window_end: string }
+export type ApiMiyunProfileFieldSource = { field: string; source_kind: string; source_refs: string[]; confidence: 'high' | 'medium' | 'low' | 'unknown'; review_state: 'suggested' | 'unknown' | 'human_confirmed'; explanation: string }
+export type ApiMiyunProductProfile = {
+  id: string; organization_id: string; project_id: string; connection_id: string; status: 'draft' | 'confirmed' | 'superseded'; product_id: string; product_name: string; brand_name?: string; category_id?: string; category_name?: string
+  keywords: string[]; material_types?: string[]; material_content_types: string[]; window_start: string; window_end: string; project_context_version: number; product_asset_refs: ApiMiyunAssetVersionRef[]; knowledge_document_ids: string[]
+  rule_version: 'miyun-product-profile-rules/v1' | 'miyun-product-profile-rules/v2'; model_version?: string; analysis_method: 'rules'; input_hash: string; input_snapshot: Record<string, unknown>; field_sources: ApiMiyunProfileFieldSource[]; analysis_warnings: string[]
+  confirmed_by?: string; confirmed_at?: string; version: number; created_by: string; created_at: string; updated_at: string
+}
+export type ApiMiyunCrawlJob = {
+  id: string; organization_id: string; project_id: string; connection_id: string; product_profile_id: string
+  status: 'queued' | 'running' | 'cooling_down' | 'auth_required' | 'partial' | 'succeeded' | 'failed' | 'cancelled'; operation: 'product' | 'cid'; query_schema_version: 'miyun-query/v1'; query_snapshot: Record<string, unknown>
+  runtime_job_id: string; completed_pages: number; discovered_count: number; deduplicated_count: number; downloaded_count: number; failed_count: number; cooldown_until?: string; last_error_kind?: string; last_error_code?: string; version: number; created_by: string; created_at: string; updated_at: string
+}
+export type ApiMiyunMaterial = {
+  id: string; organization_id: string; project_id: string; miyun_material_id: string; first_seen_crawl_job_id?: string; import_method: 'crawler' | 'manual'; resource_id?: string; resource_expected_size?: number
+  source_ref?: string; source_ref_status: 'verified' | 'unknown'; title?: string; selection_status: 'discovered' | 'confirmed' | 'rejected'; import_status: 'pending' | 'downloading' | 'imported' | 'deduplicated' | 'failed' | 'skipped'
+  platform_asset_id?: string; platform_asset_version?: number; insight_asset_id?: string; external_import_id?: string; decision_by?: string; decision_at?: string; decision_note?: string; last_import_error_kind?: string; last_import_error_code?: string; version: number; created_by: string; created_at: string; updated_at: string
+}
+export type ApiMiyunMaterialSnapshot = {
+  id: string; organization_id: string; project_id: string; material_id: string; crawl_job_id?: string; source_page: number; import_method: 'crawler' | 'manual'; schema_version: string; captured_at: string; first_published_at?: string; last_published_at?: string
+  delivery_days: number; cumulative_impressions: number; cumulative_impressions_raw: string; related_ads: number; related_creators: number; related_creators_raw: string; related_creators_known: boolean; material_score: number; views: number; likes: number; comments: number; shares: number; saves: number; sanitized_raw?: Record<string, unknown>; created_at: string
+}
+export type ApiMiyunMaterialDetail = { material: ApiMiyunMaterial; snapshots: ApiMiyunMaterialSnapshot[] }
+  export type ApiMiyunHandoffReturn = {
+    id: string; handoff_id: string; handoff_version: number; manifest_version: string; input_hash: string; parameter_version: string; product_profile_id: string
+    crawl_job_id?: string; source_material_id?: string; association_source: 'crawl_job' | 'filename' | 'manifest_xlsx'; container_filename?: string
+  status: 'created' | 'uploaded' | 'failed' | 'returned'; filename?: string; asset_version?: { asset_id: string; version: number }; mime_type?: 'video/mp4'; sha256?: string; size_bytes?: number; insight_asset_id?: string; uploaded_by?: string; uploaded_at?: string; failure_code?: string; returned_by?: string; returned_at?: string; version: number; created_at: string; updated_at: string
+}
+export type ApiMiyunHandoff = {
+  id: string; organization_id: string; project_id: string; source_material_id: string; source_material_ids: string[]; product_profile_id: string; crawl_job_id?: string
+  status: 'exporting' | 'exported' | 'delivered' | 'returned' | 'failed'; manifest_version: string; parameter_version: string
+  product_files_snapshot: Record<string, unknown>; source_snapshot: Record<string, unknown>; profile_snapshot: Record<string, unknown>; input_hash: string
+  version: number; created_by: string; created_at: string; updated_at: string; returns?: ApiMiyunHandoffReturn[]
+}
+
 export const api = {
   listAgencyWorkbench: async (options: AgencyWorkbenchOptions = {}) => {
     // Workbench data always follows the caller's accessible Project scope.
@@ -5332,10 +5987,12 @@ export const api = {
     return { authenticated: false }
   },
   getCapabilities: getKanonCapabilities,
-  getProviderConfiguration: () => request<ApiProviderConfiguration>('/provider/configuration'),
-  updateProviderConfiguration: (input: { apiKey: string; baseUrl?: string }) =>
-    request<ApiProviderConfiguration>('/provider/configuration', 'PUT', input),
-  deleteProviderConfiguration: () => request<ApiProviderConfiguration>('/provider/configuration', 'DELETE'),
+  getVideoModelConfiguration: () =>
+    platformRequest<ApiVideoModelConfiguration>('/provider/video-configuration'),
+  saveVideoModelConfiguration: (input: ApiVideoModelConfigurationInput) =>
+    platformRequest<ApiVideoModelConfiguration>('/provider/video-configuration', 'PUT', videoModelConfigurationBody(input)),
+  verifyVideoModelConfiguration: (input: ApiVideoModelConfigurationInput) =>
+    platformRequest<ApiVideoModelVerification>('/provider/video-configuration/verification', 'POST', videoModelConfigurationBody(input)),
   getPublicInsightOverview: () => request<ApiPublicInsightOverview>('/public-insights/overview'),
   getPublicInsightFilters: () => request<ApiPublicInsightFilters>('/public-insights/filters'),
   listPublicInsightVideos: (input: {
@@ -5602,6 +6259,10 @@ export const api = {
   selectShortDramaV2Direction,
   updateShortDramaV2Prompts,
   prepareShortDramaV2OpeningFrame,
+  generateShortDramaReferenceBoards,
+  reconcileShortDramaReferenceBoard,
+  retryShortDramaReferenceBoardCandidate,
+  selectShortDramaReferenceBoard,
   generateShortDramaV2FirstFrames,
   reconcileShortDramaV2FirstFrame,
   selectShortDramaV2FirstFrame,
@@ -5614,12 +6275,15 @@ export const api = {
   getTaskStrategyCreativeIntake,
   getCreativeTaskHandoffDetail,
   listCreativeTasks,
+  renameCreativeTask,
+  listCreativeVersions,
   getBrandFilmWorkspace,
   initializeStrategyBrandFilmWorkspace,
   restoreBrandFilmWorkspace,
   listCreativeIntakes,
   uploadKnowledgeDocument,
   getKnowledgeDocument,
+  extractKnowledgeDocumentMedia,
   createManualBrandFilmIntake,
   ensureBrandFilmFixtureWorkspace,
   analyzeBrandFilmBrief,
@@ -5639,6 +6303,7 @@ export const api = {
   composeBrandFilmPreview,
   prepareBrandFilmAudio,
   materializeBrandFilmAudioAssets,
+  generateBrandFilmSoundAssets,
   updateBrandFilmAudioMix,
   selectBrandFilmAudioVariant,
   renderBrandFilmAudioPreview,
@@ -5652,6 +6317,8 @@ export const api = {
   getImageTextWorkspace,
   getCreativeIntake,
   prepareBrandBriefReview,
+  getStrategyBrandWorkflow,
+  prepareStrategyBrandWorkflow,
   updateBrandBriefReview,
   confirmBrandBriefReview,
   createManualImageTextIntake,
@@ -5692,8 +6359,10 @@ export const api = {
   getLatestViralRemakeWorkspace,
   getViralRemakeWorkspace,
   analyzeViralRemake,
+  updateViralInput,
   updateViralPrompt,
   confirmViralGeneration,
+  retryViralWithoutReferenceImage,
   createViralVideoJob,
   getViralVideoJob,
   submitViralCandidateReview,
@@ -5754,8 +6423,22 @@ export const api = {
   // 人看到什么就定格什么，不让后端另挑一个窗口。
   createReport: (projectId: string, body: { execution_id: string; window: { start: string; end: string } }) =>
     request<ApiInsightReport>(`${insightProjectPath(projectId)}/reports`, 'POST', body),
-  // 人工删减。加不了新的一条：写进报告的每条发现都得能回溯到某次对比、
-  // 某个实验或某条经验，手打一条就断了这个链子。
+  // 记一笔：把分析页上的一条结论钉进本轮复盘草稿。
+  //
+  // 请求里**没有** confidence / verdict——判定由后端拿 (window, dimension,
+  // source_ref, variable) 回到那次分析结果里找回来。能从这里传的话，页面上标的
+  // 三档就是装饰：改一个字段就能把「算不出来」记成「能归因」。
+  //
+  // 目标草稿按 (项目 + 窗口) 自动 find-or-create，不需要先建复盘。
+  pinFinding: (projectId: string, body: {
+    window: { start: string; end: string }
+    dimension: string
+    source_ref?: string
+    variable?: string
+    text?: string
+  }) => request<ApiInsightReport>(`${insightProjectPath(projectId)}/findings`, 'POST', body),
+  // 人工删减。报告页上加不了新的一条：写进报告的每条发现都得能回溯到某次对比、
+  // 某个实验或某条经验，手打一条就断了这个链子。要加只能回分析页记一笔。
   dropReportFinding: (
     projectId: string,
     reportId: string,
@@ -5764,12 +6447,25 @@ export const api = {
     request<ApiInsightReport>(
       `${insightProjectPath(projectId)}/reports/${encodeURIComponent(reportId)}:drop-finding`, 'POST', body,
     ),
+  // 提交这一轮复盘：写下这一轮的摘要、补上「算哪次投放」、把系统发现定格进去、
+  // 置为已确认，后端一次做完。和 confirmReport 的区别就是前两件事——草稿是记一笔时
+  // 自动建的，那会儿还没到「这一轮讲的是什么、算哪次投放」这两个问题，
+  // 提交是全流程唯一能回答它们的地方（提交后报告不可改）。
+  submitReview: (projectId: string, reportId: string, body: {
+    // 都可以留空。摘要留空沿用报告已有那句；执行留空表示这一轮没挂投放执行，
+    // 后端不会拿空串把报告原来挂着的那次清掉。
+    summary?: string
+    execution_id?: string
+    expected_version: number
+  }) => request<ApiInsightReport>(
+    `${insightProjectPath(projectId)}/reports/${encodeURIComponent(reportId)}/submit`, 'POST', body,
+  ),
   confirmReport: (projectId: string, reportId: string, expectedVersion: number) =>
     request<ApiInsightReport>(
       `${insightProjectPath(projectId)}/reports/${encodeURIComponent(reportId)}:confirm`, 'POST',
       { expected_version: expectedVersion },
     ),
-  // 从复盘沉淀经验。九字段能填多少填多少：复盘是最有依据的一次，
+  // 从复盘里留下一条经验。九字段能填多少填多少：复盘是最有依据的一次，
   // 这里少填一个字段，后面投前洞察里那张卡就永远缺一格。
   createExperienceFromReport: (
     projectId: string,
@@ -5785,6 +6481,12 @@ export const api = {
       applicability?: ApiApplicability
       data_basis?: ApiDataBasis
       content_basis?: ApiContentBasis
+      // 这条经验留的是复盘里哪一条发现。三格和 ApiReportFinding 的
+      // dimension/variable/source_ref 一一对应，后端按同一把尺去报告里找那条发现。
+      //
+      // 它是「按哪一版阈值判的」唯一的合法来源：发现是系统算出来的，身上带着当时
+      // 那一版阈值；人手敲的一句结论没有任何阈值参与，那种情况下不传这一格。
+      source_finding?: { dimension?: string; variable?: string; source_ref?: string }
     },
   ) => request<ApiExperience>(
     `${insightProjectPath(projectId)}/reports/${encodeURIComponent(reportId)}:create-experience`, 'POST', body,
@@ -5796,6 +6498,11 @@ export const api = {
       `${insightProjectPath(projectId)}/experiences?${search.toString()}`,
     )
   },
+  // 「查」用 POST：条件有七格、好几格是自由文本，塞 query string 里既难读也容易漏转义。
+  lookupExperiences: (projectId: string, body: ApiExperienceLookup) =>
+    request<{ items: ApiExperienceMatch[] }>(
+      `${insightProjectPath(projectId)}/experiences/lookup`, 'POST', body,
+    ),
   listExperienceAudits: (projectId: string, experienceId: string, limit = 50) =>
     request<{ items: ApiExperienceAudit[] }>(
       `${insightExperiencePath(projectId, experienceId)}/audits?limit=${limit}`,
@@ -5853,8 +6560,11 @@ export const api = {
     filter.statuses?.forEach(status => search.append('status', status))
     filter.assetTypes?.forEach(assetType => search.append('asset_type', assetType))
     filter.sourceKinds?.forEach(sourceKind => search.append('source_kind', sourceKind))
+    filter.roles?.forEach(role => search.append('role', role))
     if (filter.lineageId) search.set('lineage_id', filter.lineageId)
-    return request<{ items: ApiInsightAsset[] }>(
+    if (filter.cursor) search.set('cursor', filter.cursor)
+    if (filter.query) search.set('q', filter.query)
+    return request<{ items: ApiInsightAsset[]; next_cursor?: string }>(
       `${insightProjectPath(projectId)}/assets?${search.toString()}`,
     )
   },
@@ -5863,10 +6573,27 @@ export const api = {
   // 否则平台回流的广告对象认不到任何素材上，它的花费就永远算不到人头上。
   indexInsightAsset: (projectId: string, body: IndexInsightAssetBody) =>
     request<ApiInsightAsset>(`${insightProjectPath(projectId)}/assets`, 'POST', body),
+  // 把一条台账素材拉进分析。台账里绝大多数素材永远不会投流，
+  // 所以这一步必须有人点——自动往里拉只会把四个队列重新灌满。
+  promoteInsightAsset: (
+    projectId: string, assetId: string,
+    body: { expected_version: number; reason: string },
+  ) => request<ApiInsightAsset>(`${insightAssetPath(projectId, assetId)}:promote`, 'POST', body),
+  // 把拉错的素材退回台账。已经和广告对象对上号的会被后端拒掉——
+  // 那意味着它有花费，退回去等于把数据藏起来。
+  returnInsightAssetToLedger: (
+    projectId: string, assetId: string,
+    body: { expected_version: number; reason: string },
+  ) => request<ApiInsightAsset>(`${insightAssetPath(projectId, assetId)}:return-to-ledger`, 'POST', body),
   getInsightAsset: (projectId: string, assetId: string) =>
     request<ApiInsightAsset>(`${insightAssetPath(projectId, assetId)}`),
   listInsightAssetLineage: (projectId: string, assetId: string) =>
     request<{ items: ApiInsightAsset[] }>(`${insightAssetPath(projectId, assetId)}/lineage`),
+  // 缩略图给 <img src> 用，所以是同步拼地址而不是发请求——一屏几十张图
+  // 各发一次 JSON 再取地址，清单会卡住。后端 302 到带签名的对象存储地址；
+  // 没有封面时返回 404，浏览器的 onError 会把它换成类型图标。
+  insightAssetPosterUrl: (projectId: string, assetId: string) =>
+    `${apiBase}${insightAssetPath(projectId, assetId)}/poster`,
   listInsightAssetFeatures: (projectId: string, assetId: string) =>
     request<{ items: ApiInsightAssetFeature[] }>(`${insightAssetPath(projectId, assetId)}/features`),
   // 人工结论另起一行写入，不改 AI 那一层，后台再跑也不会盖掉（03 AM-006、§14）。
@@ -5883,10 +6610,29 @@ export const api = {
     assetId: string,
     body: { expected_version: number; content: string; note?: string },
   ) => request<ApiAnalyzeAssetResult>(`${insightAssetPath(projectId, assetId)}:analyze`, 'POST', body),
+  // 量客观变量：时长、画幅。和 analyze 是两回事——不调模型，不花钱，读的是素材库
+  // 上传这个文件时就探测好的数，同一条素材按几次结果都一样，所以按钮可以随便点。
+  // 落成「客观可测」层，直接能进归因，不进复核队列。
+  // 只对**从创意导入**的素材有效：手工登记的那些洞察这边只有一条索引，没有文件。
+  deriveInsightAssetFeatures: (
+    projectId: string,
+    assetId: string,
+    body: { expected_version: number },
+  ) => request<{ items: ApiInsightAssetFeature[] }>(
+    `${insightAssetPath(projectId, assetId)}:derive-features`, 'POST', body,
+  ),
   // 分析历史。失败的也在里面：只列成功的话，成功率永远是 100%。
   listInsightAssetAnalysisRuns: (projectId: string, assetId: string, limit = 20) =>
     request<{ items: ApiAnalysisRun[] }>(
       `${insightAssetPath(projectId, assetId)}/analysis-runs?limit=${limit}`,
+    ),
+  // 整个 Project 的分析历史，最近的排在前面。
+  //
+  // **不要只取 status=failed**：那样拿到的是「历史上失败过的素材」，其中一部分早已
+  // 重跑成功。要判断「现在还是坏的」，必须把成功和失败一起取回来，按素材看最新那一条。
+  listInsightAnalysisRuns: (projectId: string, limit = 200) =>
+    request<{ items: ApiAnalysisRun[] }>(
+      `${insightProjectPath(projectId)}/analysis-runs?limit=${limit}`,
     ),
   identifyInsightAssetType: (
     projectId: string,
@@ -5914,6 +6660,26 @@ export const api = {
     request<ApiFeatureMatrix>(
       `${insightProjectPath(projectId)}/feature-matrix?asset_ids=${encodeURIComponent(assetIds.join(','))}`,
     ),
+  // 找相似素材。两种问法：给素材 ID 问「和它像的还有哪些」，或者给一组变量取值问
+  // 「时长 15 秒的还有哪些」。后一种是 ❓「算不出来」的升级通道。
+  findSimilarAssets: (projectId: string, body: {
+    asset_id?: string
+    features?: Record<string, string>
+    limit?: number
+  }) => request<ApiSimilarAssetResult>(`${insightProjectPath(projectId)}/assets/similar`, 'POST', body),
+  // 外部素材。它们**永远不进共享素材库**：那里的素材可以被拿去投放，而这些没有
+  // 那份授权。收它们只有一个用处——解释本轮结果时有个参照。
+  importExternalAsset: (projectId: string, body: {
+    title: string
+    source_note: string
+    purpose: 'benchmark' | 'reference'
+    purpose_note?: string
+    asset_type?: string
+    window_end: string
+    features?: Record<string, string>
+  }) => request<ApiExternalAsset>(`${insightProjectPath(projectId)}/external-assets`, 'POST', body),
+  listExternalAssets: (projectId: string, limit = 50) =>
+    request<{ items: ApiExternalAsset[] }>(`${insightProjectPath(projectId)}/external-assets?limit=${limit}`),
   // 数据接入（doc10）。五个视图各自是一次不同的查询：数据源与字段映射读同一批行
   // 但看不同字段，导入任务与同步记录是同一张表按 kind 过滤（22 §8.3）。
   listDataSources: (projectId: string, filter: ApiDataSourceFilter = {}) => {
@@ -6032,10 +6798,60 @@ export const api = {
       `${insightProjectPath(projectId)}/capability-operations${query ? `?${query}` : ''}`,
     )
   },
-  // 系统设置整页只读，所以只有 get 没有 put。这些值不来自数据库，全部是代码常量本身，
-  // 每次请求现算——中间隔一层存储，就会有页面和代码对不上的那一天。
+  // 设置页的说明文本全部由后端现算：判定阈值那几条取当前生效的值，其余仍是代码常量本身。
+  // 前端抄一份的话，改了 Go 忘了改这里，这一页就从说明变成误导——那比不做更糟。
   getInsightSettings: (projectId: string) =>
     request<ApiInsightSettings>(`${insightProjectPath(projectId)}/settings`),
+  getThresholds: (projectId: string) =>
+    request<ApiResolvedThresholds>(`${insightProjectPath(projectId)}/thresholds`),
+  // 用 PUT 而不是 POST：从调用方看这是「把阈值设成这样」。落库仍是追加一版，
+  // 不改任何已有的行——已经判过的结论保持它当初按的那一版。
+  //
+  // values 里的 null 表示「这一格改回出厂设定」，不是 0；reason 必填。
+  saveThresholds: (projectId: string, body: {
+    values: Record<string, number | null>
+    reason: string
+  }) => request<ApiResolvedThresholds>(`${insightProjectPath(projectId)}/thresholds`, 'PUT', body),
+  listThresholdHistory: (projectId: string, limit = 20) =>
+    request<{ items: ApiThresholdSet[] }>(
+      `${insightProjectPath(projectId)}/thresholds/history?limit=${limit}`,
+    ),
+  getMiyunConnection: (projectId: string) => request<ApiMiyunConnection>(`${miyunProjectPath(projectId)}/connection`),
+  updateMiyunConnection: (projectId: string, body: { session: string; session_expires_at?: string; expected_version?: number }) => request<ApiMiyunConnection>(`${miyunProjectPath(projectId)}/connection`, 'PUT', body),
+  verifyMiyunConnection: (projectId: string, expectedVersion: number) => request<ApiMiyunConnection>(`${miyunProjectPath(projectId)}/connection:verify`, 'POST', { expected_version: expectedVersion }),
+  listMiyunProductProfiles: (projectId: string, limit = 50) => request<{ items: ApiMiyunProductProfile[] }>(`${miyunProjectPath(projectId)}/product-profiles?limit=${limit}`),
+  getMiyunProductSource: (projectId: string) => request<ApiMiyunProductSource>(`${miyunProjectPath(projectId)}/product-source`),
+  getMediaUnderstandingCapabilities: () => request<ApiMediaUnderstandingCapabilities>('/media/v1/capabilities'),
+  requestMediaUnderstanding: (projectId: string, asset: ApiMiyunAssetVersionRef) => request<ApiMediaUnderstandingArtifact>(`/media/v1/projects/${encodeURIComponent(projectId)}/understandings`, 'POST', { asset_id: asset.asset_id, version: asset.version }),
+  getMediaUnderstanding: (projectId: string, artifactId: string) => request<ApiMediaUnderstandingArtifact>(`/media/v1/projects/${encodeURIComponent(projectId)}/understandings/${encodeURIComponent(artifactId)}`),
+  analyzeMiyunProductProfile: (projectId: string, body: { connection_id: string; product_id?: string; product_name?: string; category_name?: string; product_asset_refs: ApiMiyunAssetVersionRef[]; knowledge_document_ids: string[] }) => request<ApiMiyunProductProfile>(`${miyunProjectPath(projectId)}/product-profiles:analyze`, 'POST', body),
+  getMiyunProductProfile: (projectId: string, profileId: string) => request<ApiMiyunProductProfile>(`${miyunProjectPath(projectId)}/product-profiles/${encodeURIComponent(profileId)}`),
+  confirmMiyunProductProfile: (projectId: string, profileId: string, expectedVersion: number, query: ApiMiyunProfileQuery) => request<ApiMiyunProductProfile>(`${miyunProjectPath(projectId)}/product-profiles/${encodeURIComponent(profileId)}:confirm`, 'POST', { expected_version: expectedVersion, query }),
+  listMiyunCrawlJobs: (projectId: string, limit = 50) => request<{ items: ApiMiyunCrawlJob[] }>(`${miyunProjectPath(projectId)}/crawl-jobs?limit=${limit}`),
+  createMiyunCrawlJob: (projectId: string, body: { product_profile_id: string; operation: ApiMiyunCrawlJob['operation']; max_pages: number }, idempotencyKey: string) => request<ApiMiyunCrawlJob>(`${miyunProjectPath(projectId)}/crawl-jobs`, 'POST', body, { 'Idempotency-Key': idempotencyKey }),
+  getMiyunCrawlJob: (projectId: string, jobId: string) => request<ApiMiyunCrawlJob>(`${miyunProjectPath(projectId)}/crawl-jobs/${encodeURIComponent(jobId)}`),
+  cancelMiyunCrawlJob: (projectId: string, jobId: string, expectedVersion: number) => request<ApiMiyunCrawlJob>(`${miyunProjectPath(projectId)}/crawl-jobs/${encodeURIComponent(jobId)}:cancel`, 'POST', { expected_version: expectedVersion }),
+  retryMiyunCrawlJob: (projectId: string, jobId: string, idempotencyKey: string) => request<ApiMiyunCrawlJob>(`${miyunProjectPath(projectId)}/crawl-jobs/${encodeURIComponent(jobId)}:retry`, 'POST', undefined, { 'Idempotency-Key': idempotencyKey }),
+  listMiyunMaterials: (projectId: string, options: { crawlJobId?: string; limit?: number; offset?: number; q?: string; sort?: string; handoffEligible?: boolean } = {}) => {
+    const search = new URLSearchParams({ limit: String(options.limit ?? 100) })
+    if (options.crawlJobId) search.set('crawl_job_id', options.crawlJobId)
+    if (options.offset) search.set('offset', String(options.offset))
+    if (options.q) search.set('q', options.q)
+    if (options.sort) search.set('sort', options.sort)
+    if (options.handoffEligible) search.set('handoff_eligible', 'true')
+    return request<{ items: ApiMiyunMaterial[]; total: number; limit: number; offset: number }>(`${miyunProjectPath(projectId)}/materials?${search.toString()}`)
+  },
+  getMiyunMaterial: (projectId: string, materialId: string) => request<ApiMiyunMaterialDetail>(`${miyunProjectPath(projectId)}/materials/${encodeURIComponent(materialId)}`),
+  // This is deliberately a relative, same-origin URL. Never expose source_ref/resource URLs to the browser.
+  getMiyunMaterialPreviewUrl: (projectId: string, materialId: string) => `/api${miyunProjectPath(projectId)}/materials/${encodeURIComponent(materialId)}/preview`,
+  confirmMiyunMaterial: (projectId: string, materialId: string, expectedVersion: number, note?: string) => request<ApiMiyunMaterial>(`${miyunProjectPath(projectId)}/materials/${encodeURIComponent(materialId)}:confirm`, 'POST', { expected_version: expectedVersion, ...(note === undefined ? {} : { note }) }),
+  rejectMiyunMaterial: (projectId: string, materialId: string, expectedVersion: number, note?: string) => request<ApiMiyunMaterial>(`${miyunProjectPath(projectId)}/materials/${encodeURIComponent(materialId)}:reject`, 'POST', { expected_version: expectedVersion, ...(note === undefined ? {} : { note }) }),
+  retryMiyunMaterialImport: (projectId: string, materialId: string, expectedVersion: number) => request<ApiMiyunMaterial>(`${miyunProjectPath(projectId)}/materials/${encodeURIComponent(materialId)}:retry-import`, 'POST', { expected_version: expectedVersion }),
+  createMiyunHandoff: (projectId: string, body: { source_material_ids: string[]; product_profile_id: string; crawl_job_id: string }, idempotencyKey: string) => request<ApiMiyunHandoff>(`${miyunProjectPath(projectId)}/handoffs`, 'POST', body, { 'Idempotency-Key': idempotencyKey }),
+  listMiyunHandoffs: (projectId: string, limit = 50) => request<{ items: ApiMiyunHandoff[] }>(`${miyunProjectPath(projectId)}/handoffs?limit=${limit}`),
+  getMiyunHandoff: (projectId: string, handoffId: string) => request<ApiMiyunHandoff>(`${miyunProjectPath(projectId)}/handoffs/${encodeURIComponent(handoffId)}`),
+  getMiyunHandoffExportUrl: (projectId: string, handoffId: string, packageKind: 'sources' | 'project') => `/api${miyunProjectPath(projectId)}/handoffs/${encodeURIComponent(handoffId)}/export?package=${packageKind}`,
+  markMiyunHandoffDelivered: (projectId: string, handoffId: string, expectedVersion: number) => request<ApiMiyunHandoff>(`${miyunProjectPath(projectId)}/handoffs/${encodeURIComponent(handoffId)}:mark-delivered`, 'POST', { expected_version: expectedVersion }),
   // observed_through 要回传界面上那条问题的 last_observed_at，不要用当前时间：
   // 「你处置的是你看到的那个版本」靠它成立，中间问题若又恶化不会被一并盖掉。
   resolveQualityIssue: (
@@ -6089,6 +6905,10 @@ export const api = {
 // Insights 走 /api/insights/v1；request() 已经带上 /api 前缀。
 function insightProjectPath(projectId: string): string {
   return `/insights/v1/projects/${encodeURIComponent(projectId)}`
+}
+
+function miyunProjectPath(projectId: string): string {
+  return `${insightProjectPath(projectId)}/miyun`
 }
 
 // 动作端点形如 .../experiences/{id}:confirm，冒号是路径的一部分，不参与编码。

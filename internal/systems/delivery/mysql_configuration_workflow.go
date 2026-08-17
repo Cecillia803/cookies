@@ -12,13 +12,16 @@ import (
 	"github.com/shikanon/cookies/internal/platform/contract"
 )
 
-// CreateRecommendation persists a project-scoped recommendation derived from a three-tier snapshot.
+// CreateRecommendation persists a project-scoped recommendation derived from an immutable configuration snapshot.
 func (r MySQLRepository) CreateRecommendation(ctx context.Context, v DeliveryRecommendation) (DeliveryRecommendation, error) {
-	target, err := json.Marshal(v.TargetSnapshot)
+	if v.BaseConfiguration == nil || v.TargetConfiguration == nil || v.BaseSnapshot != nil || v.TargetSnapshot != nil {
+		return DeliveryRecommendation{}, ErrLegacyConfigurationUnsupported
+	}
+	target, err := json.Marshal(recommendationTarget(v))
 	if err != nil {
 		return v, err
 	}
-	base, err := json.Marshal(v.BaseSnapshot)
+	base, err := json.Marshal(recommendationBase(v))
 	if err != nil {
 		return v, err
 	}
@@ -64,6 +67,9 @@ func (r MySQLRepository) GetRecommendation(ctx context.Context, o contract.Organ
 	return v, err
 }
 func (r MySQLRepository) AcceptRecommendation(ctx context.Context, v DeliveryRecommendation, key, requestHash string, cs ChangeSet) (RecommendationAcceptance, bool, error) {
+	if v.ReadOnly || v.TargetConfiguration == nil || cs.TargetSnapshot == nil || cs.LegacyTargetSnapshot != nil {
+		return RecommendationAcceptance{}, false, ErrLegacyConfigurationUnsupported
+	}
 	tx, err := r.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return RecommendationAcceptance{}, false, err
@@ -105,8 +111,8 @@ func (r MySQLRepository) AcceptRecommendation(ctx context.Context, v DeliveryRec
 		return RecommendationAcceptance{}, false, ErrInvalidState
 	}
 	notes, _ := json.Marshal(cs.PreflightNotes)
-	target, _ := json.Marshal(cs.TargetSnapshot)
-	_, err = tx.ExecContext(ctx, `INSERT INTO delivery_change_sets (id,organization_id,project_id,plan_id,plan_version,status,risk_level,preflight_notes,target_snapshot,target_snapshot_hash,recommendation_id,approved_by,approved_at,version,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?)`, cs.ID, cs.OrganizationID, cs.ProjectID, cs.PlanID, cs.PlanVersion, cs.Status, cs.RiskLevel, notes, target, cs.TargetSnapshotHash, cs.RecommendationID, cs.Version, cs.CreatedBy, cs.CreatedAt, cs.UpdatedAt)
+	target := changeSetSnapshotJSON(cs)
+	_, err = tx.ExecContext(ctx, `INSERT INTO delivery_change_sets (id,organization_id,project_id,plan_id,plan_version,status,risk_level,preflight_notes,target_snapshot,target_snapshot_hash,target_snapshot_schema_version,recommendation_id,approved_by,approved_at,version,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,?,?,?)`, cs.ID, cs.OrganizationID, cs.ProjectID, cs.PlanID, cs.PlanVersion, cs.Status, cs.RiskLevel, notes, target, cs.TargetSnapshotHash, nullableString(changeSetSnapshotSchema(cs)), cs.RecommendationID, cs.Version, cs.CreatedBy, cs.CreatedAt, cs.UpdatedAt)
 	if err != nil {
 		return RecommendationAcceptance{}, false, err
 	}
@@ -140,37 +146,6 @@ func (r MySQLRepository) RejectRecommendation(ctx context.Context, o contract.Or
 	}
 	return r.GetRecommendation(ctx, o, p, id)
 }
-func (r MySQLRepository) CreateOrGetManualActionPackage(ctx context.Context, v ManualActionPackage) (ManualActionPackage, bool, error) {
-	existing, err := r.GetManualActionPackage(ctx, v.OrganizationID, v.ProjectID, v.ChangeSetID)
-	if err == nil {
-		if existing.TargetSnapshotHash == v.TargetSnapshotHash {
-			return existing, true, nil
-		}
-		return ManualActionPackage{}, false, ErrInvalidState
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return ManualActionPackage{}, false, err
-	}
-	payload, err := json.Marshal(v)
-	if err != nil {
-		return ManualActionPackage{}, false, err
-	}
-	_, err = r.DB.ExecContext(ctx, `INSERT INTO delivery_manual_action_packages (id,organization_id,project_id,change_set_id,target_snapshot_hash,content_hash,package_json,created_at) VALUES (?,?,?,?,?,?,?,?)`, v.ID, v.OrganizationID, v.ProjectID, v.ChangeSetID, v.TargetSnapshotHash, v.ContentHash, payload, v.CreatedAt)
-	if err != nil {
-		var mysqlError *mysqlDriver.MySQLError
-		if errors.As(err, &mysqlError) && mysqlError.Number == 1062 {
-			existing, getErr := r.GetManualActionPackage(ctx, v.OrganizationID, v.ProjectID, v.ChangeSetID)
-			if getErr == nil && existing.TargetSnapshotHash == v.TargetSnapshotHash && existing.ContentHash == v.ContentHash {
-				return existing, true, nil
-			}
-			if getErr == nil {
-				return ManualActionPackage{}, false, ErrIdempotencyConflict
-			}
-		}
-		return ManualActionPackage{}, false, err
-	}
-	return v, false, nil
-}
 func (r MySQLRepository) GetManualActionPackage(ctx context.Context, o contract.OrganizationID, p contract.ProjectID, cs string) (ManualActionPackage, error) {
 	var payload []byte
 	err := r.DB.QueryRowContext(ctx, `SELECT package_json FROM delivery_manual_action_packages WHERE organization_id=? AND project_id=? AND change_set_id=? ORDER BY created_at DESC LIMIT 1`, o, p, cs).Scan(&payload)
@@ -184,6 +159,7 @@ func (r MySQLRepository) GetManualActionPackage(ctx context.Context, o contract.
 	if err = json.Unmarshal(payload, &v); err != nil {
 		return ManualActionPackage{}, fmt.Errorf("decode manual action package: %w", err)
 	}
+	v.RuntimeStatus, v.ReadOnly = PlanRuntimeLegacyUnsupported, true
 	return v, nil
 }
 
@@ -199,18 +175,12 @@ func scanRecommendation(row rowScanner) (DeliveryRecommendation, error) {
 		return v, err
 	}
 	v.SimulationRunID = simulationRunID.String
-	var t ThreeTierConfiguration
-	if len(base) > 0 {
-		var b ThreeTierConfiguration
-		if err = json.Unmarshal(base, &b); err != nil {
-			return v, err
-		}
-		v.BaseSnapshot = &b
-	}
-	if err = json.Unmarshal(target, &t); err != nil {
+	if err = decodeRecommendationSnapshot(&v, base, true); err != nil {
 		return v, err
 	}
-	v.TargetSnapshot = &t
+	if err = decodeRecommendationSnapshot(&v, target, false); err != nil {
+		return v, err
+	}
 	_ = json.Unmarshal(evidence, &v.Evidence)
 	_ = json.Unmarshal(risks, &v.Risks)
 	if cooldown.Valid {
@@ -226,4 +196,51 @@ func scanRecommendation(row rowScanner) (DeliveryRecommendation, error) {
 		v.AcceptedChangeSetID = cs.String
 	}
 	return v, nil
+}
+
+func recommendationBase(value DeliveryRecommendation) any {
+	return value.BaseConfiguration
+}
+
+func recommendationTarget(value DeliveryRecommendation) any {
+	return value.TargetConfiguration
+}
+
+func decodeRecommendationSnapshot(value *DeliveryRecommendation, payload []byte, base bool) error {
+	if len(payload) == 0 || string(payload) == "null" {
+		return nil
+	}
+	var descriptor struct {
+		SchemaVersion string `json:"schema_version"`
+		Schema        string `json:"schema"`
+	}
+	if err := json.Unmarshal(payload, &descriptor); err != nil {
+		return err
+	}
+	if descriptor.SchemaVersion == PlatformConfigurationSchemaV2 {
+		var configuration PlatformConfiguration
+		if err := json.Unmarshal(payload, &configuration); err != nil {
+			return err
+		}
+		if base {
+			value.BaseConfiguration = &configuration
+		} else {
+			value.TargetConfiguration = &configuration
+		}
+		return nil
+	}
+	if descriptor.Schema == ThreeTierSchema {
+		var snapshot ThreeTierConfiguration
+		if err := json.Unmarshal(payload, &snapshot); err != nil {
+			return err
+		}
+		if base {
+			value.BaseSnapshot = &snapshot
+		} else {
+			value.TargetSnapshot = &snapshot
+		}
+		value.RuntimeStatus, value.ReadOnly = PlanRuntimeLegacyUnsupported, true
+		return nil
+	}
+	return contractFailure(ContractErrorUnknownSchemaVersion, "recommendation_snapshot", "unknown recommendation snapshot schema")
 }

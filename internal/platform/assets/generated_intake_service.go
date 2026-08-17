@@ -162,6 +162,16 @@ func (w GeneratedIntakeWorker) ProcessOnce(ctx context.Context, workerID string)
 		}
 		return true, err
 	}
+	// ActorID 留空：这条入库是后台 worker 干的，GeneratedIntake 上没有记发起人，
+	// 台账会把它落成 system。编一个人名比留空更坏。
+	w.Upload.recordLedger(ctx, LedgerEntry{
+		OrganizationID: intake.OrganizationID, ProjectID: intake.ProjectID,
+		AssetID: commit.AssetID, Version: commit.Version,
+		Kind: commit.Kind, SourceType: commit.SourceType,
+		Title: LedgerTitle("", commit.SourceType, w.now()),
+	})
+	w.Upload.ensurePoster(ctx, intake.OrganizationID, intake.ProjectID,
+		contract.AssetVersionRef{AssetID: commit.AssetID, Version: commit.Version}, commit.Kind)
 	return true, nil
 }
 
@@ -196,7 +206,7 @@ func (w GeneratedIntakeWorker) fetchAndIngest(ctx context.Context, intake Genera
 	if metadata.MIMEType != declared.DeclaredMIMEType || metadata.SizeBytes != declared.DeclaredSizeBytes || (declared.DeclaredSHA256 != nil && metadata.SHA256 != *declared.DeclaredSHA256) {
 		return AssetCommit{}, &contract.JobError{Code: "OUTPUT_METADATA_MISMATCH", Message: "provider output does not match declared metadata", Retryable: false}
 	}
-	location, err := w.Upload.Blobs.Put(ctx, w.Upload.QuarantineBucket, quarantineKey(intake.OrganizationID, intake.ID), bytes.NewReader(data), int64(len(data)), metadata.MIMEType)
+	location, err := w.Upload.Blobs.Put(ctx, w.Upload.QuarantineBucket, quarantineKey(intake.OrganizationID, intake.ProjectID, intake.ID), bytes.NewReader(data), int64(len(data)), metadata.MIMEType)
 	if err != nil {
 		return AssetCommit{}, &contract.JobError{Code: "ASSET_STORAGE_UNAVAILABLE", Message: "failed to stage provider output", Retryable: true}
 	}

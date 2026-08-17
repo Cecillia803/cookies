@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -91,6 +92,88 @@ func TestMySQLGatewayConfigStoreResolvesVersionedEncryptedRoute(t *testing.T) {
 	}
 	token, err := store.ResolveGatewayCredential(t.Context(), snapshot.CredentialID, snapshot.CredentialVersion)
 	if err != nil || token != "adapter-integration-token" {
+		t.Fatalf("ResolveGatewayCredential() = %q, %v", token, err)
+	}
+}
+
+func TestMySQLGatewayConfigStoreResolvesLASDocumentRoute(t *testing.T) {
+	dsn := os.Getenv("COOKIES_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("COOKIES_TEST_MYSQL_DSN is not configured")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	suffix := strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000"), ".", "")
+	connectionID, connectionRevisionID := "connection_las_"+suffix, "connection_las_revision_"+suffix
+	credentialID, routeID, routeRevisionID := "credential_las_"+suffix, "route_las_"+suffix, "route_las_revision_"+suffix
+	modelAlias := "cookies.document.vision.integration." + suffix
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x45}, 32))
+	cipher, err := NewAESGCMCredentialCipher(key, "integration-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, nonce, keyVersion, err := cipher.Encrypt([]byte("las-integration-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO provider_connections
+		(id, connection_code, connection_type, current_revision_id, status)
+		VALUES (?, ?, 'las_operator', NULL, 'enabled')`, connectionID, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec("UPDATE provider_model_routes SET current_revision_id = NULL WHERE id = ?", routeID)
+		_, _ = db.Exec("DELETE FROM provider_model_route_revisions WHERE id = ?", routeRevisionID)
+		_, _ = db.Exec("DELETE FROM provider_model_routes WHERE id = ?", routeID)
+		_, _ = db.Exec("DELETE FROM provider_credentials WHERE id = ?", credentialID)
+		_, _ = db.Exec("UPDATE provider_connections SET current_revision_id = NULL WHERE id = ?", connectionID)
+		_, _ = db.Exec("DELETE FROM provider_connection_revisions WHERE id = ?", connectionRevisionID)
+		_, _ = db.Exec("DELETE FROM provider_connections WHERE id = ?", connectionID)
+	})
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO provider_connection_revisions
+		(id, connection_id, revision_number, base_url, timeout_seconds, max_response_bytes)
+		VALUES (?, ?, 1, 'https://operator.las.cn-beijing.volces.com/api/v1', 900, 8388608)`,
+		connectionRevisionID, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE provider_connections SET current_revision_id = ? WHERE id = ?`, connectionRevisionID, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO provider_credentials
+		(id, connection_id, credential_version, ciphertext, nonce, key_version, status, active_from)
+		VALUES (?, ?, 1, ?, ?, ?, 'active', UTC_TIMESTAMP(6))`,
+		credentialID, connectionID, ciphertext, nonce, keyVersion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO provider_model_routes
+		(id, organization_id, capability, model_alias, current_revision_id, status)
+		VALUES (?, NULL, 'document.vision.parse', ?, NULL, 'enabled')`, routeID, modelAlias); err != nil {
+		t.Fatal(err)
+	}
+	constraints := json.RawMessage(`{
+		"endpoint":"/submit","poll_endpoint":"/poll","operator_version":"v1",
+		"parse_mode":"detail","full_result":true,"aspect_ratio_threshold":0.334,"poll_interval_ms":2000
+	}`)
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO provider_model_route_revisions
+		(id, route_id, revision_number, connection_id, connection_revision_id, upstream_model, constraints_json)
+		VALUES (?, ?, 1, ?, ?, 'las_pdf_parse_doubao', ?)`,
+		routeRevisionID, routeID, connectionID, connectionRevisionID, constraints); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE provider_model_routes SET current_revision_id = ? WHERE id = ?`, routeRevisionID, routeID); err != nil {
+		t.Fatal(err)
+	}
+	store := MySQLGatewayConfigStore{DB: db, Cipher: cipher}
+	snapshot, err := store.ResolveDocumentVisionRoute(t.Context(), "org_integration", modelAlias)
+	if err != nil || snapshot.ConnectionType != "las_operator" || snapshot.DocumentParseMode != "detail" ||
+		snapshot.DocumentSubmitPath != "/submit" || snapshot.DocumentPollPath != "/poll" {
+		t.Fatalf("ResolveDocumentVisionRoute() = %+v, %v", snapshot, err)
+	}
+	token, err := store.ResolveGatewayCredential(t.Context(), snapshot.CredentialID, snapshot.CredentialVersion)
+	if err != nil || token != "las-integration-token" {
 		t.Fatalf("ResolveGatewayCredential() = %q, %v", token, err)
 	}
 }
@@ -227,5 +310,130 @@ func testJobRecord(now time.Time, id string) JobRecord {
 		ProjectContextVersion: 1,
 		ModelAlias:            "cookies.image.standard",
 		Input:                 ImageGenerationInput{Prompt: "test", Width: 512, Height: 512},
+	}
+}
+
+func TestVideoConfigurationRoundTrip(t *testing.T) {
+	dsn := os.Getenv("COOKIES_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("COOKIES_TEST_MYSQL_DSN is not configured")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open MySQL: %v", err)
+	}
+	defer db.Close()
+	cipher, err := NewAESGCMCredentialCipher("Y29va2llcy1sb2NhbC1wcm92aWRlci1rZXktMzJiISE=", "test-v1")
+	if err != nil {
+		t.Fatalf("build cipher: %v", err)
+	}
+	store := MySQLGatewayConfigStore{DB: db, Cipher: cipher, VideoConnectionType: "ark"}
+	clearVideoConfiguration(t, db)
+	// Registered after defer db.Close() so it runs first: cleanup needs the
+	// connection to still be open.
+	defer clearVideoConfiguration(t, db)
+
+	saved, err := store.SaveVideoConfiguration(t.Context(), "org_local", VideoConfigurationInput{
+		BaseURL:      "https://ark.cn-beijing.volces.com/api/v3",
+		Model:        "doubao-seedance-1-0-lite-t2v-250428",
+		APIKey:       "first-secret-key",
+		Verification: VideoProbeResult{Outcome: VideoProbeOK, Message: "连接正常"},
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if !saved.Configured || saved.MaskedAPIKey != "****-key" {
+		t.Fatalf("saved = %+v", saved)
+	}
+	if saved.LastVerificationOK == nil || !*saved.LastVerificationOK {
+		t.Fatal("verification result was not persisted")
+	}
+
+	// Changing only the model must keep the stored credential usable.
+	if _, err = store.SaveVideoConfiguration(t.Context(), "org_local", VideoConfigurationInput{
+		BaseURL:      "https://ark.cn-beijing.volces.com/api/v3",
+		Model:        "doubao-seedance-1-0-pro-250528",
+		Verification: VideoProbeResult{Outcome: VideoProbeOK, Message: "连接正常"},
+	}); err != nil {
+		t.Fatalf("save without key: %v", err)
+	}
+	key, err := store.ResolveVideoAPIKey(t.Context(), "org_local")
+	if err != nil || key != "first-secret-key" {
+		t.Fatalf("ResolveVideoAPIKey err = %v", err)
+	}
+
+	// Replacing the key retires the old credential instead of deleting it.
+	if _, err = store.SaveVideoConfiguration(t.Context(), "org_local", VideoConfigurationInput{
+		BaseURL:      "https://ark.cn-beijing.volces.com/api/v3",
+		Model:        "doubao-seedance-1-0-pro-250528",
+		APIKey:       "second-secret-key",
+		Verification: VideoProbeResult{Outcome: VideoProbeOK, Message: "连接正常"},
+	}); err != nil {
+		t.Fatalf("replace key: %v", err)
+	}
+	var retired int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM provider_credentials WHERE connection_id = ? AND status = 'retired'`, VideoConnectionID).Scan(&retired); err != nil {
+		t.Fatalf("count retired: %v", err)
+	}
+	if retired == 0 {
+		t.Fatal("the replaced credential must be retired, not deleted")
+	}
+
+	// A stale expected version must not overwrite a newer configuration.
+	stale := int64(1)
+	if _, err = store.SaveVideoConfiguration(t.Context(), "org_local", VideoConfigurationInput{
+		BaseURL:         "https://ark.cn-beijing.volces.com/api/v3",
+		Model:           "doubao-seedance-1-0-lite-t2v-250428",
+		ExpectedVersion: &stale,
+		Verification:    VideoProbeResult{Outcome: VideoProbeOK, Message: "连接正常"},
+	}); !errors.Is(err, ErrVideoConfigurationConflict) {
+		t.Fatalf("stale write error = %v, want ErrVideoConfigurationConflict", err)
+	}
+
+	// The saved route must be resolvable through the adapter's own path.
+	snapshot, err := store.ResolveVideoRoute(t.Context(), "org_local", VideoModelAlias)
+	if err != nil {
+		t.Fatalf("ResolveVideoRoute: %v", err)
+	}
+	if snapshot.UpstreamModel != "doubao-seedance-1-0-pro-250528" {
+		t.Fatalf("snapshot model = %q", snapshot.UpstreamModel)
+	}
+
+	// A rotated master key must degrade to "please re-enter", not to an error.
+	rotated, err := NewAESGCMCredentialCipher("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", "test-v2")
+	if err != nil {
+		t.Fatalf("build rotated cipher: %v", err)
+	}
+	config, err := (MySQLGatewayConfigStore{DB: db, Cipher: rotated, VideoConnectionType: "ark"}).GetVideoConfiguration(t.Context(), "org_local")
+	if err != nil {
+		t.Fatalf("read with rotated key: %v", err)
+	}
+	if !config.Configured || config.CredentialReadable {
+		t.Fatalf("rotated read = %+v, want configured but unreadable", config)
+	}
+}
+
+func clearVideoConfiguration(t *testing.T, db *sql.DB) {
+	t.Helper()
+	statements := []string{
+		`UPDATE provider_model_routes SET current_revision_id = NULL WHERE id = ?`,
+		`DELETE FROM provider_model_route_revisions WHERE route_id = ?`,
+		`DELETE FROM provider_model_routes WHERE id = ?`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement, VideoRouteID); err != nil {
+			t.Fatalf("clear route: %v", err)
+		}
+	}
+	connectionStatements := []string{
+		`DELETE FROM provider_credentials WHERE connection_id = ?`,
+		`UPDATE provider_connections SET current_revision_id = NULL WHERE id = ?`,
+		`DELETE FROM provider_connection_revisions WHERE connection_id = ?`,
+		`DELETE FROM provider_connections WHERE id = ?`,
+	}
+	for _, statement := range connectionStatements {
+		if _, err := db.Exec(statement, VideoConnectionID); err != nil {
+			t.Fatalf("clear connection: %v", err)
+		}
 	}
 }

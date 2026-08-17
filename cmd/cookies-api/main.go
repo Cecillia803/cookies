@@ -16,18 +16,24 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/shikanon/cookies/internal/integrations/creativedelivery"
+	"github.com/shikanon/cookies/internal/integrations/crawler"
 	"github.com/shikanon/cookies/internal/integrations/creativeprovider"
 	"github.com/shikanon/cookies/internal/integrations/deliveryinsights"
+	"github.com/shikanon/cookies/internal/integrations/gotenberg"
+	"github.com/shikanon/cookies/internal/integrations/insightsledger"
+	"github.com/shikanon/cookies/internal/integrations/insightsposter"
+	"github.com/shikanon/cookies/internal/integrations/lasdocument"
 	"github.com/shikanon/cookies/internal/integrations/productsource"
-	"github.com/shikanon/cookies/internal/integrations/projectdelivery"
 	"github.com/shikanon/cookies/internal/integrations/seedresearch"
 	"github.com/shikanon/cookies/internal/integrations/strategycreative"
 	"github.com/shikanon/cookies/internal/platform/agent"
 	"github.com/shikanon/cookies/internal/platform/assets"
+	"github.com/shikanon/cookies/internal/platform/computeruse"
+	computerusehttp "github.com/shikanon/cookies/internal/platform/computeruse/httpapi"
 	"github.com/shikanon/cookies/internal/platform/config"
 	"github.com/shikanon/cookies/internal/platform/contract"
 	"github.com/shikanon/cookies/internal/platform/database"
@@ -58,6 +64,9 @@ func main() {
 	}
 	ffmpegPath := localExecutablePath(cfg.Environment, cfg.Media.FFmpegPath, "ffmpeg")
 	ffprobePath := localExecutablePath(cfg.Environment, cfg.Media.FFprobePath, "ffprobe")
+	if cfg.MediaUnderstanding.ASREnabled && ffmpegPath == "" {
+		log.Fatal("invalid configuration: COOKIES_MEDIA_UNDERSTANDING_ASR_ENABLED requires an available ffmpeg executable")
+	}
 
 	db, err := database.Open(context.Background(), cfg.MySQL)
 	if err != nil {
@@ -122,23 +131,46 @@ func main() {
 	scanner := buildScanner(cfg)
 	projectService := &project.Service{Store: projectStore, Authorizer: projectStore}
 	assetRepository := assets.MySQLRepository{DB: db}
-	uploadService := &assets.UploadService{Repository: assetRepository, Projects: projectService, Blobs: blobs, Scanner: scanner, QuarantineBucket: cfg.ObjectStorage.QuarantineBucket, AssetsBucket: cfg.ObjectStorage.AssetsBucket}
+	// 台账的收录钩子。insightsService 要到几百行之后才造得出来，
+	// 而中间有几处按值把 UploadService 拷走；拷的是这个指针，回填也回填这个指针。
+	ledgerRelay := &assets.LedgerRelay{}
+	uploadService := &assets.UploadService{Repository: assetRepository, Projects: projectService, Blobs: blobs, Scanner: scanner, QuarantineBucket: cfg.ObjectStorage.QuarantineBucket, AssetsBucket: cfg.ObjectStorage.AssetsBucket, UsePolicy: assets.AssetUsePolicy{Rights: assetRepository}, Ledger: ledgerRelay}
 	if ffprobePath != "" {
 		uploadService.VideoProbe = assets.FFprobeVideoProbe{Path: ffprobePath, WorkRoot: cfg.Media.VideoWorkRoot}
 		uploadService.AudioProbe = assets.FFprobeAudioProbe{Path: ffprobePath, WorkRoot: cfg.Media.VideoWorkRoot}
 	}
 	intakeService := &assets.GeneratedIntakeService{Repository: assetRepository, Projects: projectService}
 	creativeRepository := creative.MySQLRepository{DB: db}
+	productionCenter := &creative.ProductionCenterService{
+		Projects: projectService,
+		Sources: []creative.ProductionRunSource{
+			creative.CreativeRenderRunAdapter{Jobs: creativeRepository},
+			creative.EditingRenderRunAdapter{Jobs: creativeRepository},
+		},
+		Assets: creative.AssetReadAdapter{Assets: uploadService},
+	}
 	creativeService := &creative.Service{
 		Repository: creativeRepository, ViralRemakes: creativeRepository, EditTasks: creativeRepository, EditingRenders: creativeRepository,
-		Projects: projectService, Assets: creativeAssetReader{uploads: uploadService},
+		Projects: projectService, Assets: creativeAssetReader{uploads: uploadService}, AssetUses: assets.AssetUsePolicy{Rights: assetRepository},
 		AudioAssets:        creativeAudioAssetWriter{uploads: uploadService},
 		CommerceWorkspaces: creativeRepository, BrandBriefs: creativeRepository, Directions: creativeRepository,
-		AINativeProducts:             creativeProductResolver{resolver: productsource.NewDouyinResolver()},
-		AINativeRequirements:         creativeRepository,
-		AINativeScripts:              creativeRepository,
-		AINativeScriptProfiles:       creative.NewChannelCreativeProfileRegistry(),
+		AINativeProducts:       creativeProductResolver{resolver: productsource.NewResolver()},
+		AINativeRequirements:   creativeRepository,
+		AINativeScripts:        creativeRepository,
+		AINativeScriptProfiles: creative.NewChannelCreativeProfileRegistry(),
+		AINativeOutputPresets: func() *creative.OutputPresetRegistry {
+			value := creative.NewOutputPresetRegistry(creative.NewChannelCreativeProfileRegistry())
+			return &value
+		}(),
 		AINativeProductMediaImporter: creativeProductMediaImporter{uploads: uploadService},
+	}
+	productionRetryAdapters := []creative.ProductionRetryAdapter{
+		creative.EditingRenderProductionRetryAdapter{Renders: creativeService},
+	}
+	productionCenter.RetryAdapters = productionRetryAdapters
+	productionRetry := &creative.ProductionRetryService{
+		Projects: projectService, Sources: productionCenter.Sources, Adapters: productionRetryAdapters,
+		Ledger: creativeRepository, Audit: productionRetryAuditAdapter{store: projectStore},
 	}
 	if cfg.Creative.DirectionPlanningEnabled {
 		textAdapter, textAdapterErr := buildTextAdapter(cfg, db)
@@ -225,7 +257,7 @@ func main() {
 				Text:       &provider.Service{TextAdapter: textAdapter},
 				ModelAlias: cfg.Creative.GamePrerollPlannerModelAlias,
 			},
-			Fallback: creative.DeterministicGamePrerollPlanner{},
+			Fallback: creative.GenericGamePrerollPlanner{},
 			OnPrimaryFailure: func(err error) {
 				log.Printf("Creative game-preroll model planning fell back to deterministic planning: %v", err)
 			},
@@ -235,7 +267,7 @@ func main() {
 			cfg.Creative.GamePrerollPlannerModelAlias,
 		)
 	} else {
-		creativeService.GamePrerollPlanner = creative.DeterministicGamePrerollPlanner{}
+		creativeService.GamePrerollPlanner = creative.GenericGamePrerollPlanner{}
 	}
 	if cfg.Creative.BrandFilmModelPlannerEnabled {
 		textAdapter, textAdapterErr := buildTextAdapter(cfg, db)
@@ -289,12 +321,35 @@ func main() {
 			log.Fatalf("configure short drama V2 analyzer: %v", shortDramaAnalyzerErr)
 		}
 		creativeService.ShortDramaV2Analyzer = shortDramaAnalyzer
+		commerceAnalyzer, commerceAnalyzerErr := creativeprovider.NewCommercePrerollV2Analyzer(analysisConfig)
+		if commerceAnalyzerErr != nil {
+			log.Fatalf("configure commerce preroll V2 analyzer: %v", commerceAnalyzerErr)
+		}
+		creativeService.CommercePrerollV2Analyzer = commerceAnalyzer
+		gameAnalyzer, gameAnalyzerErr := creativeprovider.NewGamePrerollV2Analyzer(analysisConfig)
+		if gameAnalyzerErr != nil {
+			log.Fatalf("configure game preroll V2 analyzer: %v", gameAnalyzerErr)
+		}
+		creativeService.GamePrerollV2Analyzer = gameAnalyzer
 		log.Printf("Creative viral analysis configured: model_alias=%s prompt_version=%s asr=%s", "cookies.text.standard", "viral.analyze.v1", cfg.Provider.VolcengineASR.ResourceID)
 	}
 	runtimeStore := jobruntime.MySQLStore{DB: db}
+	// 派生物（目前只有视频首帧图）。ffmpeg 没配就整条不启用——本地开发机
+	// 没装 ffmpeg 也要能把服务跑起来，清单退回类型图标即可。
+	var derivativeService *assets.DerivativeService
+	if ffmpegPath != "" {
+		derivativeService = &assets.DerivativeService{
+			Repository: assetRepository,
+			Scheduler: assets.JobRuntimeDerivativeScheduler{
+				Store: runtimeStore, NewID: func() (string, error) { return ids.New("assetderivativeexec") },
+			},
+		}
+		uploadService.Derivatives = derivativeService
+	}
 	creativeService.DirectionScheduler = creative.JobRuntimeDirectionGenerationScheduler{Store: runtimeStore}
 	creativeService.AINativeOperationCanceller = creativeAINativeOperationCanceller{store: runtimeStore}
 	var researchRunner knowledge.ExternalResearchRunner
+	var researchRouteInspector strategysystem.ResearchRouteInspector
 	if cfg.Research.SeedEnabled {
 		cipher, cipherErr := provider.NewAESGCMCredentialCipher(
 			cfg.Provider.MasterKey, cfg.Provider.MasterKeyVersion,
@@ -305,17 +360,23 @@ func main() {
 		gatewayConfig := provider.MySQLGatewayConfigStore{
 			DB: db, Cipher: cipher, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP,
 		}
-		researchRunner = &seedresearch.Client{
+		seedResearchClient := &seedresearch.Client{
 			Routes: gatewayConfig, Credentials: gatewayConfig,
 			ModelAlias: cfg.Research.SeedModelAlias, MaxConcurrent: cfg.Research.MaxConcurrent,
 			AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP,
 		}
+		researchRunner = seedResearchClient
+		researchRouteInspector = seedResearchClient
 		log.Printf("Knowledge research configured: transport=ark_responses tool=web_search model_alias=%s",
 			cfg.Research.SeedModelAlias)
 	}
 	knowledgeService := &knowledge.Service{
 		DB: db, Projects: projectService, Blobs: blobs, Scanner: scanner,
 		AssetsBucket: cfg.ObjectStorage.AssetsBucket, Runner: researchRunner,
+		JobProgress: runtimeStore, JobCanceller: runtimeStore,
+	}
+	if researchRunner != nil {
+		knowledgeService.SourceVerifier = knowledge.SafeHTTPResearchSourceVerifier{Timeout: 8 * time.Second}
 	}
 	if cfg.Research.TikaEnabled {
 		knowledgeService.DocumentParser = knowledge.TikaParser{
@@ -327,6 +388,37 @@ func main() {
 			Store: runtimeStore, NewID: func() (string, error) { return ids.New("documentparsejob") },
 		}
 		log.Printf("Knowledge document parsing configured: parser=tika version=%s", cfg.Research.TikaVersion)
+	}
+	if cfg.Research.DocumentVisionEnabled {
+		cipher, cipherErr := provider.NewAESGCMCredentialCipher(cfg.Provider.MasterKey, cfg.Provider.MasterKeyVersion)
+		if cipherErr != nil {
+			log.Fatalf("configure LAS document vision credential encryption: %v", cipherErr)
+		}
+		gatewayConfig := provider.MySQLGatewayConfigStore{
+			DB: db, Cipher: cipher, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP,
+		}
+		knowledgeService.DocumentVision = &lasdocument.Client{
+			Routes: gatewayConfig, Credentials: gatewayConfig,
+			SourceURLs:   blobs,
+			OutputBucket: cfg.ObjectStorage.AssetsBucket, OutputPrefix: "provider-output/document-vision",
+			AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP,
+		}
+		knowledgeService.VisionModelAlias = cfg.Research.DocumentVisionModelAlias
+		knowledgeService.VisionScheduler = knowledge.JobRuntimeDocumentVisionFallbackScheduler{
+			Store: runtimeStore, NewID: func() (string, error) { return ids.New("documentvisionjob") },
+		}
+		log.Printf("Knowledge document vision configured: provider=volcengine_las model_alias=%s input=tos output=tos",
+			cfg.Research.DocumentVisionModelAlias)
+	}
+	if cfg.Research.DocumentConverterEnabled {
+		knowledgeService.DocumentConverter = &gotenberg.Client{
+			BaseURL: cfg.Research.DocumentConverterBaseURL, Version: cfg.Research.DocumentConverterVersion,
+			Timeout:           time.Duration(cfg.Research.DocumentConverterTimeout) * time.Second,
+			MaxPDFBytes:       int64(cfg.Research.DocumentConverterMaxPDFBytes),
+			AllowInsecureHTTP: cfg.Research.DocumentConverterAllowHTTP,
+		}
+		log.Printf("Knowledge presentation conversion configured: converter=gotenberg_libreoffice version=%s",
+			cfg.Research.DocumentConverterVersion)
 	}
 	if researchRunner != nil {
 		knowledgeService.Scheduler = knowledge.JobRuntimeResearchScheduler{
@@ -341,9 +433,11 @@ func main() {
 	if visionAdapter != nil {
 		visionProvider = &provider.Service{VisionAdapter: visionAdapter, VisionSources: assetVisionSourceResolver{uploads: uploadService}}
 	}
+	log.Printf("Media understanding configured: real_provider=%t vision_model_alias=%s asr=%t", cfg.MediaUnderstanding.RealProviderEnabled, cfg.MediaUnderstanding.VisionModelAlias, cfg.MediaUnderstanding.ASREnabled)
 	mediaUnderstandingService := &mediaunderstanding.Service{
 		Store: mediaunderstanding.MySQLStore{DB: db}, Projects: projectService, Assets: uploadService,
-		DerivedImages: uploadService, Vision: visionProvider, ModelAlias: "cookies.vision.standard",
+		DerivedImages: uploadService, Vision: visionProvider, RealVision: cfg.MediaUnderstanding.RealProviderEnabled,
+		ModelAlias: cfg.MediaUnderstanding.VisionModelAlias,
 		Scheduler: mediaunderstanding.JobRuntimeScheduler{
 			Store: runtimeStore, NewID: func() (string, error) { return ids.New("mediaunderstandingjob") },
 		},
@@ -354,6 +448,18 @@ func main() {
 			Sources: creativeMediaSource{repository: assetRepository, blobs: blobs},
 		}
 	}
+	if cfg.MediaUnderstanding.ASREnabled && ffmpegPath != "" {
+		mediaUnderstandingService.Transcriber = creativeprovider.AssetTranscriber{
+			Assets: uploadService, FFmpegPath: ffmpegPath, WorkRoot: cfg.Media.VideoWorkRoot,
+			ASR: creativeprovider.VolcengineASR{Config: creativeprovider.ASRConfig{
+				Endpoint: cfg.Provider.VolcengineASR.Endpoint, AuthMode: cfg.Provider.VolcengineASR.AuthMode,
+				AppID: cfg.Provider.VolcengineASR.AppID, AccessToken: cfg.Provider.VolcengineASR.AccessToken,
+				APIKey: cfg.Provider.VolcengineASR.APIKey, ResourceID: cfg.Provider.VolcengineASR.ResourceID,
+				Model: cfg.Provider.VolcengineASR.Model,
+			}},
+		}
+		log.Printf("Media understanding ASR configured: adapter=volcengine_asr model=%s", cfg.Provider.VolcengineASR.Model)
+	}
 	remixService := remix.NewMemoryService(func() (string, error) { return ids.New("remixplan") })
 	agentService := agent.NewMemoryService(remixService, func(prefix string) (string, error) { return ids.New(prefix) })
 	dependencies := httpserver.Dependencies{
@@ -361,7 +467,7 @@ func main() {
 		ProjectAuthorizer: projectStore,
 		Readiness:         database.Readiness{DB: db},
 		Identities:        identityStore, Accounts: identityStore, Projects: projectService, ProjectMembers: projectStore,
-		Uploads: uploadService, Intakes: intakeService, Creative: creativeService,
+		Uploads: uploadService, Intakes: intakeService, Creative: creativeService, ProductionCenter: productionCenter, ProductionAssets: productionCenter, ProductionRetry: productionRetry,
 		Sessions: sessionService, Knowledge: knowledgeService,
 		RemixPlans: remixService, Evals: remixService, AgentRuns: agentService,
 		ProviderConfig: provider.MySQLGatewayConfigStore{DB: db},
@@ -371,8 +477,6 @@ func main() {
 	deliveryService := &delivery.Service{
 		Repository: delivery.MySQLRepository{DB: db},
 		Projects:   projectService,
-		Packages:   creativedelivery.Reader{Service: creativeService},
-		References: projectdelivery.Reader{Service: projectService},
 		// The Connector is not configured in this environment. Normalize the
 		// deterministic OutcomeSimulation records through the Delivery consumer
 		// port until its future adapter publishes a stable contract.
@@ -380,6 +484,16 @@ func main() {
 	}
 	dependencies.AuthenticatedDomainMounts = append(dependencies.AuthenticatedDomainMounts,
 		httpserver.DomainMount{Pattern: "/api/delivery/v1/", Handler: deliveryhttp.New(deliveryService)})
+	computerUseRepository := computeruse.MySQLRepository{DB: db}
+	computerUseService := computeruse.Service{
+		Repository: computerUseRepository,
+		AuthorityProvider: delivery.ComputerUseAuthorityProvider{
+			Repository: delivery.MySQLRepository{DB: db},
+		},
+		NewID: func(prefix string) (string, error) { return ids.New(prefix) },
+	}
+	dependencies.AuthenticatedDomainMounts = append(dependencies.AuthenticatedDomainMounts,
+		httpserver.DomainMount{Pattern: "/api/platform/v1/computer-use/", Handler: computerusehttp.NewTakeoverOnly(computerUseService, projectStore)})
 	// 文本模型出口。Strategy 和 Insights 共用同一个网关适配器和同一个能力别名——
 	// 它们要的是同一件事：调一次文本模型。**目前也共用同一个开关**
 	// （COOKIES_STRATEGY_REAL_PROVIDER_ENABLED），这是个遗留：
@@ -398,14 +512,80 @@ func main() {
 		creativeService.AINativeStoryboardPlanner = creative.ModelAINativeStoryboardPlanner{Text: textProvider, ModelAlias: cfg.Strategy.TextModelAlias}
 		creativeService.AINativeVoiceoverFitter = creative.ModelAINativeVoiceoverFitter{Text: textProvider, ModelAlias: cfg.Strategy.TextModelAlias}
 	}
+	var miyunCipher insights.MiyunSecretCipher
+	var miyunPages insights.MiyunPageClient
+	var miyunVerifier insights.MiyunConnectionVerifier
+	var miyunImports insights.MiyunAuthorizedImporter
+	var miyunPreviews insights.MiyunAuthorizedPreviewer
+	if cfg.Miyun.Enabled {
+		cipher, cipherErr := insights.NewAESGCMMiyunSecretCipher(cfg.Miyun.MasterKey, cfg.Miyun.MasterKeyVersion)
+		if cipherErr != nil {
+			log.Fatalf("configure Miyun secret encryption: %v", cipherErr)
+		}
+		if uploadService.VideoProbe == nil && uploadService.MediaProbe == nil {
+			log.Fatalf("configure Miyun external import: ffprobe or media probe is required")
+		}
+		gate := &crawler.YouShuGate{
+			MaxConcurrent: cfg.Miyun.MaxConcurrent, RequestsPerSecond: cfg.Miyun.RequestsPerSecond,
+			Cooldown: time.Duration(cfg.Miyun.CooldownSeconds) * time.Second,
+		}
+		protocol := miyunProtocolAdapter{endpoint: cfg.Miyun.Endpoint, cipher: cipher, client: &http.Client{Timeout: 30 * time.Second}, gate: gate}
+		externalImports := assets.ExternalImportService{
+			Repository: assetRepository, Projects: projectService, Upload: *uploadService,
+			QuarantineBucket: cfg.ObjectStorage.QuarantineBucket,
+		}
+		miyunCipher, miyunPages, miyunVerifier = cipher, protocol, protocol
+		miyunImports = miyunAuthorizedImportAdapter{
+			downloader: &crawler.YouShuDownloader{HTTPClient: &http.Client{Timeout: 2 * time.Minute}, AllowedHosts: cfg.Miyun.DownloadAllowedHosts},
+			assets:     externalImports, ledger: assetRepository, workRoot: miyunWorkRoot(cfg.Media.VideoWorkRoot),
+		}
+		miyunPreviews = miyunAuthorizedPreviewAdapter{
+			downloader: &crawler.YouShuDownloader{HTTPClient: &http.Client{Timeout: 2 * time.Minute}, AllowedHosts: cfg.Miyun.DownloadAllowedHosts},
+			workRoot:   miyunWorkRoot(cfg.Media.VideoWorkRoot),
+		}
+		log.Printf("Miyun collection configured: real_calls=true concurrency=%d rate=%d cooldown_seconds=%d download_hosts=%d",
+			cfg.Miyun.MaxConcurrent, cfg.Miyun.RequestsPerSecond, cfg.Miyun.CooldownSeconds, len(cfg.Miyun.DownloadAllowedHosts))
+	}
 	insightsService := &insights.Service{
-		Repository:  insights.MySQLRepository{DB: db},
-		Assets:      insights.MySQLRepository{DB: db},
-		Connectors:  insights.MySQLRepository{DB: db},
-		Runs:        insights.MySQLRepository{DB: db},
-		Experiments: insights.MySQLRepository{DB: db},
-		Projects:    projectService,
-		Delivery:    deliveryinsights.Reader{Service: deliveryService},
+		Repository:     insights.MySQLRepository{DB: db},
+		Assets:         insights.MySQLRepository{DB: db},
+		ExternalAssets: insights.MySQLRepository{DB: db},
+		Connectors:     insights.MySQLRepository{DB: db},
+		Runs:           insights.MySQLRepository{DB: db},
+		Experiments:    insights.MySQLRepository{DB: db},
+		Thresholds:     insights.MySQLRepository{DB: db},
+		Projects:       projectService,
+		Delivery:       deliveryinsights.Reader{Service: deliveryService},
+		Media:          insightMediaReader{uploads: uploadService},
+		// 视频类提取走多模态。为 nil 时视频类退回人填画面描述那条路——
+		// 这里永远不为 nil（媒体理解服务总是构造出来的），但它内部的视觉链路
+		// 可能没接通，那种情况由 UnderstandMedia 自己识别并回落。
+		Understanding: insightMediaUnderstander{service: mediaUnderstandingService},
+
+		// 米云素材（来自上游 shikanon/cookies）。
+		Miyun:               insights.MySQLRepository{DB: db},
+		MiyunProjects:       miyunProjectSourceAdapter{projects: projectService},
+		MiyunAssets:         miyunAssetSourceAdapter{uploads: uploadService},
+		MiyunKnowledge:      miyunKnowledgeSourceAdapter{knowledge: knowledgeService},
+		MiyunHandoffContent: miyunHandoffContentAdapter{uploads: uploadService, knowledge: knowledgeService},
+		MiyunMedia:          miyunMediaEvidenceAdapter{media: mediaUnderstandingService},
+		MiyunCrawl:          insights.MySQLRepository{DB: db},
+		MiyunJobs:           runtimeStore,
+		MiyunPages:          miyunPages,
+		MiyunImports:        miyunImports,
+		MiyunReturns:        miyunReturnImportAdapter{imports: assets.ExternalImportService{Repository: assetRepository, Projects: projectService, Upload: *uploadService, QuarantineBucket: cfg.ObjectStorage.QuarantineBucket}, uploads: *uploadService},
+		MiyunPreviews:       miyunPreviews,
+		MiyunSecrets:        miyunCipher,
+		MiyunVerifier:       miyunVerifier,
+		MiyunCooldown:       time.Duration(cfg.Miyun.CooldownSeconds) * time.Second,
+	}
+	// 回填台账钩子。必须在 insightsService 构造完之后——
+	// 在这之前，素材库那边每一次入库都从 relay 上读到 nil，什么都不做。
+	ledgerRelay.Recorder = insightsledger.Recorder{Service: insightsService}
+	// 封面取用口。derivativeService 为 nil（没配 ffmpeg）时不接，
+	// ReadAssetPoster 会明说没接通，前端退回类型图标。
+	if derivativeService != nil {
+		insightsService.Posters = insightsposter.Reader{Derivatives: *derivativeService, Uploads: uploadService}
 	}
 	// Text 为 nil 时提取会直接失败，不会退化成模板产出——
 	// 库里一条编造的特征，代价远大于一次失败的提取。
@@ -417,8 +597,26 @@ func main() {
 		httpserver.DomainMount{Pattern: "/api/insights/v1/", Handler: insightshttp.New(insightsService)})
 	workerContext, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
+	if knowledgeService.DocumentScheduler != nil || knowledgeService.Scheduler != nil || knowledgeService.VisionScheduler != nil {
+		knowledgeReconciler := knowledge.JobStateReconciler{Service: knowledgeService, Limit: 20}
+		startWorker(workerContext, "knowledge-job-reconcile", knowledgeReconciler.RunOnce)
+	}
 	agentStore := agent.MySQLStore{DB: db}
 	runtimeHandlers := map[string]jobruntime.Handler{}
+	if cfg.Miyun.Enabled {
+		runtimeHandlers[insights.MiyunCrawlJobKind] = insightsService.HandleMiyunCrawlJob
+		runtimeHandlers[insights.MiyunMaterialImportJobKind] = insightsService.HandleMiyunMaterialImportJob
+	}
+	// 抽帧 worker。要有系统身份：IngestDerivedImage 认 assets.write，
+	// 而这条路上没有人在点，只有 worker。
+	if derivativeService != nil && actor != nil {
+		runtimeHandlers[assets.DerivativeJobKind] = assets.DerivativeRuntimeHandler(assets.DerivativeRunner{
+			Repository: assetRepository, Assets: assetRepository, Blobs: blobs,
+			Upload: *uploadService,
+			Poster: assets.FFmpegPosterExtractor{Path: ffmpegPath, WorkRoot: cfg.Media.VideoWorkRoot},
+			Actor:  *actor,
+		})
+	}
 	runtimeHandlers[creative.DirectionGenerationJobKind] = creativeService.HandleDirectionGenerationJob
 	creativeService.AINativeScriptScheduler = creative.JobRuntimeAINativeScriptScheduler{
 		Store: runtimeStore,
@@ -430,6 +628,9 @@ func main() {
 	}
 	if knowledgeService.DocumentParser != nil {
 		runtimeHandlers[knowledge.DocumentParseJobKind] = knowledgeService.HandleDocumentParseJob
+	}
+	if knowledgeService.DocumentVision != nil {
+		runtimeHandlers[knowledge.DocumentVisionFallbackJobKind] = knowledgeService.HandleDocumentVisionFallbackJob
 	}
 	creativeService.RenderScheduler = creative.JobRuntimeRenderScheduler{
 		Store: runtimeStore, NewID: func() (string, error) { return ids.New("creativerenderexec") },
@@ -447,6 +648,7 @@ func main() {
 			Sources: creativeMediaSource{repository: assetRepository, blobs: blobs}, Probe: probe,
 		}
 		creativeService.ShortDramaV2OutputNormalizer = composer
+		creativeService.CommercePrerollV2OutputNormalizer = composer
 		creativeService.Composer = composer
 		creativeService.BrandFilmComposer = composer
 		creativeService.RenderedAssets = creativeRenderedAssetWriter{uploads: uploadService}
@@ -457,8 +659,9 @@ func main() {
 		}
 		creativeService.AINativeTimelineRenderer = media.FFmpegTimelineRenderer{
 			FFmpegPath: ffmpegPath, WorkRoot: cfg.Media.VideoWorkRoot,
-			Videos: creativeMediaSource{repository: assetRepository, blobs: blobs},
-			Audio:  creativeMediaSource{repository: assetRepository, blobs: blobs}, Probe: probe,
+			Videos:  creativeMediaSource{repository: assetRepository, blobs: blobs},
+			Visuals: creativeMediaSource{repository: assetRepository, blobs: blobs},
+			Audio:   creativeMediaSource{repository: assetRepository, blobs: blobs}, Probe: probe,
 		}
 		runtimeHandlers[creative.AudioMixRenderJobKind] = creative.AudioMixRenderRuntimeHandler(*creativeService)
 		for kind, handler := range creative.NewRenderRuntimeWorker(runtimeStore, *creativeService).Handlers {
@@ -467,12 +670,17 @@ func main() {
 		runtimeHandlers["creative.editing.render"] = creative.EditingRenderRuntimeHandler(*creativeService)
 	}
 	if cfg.Strategy.Enabled {
+		productEventWriter := strategysystem.MySQLProductEventWriter{DB: db}
 		strategyService := strategysystem.Service{
 			DB: db, Projects: projectService, Knowledge: knowledgeService, ConversationKnowledge: knowledgeService,
-			ConversationResearch: knowledgeService,
+			ConversationResearch: knowledgeService, ResearchRoutes: researchRouteInspector,
+			DocumentVisionRoutes: knowledgeService.DocumentVision,
 			ConversationMedia:    mediaUnderstandingService,
-			CreativeAssets:       uploadService, Agents: agentStore, Text: textProvider,
-			TextModelAlias: cfg.Strategy.TextModelAlias, DeepReviewModelAlias: cfg.Strategy.DeepReviewModelAlias,
+			CreativeAssets:       uploadService, Agents: agentStore,
+			ProductEvents: productEventWriter, Text: textProvider,
+			TextModelAlias: cfg.Strategy.TextModelAlias, LiteTextModelAlias: cfg.Strategy.LiteTextModelAlias,
+			DeepReviewModelAlias: cfg.Strategy.DeepReviewModelAlias,
+			ResearchModelAlias:   cfg.Research.SeedModelAlias, DocumentVisionModelAlias: cfg.Research.DocumentVisionModelAlias,
 			PromptVersion:             cfg.Strategy.PromptVersion,
 			ConversationPromptVersion: cfg.Strategy.ConversationPromptVersion,
 			RevisePromptVersion:       cfg.Strategy.RevisePromptVersion,
@@ -487,6 +695,10 @@ func main() {
 			DisableApproval:              !cfg.Strategy.ApproveEnabled,
 			AllowedOrganizations:         strategyOrganizationAllowlist(cfg.Strategy.OrganizationAllowlist),
 		}
+		knowledgeService.DocumentEvents = strategysystem.KnowledgeDocumentProductEventSink{
+			Writer: productEventWriter, NewID: func() (string, error) { return ids.New("strategyproductevent") },
+		}
+		knowledgeService.ResearchCompletion = strategyService
 		if err := strategyService.EnsureCreativeBusinessCatalog(context.Background()); err != nil {
 			log.Fatalf("seed Strategy creative business catalog: %v", err)
 		}
@@ -526,7 +738,7 @@ func main() {
 		agentDispatcher := agent.Dispatcher{DB: db, Jobs: runtimeStore}
 		startWorker(workerContext, "agent-dispatch", agentDispatcher.RunOnce)
 	}
-	if cfg.Environment == config.EnvironmentLocal || cfg.Provider.ImageAdapter == "adapter_gateway" {
+	if cfg.Environment == config.EnvironmentLocal || cfg.Provider.ImageAdapter == "adapter_gateway" || cfg.Provider.VideoAdapter == "adapter_gateway" {
 		adapter, outputHandles, err := buildImageAdapter(cfg, db, blobs)
 		if err != nil {
 			log.Fatalf("configure Provider image adapter: %v", err)
@@ -535,8 +747,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("configure Provider video adapter: %v", err)
 		}
+		providerStore := provider.MySQLStore{DB: db, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP}
 		providerService := provider.Service{
-			Store:         provider.MySQLStore{DB: db, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP},
+			Store:         providerStore,
+			JobQueryStore: providerStore,
 			Scheduler:     provider.JobRuntimeScheduler{Store: runtimeStore, NewID: func() (string, error) { return ids.New("providerexec") }},
 			ImageAdapter:  adapter,
 			VideoAdapter:  videoAdapter,
@@ -552,6 +766,10 @@ func main() {
 			}
 			providerService.Routes = provider.MySQLGatewayConfigStore{DB: db, Cipher: cipher, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP}
 		}
+		// The stored route is always resolved, so a configuration saved in the
+		// Settings page takes effect without a restart. When the environment also
+		// carries a key, a missing route is not an error: the adapter falls back
+		// to that key, which keeps deployments working that never opened the page.
 		if cfg.Provider.VideoAdapter == "adapter_gateway" || cfg.Provider.VideoAdapter == "ark_video" {
 			cipher, cipherErr := provider.NewAESGCMCredentialCipher(cfg.Provider.MasterKey, cfg.Provider.MasterKeyVersion)
 			if cipherErr != nil {
@@ -561,13 +779,41 @@ func main() {
 			if cfg.Provider.VideoAdapter == "adapter_gateway" {
 				connectionType = "adapter_gateway"
 			}
-			providerService.VideoRoutes = provider.MySQLGatewayConfigStore{
+			videoConfigStore := provider.MySQLGatewayConfigStore{
 				DB: db, Cipher: cipher, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP,
 				VideoConnectionType: connectionType,
 			}
+			if cfg.Provider.VideoAdapter == "adapter_gateway" {
+				resolved, resolveErr := videoConfigStore.ResolveVideoRoute(context.Background(), "", "cookies.video.standard")
+				if resolveErr != nil {
+					log.Fatalf("resolve Adapter-only cookies.video.standard route: %v", resolveErr)
+				}
+				if resolved.ConnectionType != "adapter_gateway" {
+					log.Fatalf("cookies.video.standard resolved forbidden video connection type %q", resolved.ConnectionType)
+				}
+				providerService.VideoRoutes = videoConfigStore
+				dependencies.ProviderVideoConfiguration = provider.GatewayManagedVideoConfigurationStore{Routes: videoConfigStore}
+				dependencies.ProviderVideoEnvironment = httpserver.ProviderVideoEnvironment{Configured: true}
+			} else {
+				providerService.VideoRoutes = videoConfigStore
+				providerService.VideoRouteOptional = cfg.Provider.ArkVideoDirect()
+				dependencies.ProviderVideoConfiguration = videoConfigStore
+				dependencies.ProviderVideoEnvironment = httpserver.ProviderVideoEnvironment{
+					Configured: cfg.Provider.ArkVideoDirect(),
+					Model:      cfg.Provider.ArkVideo.Model,
+					BaseURL:    cfg.Provider.ArkVideo.BaseURL,
+				}
+			}
 		}
 		dependencies.ProviderJobs = providerService
+		productionCenter.Sources = append(productionCenter.Sources, creative.ProviderRunAdapter{Jobs: &providerService})
+		imageRetryAdapter := creativeprovider.ImageSlotProductionRetryAdapter{Creative: creativeService, Attempts: creativeRepository, Provider: &providerService, Projects: projectService}
+		productionRetryAdapters = append(productionRetryAdapters, imageRetryAdapter)
+		productionCenter.RetryAdapters = productionRetryAdapters
+		productionRetry.Adapters = productionRetryAdapters
+		productionRetry.Sources = productionCenter.Sources
 		creativeService.ShortDramaV2Images = creativeShortDramaV2ImageJobs{provider: &providerService}
+		creativeService.CommercePrerollV2Images = creativeCommercePrerollV2ImageJobs{provider: &providerService}
 		creativeService.AINativeStoryboards = creativeRepository
 		creativeService.AINativeStoryboardAssetPreparer = creativeAINativeStoryboardAssetPreparer{provider: &providerService}
 		creativeService.AINativeStoryboardScheduler = creative.JobRuntimeAINativeStoryboardScheduler{Store: runtimeStore}
@@ -589,6 +835,14 @@ func main() {
 			routes := provider.MySQLGatewayConfigStore{DB: db, Cipher: cipher, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP}
 			speechSynthesizer = provider.MiniMaxSpeechAdapter{Routes: routes, Credentials: routes, ModelAlias: provider.DefaultMiniMaxSpeechModelAlias, DefaultVoiceAlias: "cookies.voice.brand.warm_female"}
 			creativeService.BrandFilmSpeech = speechSynthesizer
+		}
+		if cfg.Provider.SoundAssetAdapter == "http" {
+			creativeService.BrandFilmSoundAssets = provider.HTTPSoundAssetGenerator{
+				Endpoint: cfg.Provider.SoundAsset.Endpoint,
+				APIKey:   cfg.Provider.SoundAsset.APIKey,
+				Model:    cfg.Provider.SoundAsset.Model,
+			}
+			log.Printf("Brand Film AI sound generation configured: model=%s", cfg.Provider.SoundAsset.Model)
 		}
 		creativeService.AINativeProductions = creativeRepository
 		creativeService.AINativeProductionScheduler = creative.JobRuntimeAINativeProductionScheduler{Store: runtimeStore}
@@ -686,8 +940,15 @@ func buildVideoAdapter(cfg config.Config, db *sql.DB, handles provider.OutputHan
 		if err != nil {
 			return nil, err
 		}
-		store := provider.MySQLGatewayConfigStore{DB: db, Cipher: cipher}
-		return provider.NewRoutedArkVideoAdapter(store, handles)
+		store := provider.MySQLGatewayConfigStore{DB: db, Cipher: cipher, AllowInsecureHTTP: cfg.Provider.AllowInsecureHTTP}
+		// Both credential sources stay live for the process lifetime: a job that
+		// carries a route saved in the Settings page uses it, and one that does
+		// not falls back to the environment key this process started with.
+		return provider.NewArkVideoAdapterWithRoutes(provider.ArkVideoConfig{
+			APIKey:  cfg.Provider.ArkVideo.APIKey,
+			Model:   cfg.Provider.ArkVideo.Model,
+			BaseURL: cfg.Provider.ArkVideo.BaseURL,
+		}, store, handles)
 	default:
 		return nil, fmt.Errorf("unsupported Provider video adapter %q", cfg.Provider.VideoAdapter)
 	}
@@ -743,6 +1004,9 @@ func buildTextAdapter(cfg config.Config, db *sql.DB) (provider.TextProviderAdapt
 }
 
 func buildVisionAdapter(cfg config.Config, db *sql.DB) (provider.VisionProviderAdapter, error) {
+	if !cfg.MediaUnderstanding.RealProviderEnabled {
+		return provider.FakeSyncAdapter{}, nil
+	}
 	switch cfg.Provider.TextAdapter {
 	case "fake":
 		return provider.FakeSyncAdapter{}, nil
@@ -790,9 +1054,117 @@ func strategyOrganizationAllowlist(values []string) map[contract.OrganizationID]
 
 type assetVisionSourceResolver struct{ uploads *assets.UploadService }
 
+type miyunProjectSourceAdapter struct{ projects *project.Service }
+type miyunAssetSourceAdapter struct{ uploads *assets.UploadService }
+type miyunKnowledgeSourceAdapter struct{ knowledge *knowledge.Service }
+type miyunHandoffContentAdapter struct {
+	uploads   *assets.UploadService
+	knowledge *knowledge.Service
+}
+type miyunMediaEvidenceAdapter struct{ media *mediaunderstanding.Service }
+
+func (a miyunProjectSourceAdapter) ReadMiyunProjectSource(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID) (insights.MiyunProjectSource, error) {
+	projectContext, err := a.projects.GetContext(ctx, actor, projectID)
+	if err != nil {
+		return insights.MiyunProjectSource{}, err
+	}
+	businessContext, err := a.projects.GetBusinessContext(ctx, actor, projectID)
+	if err != nil {
+		return insights.MiyunProjectSource{}, err
+	}
+	workbench, err := a.projects.GetWorkbench(ctx, actor, projectID)
+	if err != nil {
+		return insights.MiyunProjectSource{}, err
+	}
+	if businessContext.ProjectID != projectID || workbench.Project.ProjectID != string(projectID) ||
+		workbench.Project.OrganizationID != string(actor.OrganizationID) {
+		return insights.MiyunProjectSource{}, fmt.Errorf("%w: Miyun Project projections are inconsistent", insights.ErrInvalidState)
+	}
+	products := make([]insights.MiyunProjectProduct, 0, len(businessContext.Products))
+	for _, product := range businessContext.Products {
+		products = append(products, insights.MiyunProjectProduct{ID: product.ID, Name: product.Name})
+	}
+	return insights.MiyunProjectSource{
+		Context: projectContext, ProjectName: businessContext.ProjectName,
+		BrandName: businessContext.BrandName, CategoryName: workbench.Brand.Category,
+		Products: products,
+	}, nil
+}
+
+func (a miyunAssetSourceAdapter) ReadMiyunAssetSource(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, ref contract.AssetVersionRef) (insights.MiyunAssetSource, error) {
+	value, err := a.uploads.Get(ctx, actor, projectID, ref)
+	if err != nil {
+		return insights.MiyunAssetSource{}, err
+	}
+	return insights.MiyunAssetSource{
+		Ref: value.Version.Ref(), Kind: value.Asset.Kind, MIMEType: value.Version.MIMEType,
+		SHA256: value.Version.SHA256,
+		Ready:  value.Asset.Status == assets.AssetReady && value.Version.Status == assets.AssetReady,
+	}, nil
+}
+
+func (a miyunKnowledgeSourceAdapter) ReadMiyunKnowledgeSource(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, documentID string) (insights.MiyunKnowledgeSource, error) {
+	value, err := a.knowledge.GetDocument(ctx, actor, projectID, documentID)
+	if err != nil {
+		return insights.MiyunKnowledgeSource{}, err
+	}
+	return insights.MiyunKnowledgeSource{
+		ID: value.ID, Filename: value.Filename, MIMEType: value.MIMEType,
+		Status: value.Status, Text: value.ExtractedText, TextSHA256: value.TextSHA256, ContentSHA256: value.ContentSHA256,
+	}, nil
+}
+
+func (a miyunHandoffContentAdapter) OpenMiyunHandoffAsset(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, ref contract.AssetVersionRef) (io.ReadCloser, error) {
+	if a.uploads == nil {
+		return nil, fmt.Errorf("Miyun asset content reader is unavailable")
+	}
+	stream, _, err := a.uploads.OpenPreview(ctx, actor, projectID, ref)
+	return stream, err
+}
+func (a miyunHandoffContentAdapter) OpenMiyunHandoffDocument(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, id string) (io.ReadCloser, error) {
+	if a.knowledge == nil {
+		return nil, fmt.Errorf("Miyun knowledge content reader is unavailable")
+	}
+	stream, _, err := a.knowledge.OpenDocumentOriginalStream(ctx, actor, projectID, id)
+	return stream, err
+}
+
+func (a miyunMediaEvidenceAdapter) ReadLatestMiyunMediaEvidence(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, ref contract.AssetVersionRef) (insights.MiyunMediaEvidence, bool, error) {
+	value, err := a.media.GetLatestForAsset(ctx, actor, projectID, ref)
+	if errors.Is(err, mediaunderstanding.ErrNotFound) {
+		return insights.MiyunMediaEvidence{}, false, nil
+	}
+	if err != nil {
+		return insights.MiyunMediaEvidence{}, false, err
+	}
+	evidence := make([]string, 0, 1+len(value.VisibleText)+len(value.Observations)+len(value.Inferences)+len(value.Risks)+len(value.Unknowns)+len(value.Transcript))
+	if value.Summary != "" {
+		evidence = append(evidence, value.Summary)
+	}
+	for _, group := range [][]mediaunderstanding.Evidence{value.VisibleText, value.Observations, value.Inferences, value.Risks, value.Unknowns, value.Transcript} {
+		for _, item := range group {
+			evidence = append(evidence, item.Text)
+		}
+	}
+	asrProviderCode, asrModelVersion := "", ""
+	if value.TranscriptionLineage != nil {
+		asrProviderCode, asrModelVersion = value.TranscriptionLineage.ProviderCode, value.TranscriptionLineage.ModelVersion
+	}
+	return insights.MiyunMediaEvidence{
+		ArtifactID: value.ID, Status: string(value.Status), ContentHash: value.ContentHash, Evidence: evidence,
+		MediaFormatCode:        value.Classifications.MediaFormat.Code,
+		ContentStyleCode:       value.Classifications.ContentStyle.Code,
+		ContentStyleConfidence: value.Classifications.ContentStyle.Confidence,
+		VisionProviderCode:     value.Lineage.ProviderCode,
+		VisionModelVersion:     value.Lineage.ModelVersion,
+		ASRProviderCode:        asrProviderCode,
+		ASRModelVersion:        asrModelVersion,
+	}, true, nil
+}
+
 type creativeAssetReader struct{ uploads *assets.UploadService }
 
-type creativeProductResolver struct{ resolver productsource.DouyinResolver }
+type creativeProductResolver struct{ resolver productsource.Resolver }
 
 func (r creativeProductResolver) Resolve(ctx context.Context, input string) (creative.AINativeProductSnapshot, error) {
 	value, err := r.resolver.Resolve(ctx, input)
@@ -818,7 +1190,8 @@ func (r creativeProductResolver) Resolve(ctx context.Context, input string) (cre
 			MinRaw: value.Price.MinRaw, MaxRaw: value.Price.MaxRaw, Currency: value.Price.Currency,
 			DisplayUnconfirmed: value.Price.DisplayUnconfirmed,
 		},
-		Sales: value.Sales, SourceURL: value.SourceURL,
+		Sales: value.Sales, SourceURL: value.SourceURL, ResolutionStatus: value.ResolutionStatus,
+		ResourceType: value.ResourceType, MissingFields: append([]string{}, value.MissingFields...),
 	}, nil
 }
 
@@ -837,6 +1210,30 @@ func (s creativeMediaSource) OpenVideo(ctx context.Context, organizationID contr
 	}
 	if value.Asset.Status != assets.AssetReady || value.Version.Status != assets.AssetReady || value.Asset.Kind != contract.AssetVideo || value.Version.MIMEType != "video/mp4" {
 		return assets.AssetVersion{}, nil, fmt.Errorf("creative media source is not a ready MP4")
+	}
+	reader, info, err := s.blobs.Open(ctx, value.Version.Blob)
+	if err != nil {
+		return assets.AssetVersion{}, nil, err
+	}
+	if info.SizeBytes != value.Version.SizeBytes {
+		reader.Close()
+		return assets.AssetVersion{}, nil, assets.ErrOutputMetadataMismatch
+	}
+	return value.Version, reader, nil
+}
+
+func (s creativeMediaSource) OpenVisual(ctx context.Context, organizationID contract.OrganizationID, projectID contract.ProjectID, ref contract.AssetVersionRef) (assets.AssetVersion, io.ReadCloser, error) {
+	if s.repository == nil || s.blobs == nil {
+		return assets.AssetVersion{}, nil, fmt.Errorf("creative visual source is unavailable")
+	}
+	value, err := s.repository.GetProjectAsset(ctx, organizationID, projectID, ref)
+	if err != nil {
+		return assets.AssetVersion{}, nil, err
+	}
+	readyVideo := value.Asset.Kind == contract.AssetVideo && value.Version.MIMEType == "video/mp4"
+	readyImage := value.Asset.Kind == contract.AssetImage && (value.Version.MIMEType == "image/jpeg" || value.Version.MIMEType == "image/png" || value.Version.MIMEType == "image/webp")
+	if value.Asset.Status != assets.AssetReady || value.Version.Status != assets.AssetReady || !readyVideo && !readyImage {
+		return assets.AssetVersion{}, nil, fmt.Errorf("creative visual source is not a ready supported video or image")
 	}
 	reader, info, err := s.blobs.Open(ctx, value.Version.Blob)
 	if err != nil {
@@ -945,6 +1342,119 @@ func (r creativeAssetReader) ReadForCreative(ctx context.Context, actor contract
 		DurationMS: value.Version.DurationMS, FrameRate: value.Version.FrameRate,
 		VideoCodec: value.Version.VideoCodec, AudioCodec: value.Version.AudioCodec,
 	}, nil
+}
+
+// insightMediaReader 把素材库上传时探测到的元数据递给洞察的客观可测层。
+//
+// 只读，而且只读已经落库的探测结果——洞察不再跑一遍 ffprobe。两处各自量出的时长
+// 对不上的时候，没人说得清该信谁，而这一层的全部价值就在于「同一个文件量两遍
+// 结果一样」。
+type insightMediaReader struct{ uploads *assets.UploadService }
+
+func (r insightMediaReader) ReadMediaFacts(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID,
+	platformAssetID string, platformAssetVersion int64) (insights.MediaFacts, error) {
+	if r.uploads == nil {
+		return insights.MediaFacts{}, fmt.Errorf("asset upload service is required")
+	}
+	value, err := r.uploads.Get(ctx, actor, projectID, contract.AssetVersionRef{
+		AssetID: contract.AssetID(platformAssetID), Version: platformAssetVersion,
+	})
+	if err != nil {
+		return insights.MediaFacts{}, err
+	}
+	// 探测没成功就如实说没有。这几个字段在失败时是零值，当成「时长 0 秒」写进
+	// 客观可测层，就是把一个探测故障伪装成一条测量结论。
+	if value.Version.Media.ProbeStatus != assets.MediaProbeSucceeded {
+		reason := "素材库还没探测过这个文件"
+		switch value.Version.Media.ProbeStatus {
+		case assets.MediaProbeFailed:
+			reason = "素材库探测这个文件失败了"
+		case assets.MediaProbeNotRequired:
+			reason = "这个文件不是音视频，没有可探测的时长"
+		}
+		return insights.MediaFacts{Unavailable: reason}, nil
+	}
+	return insights.MediaFacts{
+		Measured:        true,
+		DurationSeconds: value.Version.Media.DurationSeconds,
+		WidthPixels:     value.Version.WidthPixels,
+		HeightPixels:    value.Version.HeightPixels,
+	}, nil
+}
+
+// insightMediaUnderstander 把平台的「媒体理解」接到洞察的视频语义提取上。
+//
+// 一次 Request 同时管排队和读结果：媒体理解按 (文件 SHA256, profile, prompt 版本,
+// 模型别名) 算输入指纹去重，同一条视频重复请求拿回的是同一份产出，不会重复排队，
+// 也不会重复花钱。所以洞察那边只有一个方法，不用自己判断该 Request 还是该 Get。
+type insightMediaUnderstander struct{ service *mediaunderstanding.Service }
+
+func (u insightMediaUnderstander) UnderstandMedia(ctx context.Context, actor contract.ActorContext,
+	projectID contract.ProjectID, platformAssetID string, platformAssetVersion int64) (insights.MediaUnderstanding, error) {
+	if u.service == nil {
+		return insights.MediaUnderstanding{Unavailable: "这个环境没接多模态"}, nil
+	}
+	artifact, _, err := u.service.Request(ctx, actor, projectID, mediaunderstanding.CreateRequest{
+		AssetID: platformAssetID, Version: platformAssetVersion,
+	})
+	if errors.Is(err, mediaunderstanding.ErrUnsupportedProfile) {
+		return insights.MediaUnderstanding{
+			Unavailable: "这条视频不在多模态能看的范围内（只看 15–90 秒的 mp4）",
+		}, nil
+	}
+	if err != nil {
+		return insights.MediaUnderstanding{}, err
+	}
+
+	switch artifact.Status {
+	case mediaunderstanding.StatusRunning:
+		return insights.MediaUnderstanding{Pending: true, ArtifactID: artifact.ID}, nil
+	case mediaunderstanding.StatusFailed:
+		return insights.MediaUnderstanding{
+			ArtifactID: artifact.ID, Unavailable: understandingFailureReason(artifact),
+		}, nil
+	}
+	// 视觉链路没配好时，媒体理解仍然会落一条 partial，里面只有一句技术校验
+	// （applyTechnicalFallback）。那句话喂给特征模型只会让它照着编，所以这里当成
+	// 「没看成」，让洞察回落到人填正文——它自己在 Warnings 里说了这件事。
+	for _, warning := range artifact.Warnings {
+		switch warning {
+		case "vision_provider_unavailable", "vision_route_unavailable", "fake_vision_no_semantic_claims":
+			return insights.MediaUnderstanding{
+				ArtifactID: artifact.ID, Unavailable: "这个环境的视觉模型没接通，模型没真看画面",
+			}, nil
+		}
+	}
+	return insights.MediaUnderstanding{
+		Ready: true, ArtifactID: artifact.ID, Summary: artifact.Summary,
+		Observations: evidenceTexts(artifact.Observations), Inferences: evidenceTexts(artifact.Inferences),
+		VisibleText: evidenceTexts(artifact.VisibleText), Transcript: evidenceTexts(artifact.Transcript),
+		KeyframeCount: len(artifact.Keyframes), ProviderCode: artifact.Lineage.ProviderCode,
+		ModelAlias: artifact.Lineage.ModelAlias, ModelVersion: artifact.Lineage.ModelVersion,
+		ContentHash: artifact.ContentHash,
+	}, nil
+}
+
+func understandingFailureReason(artifact mediaunderstanding.Artifact) string {
+	if message := strings.TrimSpace(artifact.ErrorMessage); message != "" {
+		return message
+	}
+	return "多模态没能看完这条视频"
+}
+
+// evidenceTexts 只取正文，丢掉帧号和置信度。
+//
+// 丢掉是有意的：这段字是要发给特征模型的，带上「frame_index: 2, confidence: 0.7」
+// 只会让它把这些数字也当成待提取的内容。帧号和置信度仍然完整留在媒体理解的产出上，
+// 想看证据链去那边看——那边有帧图，这边只有文字。
+func evidenceTexts(items []mediaunderstanding.Evidence) []string {
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		if value := strings.TrimSpace(item.Text); value != "" {
+			texts = append(texts, value)
+		}
+	}
+	return texts
 }
 
 func (r assetVisionSourceResolver) ResolveVisionSources(ctx context.Context, actor contract.ActorContext, projectContext contract.ProjectContext, refs []contract.ProjectAssetRef) ([]provider.VisionSource, error) {

@@ -39,7 +39,8 @@ const viewTargets: Record<string, ViewTarget> = {
 }
 
 const statusLabels: Record<ApiAnalysisStatus, string> = {
-  awaiting_data: '待数据',
+  // 等的是类型识别，不是投放数据。理由见 AssetDetail 同名表上的注释。
+  awaiting_data: '待认类型',
   awaiting_match: '待匹配',
   analysable: '可分析',
   analysing: '分析中',
@@ -62,7 +63,12 @@ const sourceKindLabels: Record<string, string> = {
   creative: '创意模块产物',
   upload: '上传文件',
   external: '外部引用',
+  miyun: '米云',
 }
+
+// 手工登记只给这三种。米云的素材是米云那条线自己写进来的，
+// 人在这儿选「米云」等于给一个别处来的东西盖米云的章——那个章后面没有采集记录。
+const registerableSourceKinds: ApiAssetSourceKind[] = ['creative', 'upload', 'external']
 
 const confidenceLabels: Record<ApiConfidence, string> = { low: '低', medium: '中', high: '高' }
 
@@ -415,14 +421,20 @@ function formatTime(value: string): string {
 /**
  * 登记一个素材。
  *
- * 创意模块产出的素材会自己流进来，但外部投放的（别处剪的片子、代理商给的图文）
- * 没有那条通路。少了这个入口，平台回流的广告对象就没有任何素材可以认领过去，
- * 花费只能挂在总盘上，后面的内容分析、对比、报告全都无从谈起。
+ * 创意模块产出的素材会自己流进来，但在别处做完直接投出去的（别处剪的片子、代理商
+ * 给的图文）没有那条通路。少了这个入口，平台回流的广告对象就没有任何素材可以认领
+ * 过去，花费只能挂在总盘上，后面的内容分析、对比、报告全都无从谈起。
+ *
+ * 注意跟「外部证据」区分：这里登记的是**真的投出去过**的素材，它进共享素材库、
+ * 参与归因；外部证据是竞品或参照物，只读、有到期日、永远不进素材库。
  *
  * 内容类型可以先不填：填了才知道要提哪套特征，但认不准就先留着「待识别」，
  * 比随便挑一个然后按错的特征表去提取要好。
  */
-function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
+// 导出给「素材 · 总览」用。登记素材是这个模块唯一一处「凭空多出一条素材」的入口，
+// 三个旧页面合并之后它不能跟着旧页面一起消失——没有它，一个新 Project 里
+// 后面每一页都是空的，而人找不到从哪儿开始。
+export function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
   assets: ApiInsightAsset[]
   projectId: string
   busy: boolean
@@ -434,22 +446,46 @@ function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
   const [sourceRef, setSourceRef] = useState('')
   const [assetType, setAssetType] = useState<ApiInsightAssetType | ''>('')
   const [lineageId, setLineageId] = useState('')
+  // 素材库里的那份文件。**以前登记表单不给这一格**，于是手工登记的素材永远没有文件
+  // 引用，「量一下」在它们身上永远是灰的，提示还写着「从创意导入的才带这个引用」
+  // ——那是一条死路：这条素材已经登记完了，创意导入救不了它。后端本来就收这两个字段
+  // （IndexAssetRequest），缺的只是这个口。
+  const [platformAssetId, setPlatformAssetId] = useState('')
+  const [platformAssetVersion, setPlatformAssetVersion] = useState('')
   const [error, setError] = useState('')
   const [working, setWorking] = useState(false)
 
   // 同一条创意的多个版本共用一个 lineage_id，列表里只需要露出每条血缘的最新一版。
+  //
+  // 整条都作废了的血缘不出现：给一条已经作废的创意再加一版没有意义，而它留在下拉里
+  // 只会让人误选，选中之后新素材就挂到了一条不该再动的血缘上。版本号仍然按全部修订
+  // 数——包括作废的——来显示，否则会写出「现在第 2 版」而后端实际给出第 4 版。
   const lineages = useMemo(() => {
     const latest = new Map<string, ApiInsightAsset>()
+    const alive = new Set<string>()
     for (const asset of assets) {
       const seen = latest.get(asset.lineage_id)
       if (!seen || asset.revision > seen.revision) latest.set(asset.lineage_id, asset)
+      if (asset.analysis_status !== 'retired') alive.add(asset.lineage_id)
     }
-    return [...latest.values()]
+    return [...latest.values()].filter(asset => alive.has(asset.lineage_id))
   }, [assets])
 
   const submit = async () => {
     if (!title.trim()) {
       setError('先给它一个标题，后面所有地方都靠这个名字认人。')
+      return
+    }
+    // 后端要求这两个要么都给要么都不给。在这儿先说清楚，比让它回一句
+    // ErrInvalidRequest（界面上会变成「登记失败」）强。
+    const refId = platformAssetId.trim()
+    const refVersion = platformAssetVersion.trim()
+    if (Boolean(refId) !== Boolean(refVersion)) {
+      setError('素材库文件号和版本号要一起填，或者一起留空。只填一个的话，洞察这边指不到具体哪一版。')
+      return
+    }
+    if (refVersion && !/^\d+$/.test(refVersion)) {
+      setError('版本号只能是数字，例如 3。')
       return
     }
     setError('')
@@ -460,6 +496,8 @@ function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
         source_kind: sourceKind,
         source_ref: sourceRef.trim() || undefined,
         lineage_id: lineageId || undefined,
+        platform_asset_id: refId || undefined,
+        platform_asset_version: refVersion ? Number(refVersion) : undefined,
         // 类型是人在这儿挑的，就照实记成人工判定——记成 AI 推断的话，
         // 复核队列会以为这项已经有机器意见了，而实际上没有。
         asset_type: assetType || undefined,
@@ -475,7 +513,7 @@ function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
 
   return <>
     <span className="section-label">登记一个素材</span>
-    <p>创意模块产出的素材会自己进来。这里登记的是外部素材——别处剪的片子、代理商给的图文，不登记就没法把平台上的广告认到它头上。</p>
+    <p>创意模块批准过的素材走「从创意导入」，一次勾完，不用在这儿一条条打。这里登记的是在别处做完直接投出去的那些——别处剪的片子、代理商给的图文，不登记就没法把平台上的广告认到它头上。（找竞品参照物请走「外部证据」，那边的东西不参与归因。）</p>
     {/* 沿用经验库修订表单的字段写法（.experience-revise）：标签在上、输入框整行。
         右边这一栏窄，标签和输入框并排会把输入框挤到只剩十几个字符宽。 */}
     <div className="experience-revise">
@@ -485,7 +523,7 @@ function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
       <div className="revise-grid">
         <label><small>来源</small>
           <select value={sourceKind} onChange={event => setSourceKind(event.target.value as ApiAssetSourceKind)}>
-            {(Object.keys(sourceKindLabels) as ApiAssetSourceKind[]).map(kind => <option key={kind} value={kind}>{sourceKindLabels[kind]}</option>)}
+            {registerableSourceKinds.map(kind => <option key={kind} value={kind}>{sourceKindLabels[kind]}</option>)}
           </select>
         </label>
         <label><small>内容类型（认不准就留空）</small>
@@ -498,6 +536,22 @@ function AssetIndexForm({ assets, projectId, busy, onCancel, onDone }: {
       <label className="experience-reason"><small>来源说明（可留空）</small>
         <input value={sourceRef} onChange={event => setSourceRef(event.target.value)} placeholder="例如：外部剪辑 20260720 交付批次"/>
       </label>
+      {/* 这一格决定了「量一下」以后按不按得动：能量的时长、画幅是从素材库那个文件上
+          读的，没有这个号码就没有文件可读。留空不拦，但要让人知道留空的代价。 */}
+      <div className="revise-grid">
+        <label><small>素材库文件号（可留空）</small>
+          <input value={platformAssetId} onChange={event => setPlatformAssetId(event.target.value)}
+            placeholder="素材库里那条的编号"/>
+        </label>
+        <label><small>第几版</small>
+          <input value={platformAssetVersion} inputMode="numeric"
+            onChange={event => setPlatformAssetVersion(event.target.value)} placeholder="例如 1"/>
+        </label>
+      </div>
+      <p className="form-hint">
+        文件已经在共享素材库里的话，把它的编号和版本填上：填了，这条素材才能「量一下」
+        （从文件本身读出时长和画幅，不用调模型，直接能进归因）。留空也能登记，只是那个按钮会一直是灰的。
+      </p>
       <label className="experience-reason"><small>属于哪条创意</small>
         <select value={lineageId} onChange={event => setLineageId(event.target.value)}>
           <option value="">新的一条创意</option>
@@ -567,13 +621,23 @@ export function MappingResolveForm({ mapping, assets, projectId, onDone }: {
     }
   }
 
+  // 已失效的素材不进下拉。「找相似」早就不拿它当种子了（拿一条已经不作数的素材
+  // 去找相似，找回来的一组从一开始就不该用），认领比那个更重，把真金白银的花费
+  // 算到一条已经作废的素材上，往后每一份报告都会带着这笔账。
+  //
+  // 唯一的例外是它已经就是当前归属：藏掉的话，下拉会显示成「未选择」，人以为
+  // 这条对象没认领过，随手改到别处，而原来那笔归属是有人做过决定的。
+  const selectable = assets.filter(asset =>
+    asset.analysis_status !== 'retired' || asset.id === mapping.asset_id)
+
   return <div className="feature-stack">
     <span>{claimed ? '改这个平台对象的归属' : '认领这个平台对象'}</span>
     <label className="field">归到哪个素材版本
       <select value={assetId} onChange={event => setAssetId(event.target.value)}>
         <option value="">未选择</option>
-        {assets.map(asset => <option key={asset.id} value={asset.id}>
+        {selectable.map(asset => <option key={asset.id} value={asset.id}>
           {asset.title} · 第 {asset.revision} 版
+          {asset.analysis_status === 'retired' ? '（已失效，只能改走不能改回来）' : ''}
         </option>)}
       </select>
     </label>

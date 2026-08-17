@@ -1,0 +1,64 @@
+import { useCallback, useEffect, useState } from 'react'
+import { api } from '../../../data/api'
+import type { AnalysisView } from './AnalysisPage'
+
+export interface PinTarget {
+  dimension: AnalysisView
+  source_ref?: string
+  variable?: string
+}
+
+/**
+ * 前端本地的「已记」标记键。
+ *
+ * 比后端的去重键（维度 + 变量）多带一个 source_ref：后端去重问的是「这条结论说的
+ * 哪个变量」，同一个变量在复盘里只需要一条；页面上问的是「我按过哪一行」，同一个
+ * 变量出现在两个素材上就是两行，只点亮一行才对得上人刚才按的那一下。
+ *
+ * 分隔符用转义写法，不直接在源码里敲一个空字符：真躺着一个 NUL 字节的话，
+ * git 会把整个文件当二进制，从此这个文件的改动在 diff 里全是「Bin 变了」。
+ */
+export function pinKey(target: PinTarget): string {
+  return `${target.dimension}\u0000${target.variable ?? ''}\u0000${target.source_ref ?? ''}`
+}
+
+/**
+ * 记一笔的状态。乐观标记「已记」，失败了再撤回——这个按钮一天要按几十次，
+ * 每次都等一个来回会让人以为页面卡住。
+ */
+export function usePinFinding(projectId: string, window: { start: string; end: string }) {
+  const [pinned, setPinned] = useState<ReadonlySet<string>>(new Set())
+  const [pinning, setPinning] = useState(false)
+  const [notice, setNotice] = useState('')
+
+  // 换项目或换窗口就把点亮全清掉。草稿是按 (项目 + 窗口) 一份的，换了窗口
+  // 就是另一份草稿，上一份里记过的那几条在这一份里并不存在——继续显示「已记一笔」
+  // 会让人以为这一轮也记上了，等复盘的时候才发现是空的。
+  useEffect(() => {
+    setPinned(new Set())
+    setNotice('')
+  }, [projectId, window.start, window.end])
+
+  const pin = useCallback((target: PinTarget) => {
+    if (!projectId) return
+    const key = pinKey(target)
+    setPinned(previous => new Set(previous).add(key))
+    setPinning(true)
+    setNotice('')
+    api.pinFinding(projectId, { window, ...target })
+      .then(() => { setNotice('已记进本轮复盘草稿。要不要留成经验，复盘的时候再决定。') })
+      .catch((cause: unknown) => {
+        // 撤回标记，让人看得出这一下没成。静默失败会让他以为记上了，
+        // 复盘的时候才发现那条不在。
+        setPinned(previous => {
+          const next = new Set(previous)
+          next.delete(key)
+          return next
+        })
+        setNotice(cause instanceof Error ? cause.message : '记一笔失败，请重试。')
+      })
+      .finally(() => setPinning(false))
+  }, [projectId, window])
+
+  return { pin, pinned, pinning, notice }
+}

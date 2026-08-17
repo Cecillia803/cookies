@@ -37,13 +37,14 @@ const (
 )
 
 type ManualBrandFilmInput struct {
-	DocumentID     string `json:"document_id,omitempty"`
-	FixtureID      string `json:"fixture_id"`
-	FixtureVersion int64  `json:"fixture_version"`
-	FixtureHash    string `json:"fixture_hash"`
-	BriefName      string `json:"brief_name"`
-	BriefText      string `json:"brief_text"`
-	ProductName    string `json:"product_name"`
+	DocumentID      string                     `json:"document_id,omitempty"`
+	FixtureID       string                     `json:"fixture_id"`
+	FixtureVersion  int64                      `json:"fixture_version"`
+	FixtureHash     string                     `json:"fixture_hash"`
+	BriefName       string                     `json:"brief_name"`
+	BriefText       string                     `json:"brief_text"`
+	ProductName     string                     `json:"product_name"`
+	AssetCandidates []BrandBriefAssetCandidate `json:"asset_candidates,omitempty"`
 }
 
 func (i ManualBrandFilmInput) Validate() error {
@@ -51,6 +52,17 @@ func (i ManualBrandFilmInput) Validate() error {
 		if !validSHA256Ref(i.FixtureHash) || strings.TrimSpace(i.BriefName) == "" ||
 			strings.TrimSpace(i.BriefText) == "" || strings.TrimSpace(i.ProductName) == "" {
 			return fmt.Errorf("manual brand film document input is incomplete")
+		}
+		if len(i.AssetCandidates) > 24 {
+			return fmt.Errorf("manual brand film has too many extracted asset candidates")
+		}
+		for _, candidate := range i.AssetCandidates {
+			if strings.TrimSpace(candidate.ID) == "" || (candidate.Role != "product_front" && candidate.Role != "logo") || strings.TrimSpace(candidate.Label) == "" {
+				return fmt.Errorf("manual brand film extracted asset candidate is invalid")
+			}
+			if candidate.AssetRef != nil && candidate.AssetRef.Validate() != nil {
+				return fmt.Errorf("manual brand film extracted asset reference is invalid")
+			}
 		}
 		return nil
 	}
@@ -103,13 +115,7 @@ type BrandFilmSourceSnapshot struct {
 func newBrandFilmDraft(task CreativeTask, intake CreativeIntake, route CreativeRouteSnapshot, now time.Time) (*BrandFilmDraft, error) {
 	briefName := "已确认品牌策略"
 	briefText := strings.TrimSpace(string(intake.Request.StrategyHandoffInput))
-	productName := strings.TrimSpace(intake.Request.CoreMessage)
-	if productName == "" {
-		productName = strings.TrimSpace(intake.Request.Concept)
-	}
-	if productName == "" {
-		productName = "未命名品牌项目"
-	}
+	productName := brandFilmProductName(intake)
 	snapshot := BrandFilmSourceSnapshot{
 		SourceKind: string(intake.Source), IntakeID: intake.ID, InputIdentityHash: intake.InputIdentityHash,
 		BriefName: briefName, BriefText: briefText, ProductName: productName,
@@ -125,9 +131,12 @@ func newBrandFilmDraft(task CreativeTask, intake CreativeIntake, route CreativeR
 			snapshot.SourceKind = "manual_document"
 			snapshot.IntakeID = intake.ID
 			snapshot.EvidenceRefs = []string{"knowledge://documents/" + manual.DocumentID}
-			snapshot.AssetCandidates = []BrandBriefAssetCandidate{
-				{ID: "asset_product_front", Role: "product_front", Label: "商品正面图", SourceLocator: "knowledge://documents/" + manual.DocumentID + "#product-image", RightsStatus: "needs_confirmation"},
-				{ID: "asset_brand_logo", Role: "logo", Label: "品牌 Logo", SourceLocator: "knowledge://documents/" + manual.DocumentID + "#brand-logo", RightsStatus: "needs_confirmation"},
+			snapshot.AssetCandidates = append([]BrandBriefAssetCandidate{}, manual.AssetCandidates...)
+			if len(snapshot.AssetCandidates) == 0 {
+				snapshot.AssetCandidates = []BrandBriefAssetCandidate{
+					{ID: "asset_product_front", Role: "product_front", Label: "商品正面图", SourceLocator: "knowledge://documents/" + manual.DocumentID + "#product-image", RightsStatus: "needs_confirmation"},
+					{ID: "asset_brand_logo", Role: "logo", Label: "品牌 Logo", SourceLocator: "knowledge://documents/" + manual.DocumentID + "#brand-logo", RightsStatus: "needs_confirmation"},
+				}
 			}
 		}
 		snapshot.FixtureID, snapshot.FixtureVersion, snapshot.FixtureHash = manual.FixtureID, manual.FixtureVersion, manual.FixtureHash
@@ -181,6 +190,16 @@ func newBrandFilmDraft(task CreativeTask, intake CreativeIntake, route CreativeR
 	}, nil
 }
 
+func brandFilmProductName(intake CreativeIntake) string {
+	if value := strings.TrimSpace(intake.Request.CoreMessage); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(intake.Request.Concept); value != "" {
+		return value
+	}
+	return "未命名品牌项目"
+}
+
 type BrandBriefFact struct {
 	Text       string  `json:"text"`
 	Locator    string  `json:"locator"`
@@ -201,16 +220,19 @@ type BrandBriefAssetCandidate struct {
 }
 
 type BrandBriefAnalysisVersion struct {
-	Revision          int64                      `json:"revision"`
-	Summary           string                     `json:"summary"`
-	Audience          string                     `json:"audience"`
-	CoreMessage       string                     `json:"core_message"`
-	SellingPoints     []BrandBriefFact           `json:"selling_points"`
-	Mandatory         []string                   `json:"mandatory_elements"`
-	Prohibited        []string                   `json:"prohibited_claims"`
-	ImageRequirements []string                   `json:"image_requirements"`
-	VideoRequirements []string                   `json:"video_requirements"`
-	VoiceDirection    string                     `json:"voice_direction"`
+	Revision          int64            `json:"revision"`
+	Summary           string           `json:"summary"`
+	Audience          string           `json:"audience"`
+	CoreMessage       string           `json:"core_message"`
+	SellingPoints     []BrandBriefFact `json:"selling_points"`
+	Mandatory         []string         `json:"mandatory_elements"`
+	Prohibited        []string         `json:"prohibited_claims"`
+	ImageRequirements []string         `json:"image_requirements"`
+	VideoRequirements []string         `json:"video_requirements"`
+	// VoiceDirection is retained only to read historical v1 Brand Film drafts.
+	// New brand-film work is guided by SoundDesignIntent instead of narration.
+	VoiceDirection    string                     `json:"voice_direction,omitempty"`
+	SoundDesignIntent SoundDesignIntent          `json:"sound_design_intent,omitempty"`
 	AssetCandidates   []BrandBriefAssetCandidate `json:"asset_candidates"`
 	Uncertainties     []string                   `json:"uncertainties"`
 	Confirmed         bool                       `json:"confirmed"`
@@ -226,13 +248,50 @@ type BrandBriefAnalysisVersion struct {
 func (v BrandBriefAnalysisVersion) Validate() error {
 	if v.Revision < 1 || strings.TrimSpace(v.Summary) == "" || strings.TrimSpace(v.Audience) == "" ||
 		strings.TrimSpace(v.CoreMessage) == "" || len(v.SellingPoints) == 0 ||
-		strings.TrimSpace(v.VoiceDirection) == "" || v.CreatedAt.IsZero() {
+		(v.SoundDesignIntent.Empty() && strings.TrimSpace(v.VoiceDirection) == "") || v.CreatedAt.IsZero() {
 		return fmt.Errorf("brand brief analysis is incomplete")
+	}
+	if !v.SoundDesignIntent.Empty() && v.SoundDesignIntent.Validate() != nil {
+		return fmt.Errorf("brand brief sound design intent is invalid")
 	}
 	for _, fact := range v.SellingPoints {
 		if strings.TrimSpace(fact.Text) == "" || strings.TrimSpace(fact.Locator) == "" ||
 			fact.Confidence < 0 || fact.Confidence > 1 || (fact.Status != "brief_fact" && fact.Status != "needs_confirmation") {
 			return fmt.Errorf("brand brief fact is invalid")
+		}
+	}
+	return nil
+}
+
+// SoundDesignIntent is the small, human-editable handoff from the storyboard
+// to the sound-design stage. It deliberately contains no provider prompts,
+// voice profile, or audio asset references.
+type SoundDesignIntent struct {
+	MusicDirection    string   `json:"music_direction"`
+	SoundEffectFocus  []string `json:"sound_effect_focus"`
+	SourceAudioPolicy string   `json:"source_audio_policy"` // mute | optional | include
+	Avoid             []string `json:"avoid,omitempty"`
+}
+
+func (v SoundDesignIntent) Empty() bool {
+	return strings.TrimSpace(v.MusicDirection) == "" && len(v.SoundEffectFocus) == 0 && strings.TrimSpace(v.SourceAudioPolicy) == "" && len(v.Avoid) == 0
+}
+
+func (v SoundDesignIntent) Validate() error {
+	if strings.TrimSpace(v.MusicDirection) == "" || len(v.SoundEffectFocus) == 0 {
+		return fmt.Errorf("music direction and sound effect focus are required")
+	}
+	if v.SourceAudioPolicy == "" {
+		return fmt.Errorf("source audio policy is required")
+	}
+	switch v.SourceAudioPolicy {
+	case "mute", "optional", "include":
+	default:
+		return fmt.Errorf("source audio policy is invalid")
+	}
+	for _, item := range append(append([]string{}, v.SoundEffectFocus...), v.Avoid...) {
+		if strings.TrimSpace(item) == "" {
+			return fmt.Errorf("sound design intent contains an empty entry")
 		}
 	}
 	return nil
@@ -279,45 +338,50 @@ func (s BrandCreativeConceptSet) Validate() error {
 }
 
 type BrandFilmShot struct {
-	ID              string `json:"id"`
-	Order           int    `json:"order"`
-	StartSecond     int    `json:"start_second"`
-	EndSecond       int    `json:"end_second"`
-	Purpose         string `json:"purpose"`
-	Visual          string `json:"visual"`
-	Action          string `json:"action"`
-	Camera          string `json:"camera"`
-	Lighting        string `json:"lighting"`
-	Voiceover       string `json:"voiceover"`
+	ID          string `json:"id"`
+	Order       int    `json:"order"`
+	StartSecond int    `json:"start_second"`
+	EndSecond   int    `json:"end_second"`
+	Purpose     string `json:"purpose"`
+	Visual      string `json:"visual"`
+	Action      string `json:"action"`
+	Camera      string `json:"camera"`
+	Lighting    string `json:"lighting"`
+	// Voiceover is a historical v1 field. New Brand Film plans leave it empty.
+	Voiceover       string `json:"voiceover,omitempty"`
 	OnScreenText    string `json:"on_screen_text"`
 	ReferenceRole   string `json:"reference_role"`
 	ContinuityNotes string `json:"continuity_notes"`
 }
 
 type BrandFilmPlanVersion struct {
-	Revision         int64           `json:"revision"`
-	MasterDurationMS int             `json:"master_duration_ms,omitempty"`
-	ConceptID        string          `json:"concept_id"`
-	Title            string          `json:"title"`
-	StorySummary     string          `json:"story_summary"`
-	VoiceDirection   string          `json:"voice_direction"`
-	MusicDirection   string          `json:"music_direction"`
-	Shots            []BrandFilmShot `json:"shots"`
-	Confirmed        bool            `json:"confirmed"`
-	ConfirmedBy      string          `json:"confirmed_by,omitempty"`
-	ConfirmedAt      *time.Time      `json:"confirmed_at,omitempty"`
-	ModelAlias       string          `json:"model_alias"`
-	ModelVersion     string          `json:"model_version"`
-	RouteRevisionID  string          `json:"route_revision_id,omitempty"`
-	PromptVersion    string          `json:"prompt_version"`
-	CreatedAt        time.Time       `json:"created_at"`
+	Revision          int64             `json:"revision"`
+	MasterDurationMS  int               `json:"master_duration_ms,omitempty"`
+	ConceptID         string            `json:"concept_id"`
+	Title             string            `json:"title"`
+	StorySummary      string            `json:"story_summary"`
+	VoiceDirection    string            `json:"voice_direction,omitempty"`
+	MusicDirection    string            `json:"music_direction,omitempty"`
+	SoundDesignIntent SoundDesignIntent `json:"sound_design_intent,omitempty"`
+	Shots             []BrandFilmShot   `json:"shots"`
+	Confirmed         bool              `json:"confirmed"`
+	ConfirmedBy       string            `json:"confirmed_by,omitempty"`
+	ConfirmedAt       *time.Time        `json:"confirmed_at,omitempty"`
+	ModelAlias        string            `json:"model_alias"`
+	ModelVersion      string            `json:"model_version"`
+	RouteRevisionID   string            `json:"route_revision_id,omitempty"`
+	PromptVersion     string            `json:"prompt_version"`
+	CreatedAt         time.Time         `json:"created_at"`
 }
 
 func (v BrandFilmPlanVersion) Validate() error {
 	if v.Revision < 1 || strings.TrimSpace(v.ConceptID) == "" || strings.TrimSpace(v.Title) == "" ||
-		strings.TrimSpace(v.StorySummary) == "" || strings.TrimSpace(v.VoiceDirection) == "" ||
+		strings.TrimSpace(v.StorySummary) == "" || (v.SoundDesignIntent.Empty() && strings.TrimSpace(v.VoiceDirection) == "") ||
 		len(v.Shots) == 0 || v.CreatedAt.IsZero() {
 		return fmt.Errorf("brand film plan is incomplete")
+	}
+	if !v.SoundDesignIntent.Empty() && v.SoundDesignIntent.Validate() != nil {
+		return fmt.Errorf("brand film sound design intent is invalid")
 	}
 	end := 0
 	for index, shot := range v.Shots {

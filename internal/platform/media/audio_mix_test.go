@@ -17,6 +17,9 @@ type audioMixTestSource struct{}
 func (audioMixTestSource) OpenVideo(context.Context, contract.OrganizationID, contract.ProjectID, contract.AssetVersionRef) (assets.AssetVersion, io.ReadCloser, error) {
 	return assets.AssetVersion{}, io.NopCloser(bytes.NewReader([]byte("video"))), nil
 }
+func (audioMixTestSource) OpenVisual(context.Context, contract.OrganizationID, contract.ProjectID, contract.AssetVersionRef) (assets.AssetVersion, io.ReadCloser, error) {
+	return assets.AssetVersion{}, io.NopCloser(bytes.NewReader([]byte("visual"))), nil
+}
 func (audioMixTestSource) OpenAudio(context.Context, contract.OrganizationID, contract.ProjectID, contract.AssetVersionRef) (assets.AssetVersion, io.ReadCloser, error) {
 	return assets.AssetVersion{}, io.NopCloser(bytes.NewReader([]byte("audio"))), nil
 }
@@ -51,6 +54,20 @@ func TestBuildAudioMixFilterAppliesTimelineProcessingDuckingAndMastering(t *test
 	}
 	if strings.Contains(graph, "amix=inputs=1") || !strings.Contains(graph, "anull[musicbus]") {
 		t.Fatalf("single-input bus must bypass amix: %q", graph)
+	}
+}
+
+func TestBuildAudioMixFilterLetsMusicYieldToKeySFX(t *testing.T) {
+	t.Parallel()
+	request := AudioMixRequest{OrganizationID: "org_1", ProjectID: "project_1", Visual: contract.AssetVersionRef{AssetID: "visual", Version: 1}, MasterDurationMS: 15000, SampleRate: 48000, ChannelLayout: "stereo", Clips: []AudioMixClip{
+		{ID: "music", TrackType: "music", Asset: contract.AssetVersionRef{AssetID: "music", Version: 1}, TimelineEndMS: 15000, SourceOutMS: 15000, PlaybackRate: 1},
+		{ID: "key-sfx", TrackType: "sfx", Asset: contract.AssetVersionRef{AssetID: "sfx", Version: 1}, TimelineStartMS: 5000, TimelineEndMS: 5600, SourceOutMS: 600, PlaybackRate: 1},
+	}}
+	graph, _ := BuildAudioMixFilter(request)
+	for _, want := range []string{"asplit=2[sfxsidechain][sfxout]", "[musicbus][sfxsidechain]sidechaincompress", "loudnorm=I=-16"} {
+		if !strings.Contains(graph, want) {
+			t.Fatalf("filter graph %q does not contain %q", graph, want)
+		}
 	}
 }
 

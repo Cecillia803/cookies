@@ -151,23 +151,29 @@ func TestExperienceLifecycleAgainstMySQL(t *testing.T) {
 		t.Fatalf("lineage=%d err=%v", len(lineage), err)
 	}
 
-	// needs_review is the only way to challenge a confirmed conclusion.
-	reviewed, err := repository.TransitionExperience(ctx, insights.TransitionExperienceInput{
+	// 质疑一条在用的结论，走的是标记，不是状态。标完它还在用、还能被引用。
+	flagged, err := repository.FlagExperienceForReview(ctx, insights.FlagExperienceReviewInput{
 		OrganizationID: organizationID, ProjectID: projectID, ID: revision.ID,
-		ExpectedVersion: promoted.Version, From: []insights.ExperienceStatus{insights.ExperienceConfirmed},
-		To: insights.ExperienceNeedsReview, Reason: "新一轮数据与结论冲突", ActorID: userID, Now: now,
+		ExpectedVersion: promoted.Version, NeedsReview: true,
+		Reason: "新一轮数据与结论冲突", ActorID: userID, Now: now,
 		AuditID: "experienceaudit_it_7_" + suffix,
 	})
-	if err != nil || reviewed.Status != insights.ExperienceNeedsReview || reviewed.Reusable() {
-		t.Fatalf("needs review=%#v err=%v", reviewed, err)
+	if err != nil || flagged.Status != insights.ExperienceConfirmed || !flagged.NeedsReview || !flagged.Reusable() {
+		t.Fatalf("flag for review=%#v err=%v", flagged, err)
 	}
-	if _, err := repository.TransitionExperience(ctx, insights.TransitionExperienceInput{
+	// 标记要真的落库，不能只活在返回值里——下一个读它的人得看得见。
+	stored, err := repository.GetExperience(ctx, organizationID, projectID, revision.ID)
+	if err != nil || !stored.NeedsReview || stored.ReviewHint() == "" {
+		t.Fatalf("stored flag=%#v err=%v", stored, err)
+	}
+	// 拿旧版本号再标一次是并发写，必须被版本号挡住。
+	if _, err := repository.FlagExperienceForReview(ctx, insights.FlagExperienceReviewInput{
 		OrganizationID: organizationID, ProjectID: projectID, ID: revision.ID,
-		ExpectedVersion: reviewed.Version, From: []insights.ExperienceStatus{insights.ExperienceConfirmed},
-		To: insights.ExperienceNeedsReview, Reason: "重复请求", ActorID: userID, Now: now,
+		ExpectedVersion: promoted.Version, NeedsReview: true,
+		Reason: "重复请求", ActorID: userID, Now: now,
 		AuditID: "experienceaudit_it_8_" + suffix,
-	}); !errors.Is(err, insights.ErrInvalidState) {
-		t.Fatalf("repeat review error = %v", err)
+	}); !errors.Is(err, insights.ErrVersionConflict) {
+		t.Fatalf("stale flag error = %v", err)
 	}
 }
 
@@ -392,7 +398,11 @@ func seedExperience(ctx context.Context, t *testing.T, repository insights.MySQL
 		ReportID: reportID, SourceExecutionID: "deliveryexecution_it_" + id,
 		SourceEvidenceID: "evidence_it_" + id, SourceMetricSnapshotID: "metricsnapshot_it_" + id,
 		Conclusion: "本地集成测试结论", Conditions: []string{"小红书图文"}, Counterexamples: []string{"未覆盖视频"},
-		Status: insights.ExperiencePending, StatusChangedBy: userID, StatusChangedAt: &now,
+		// card_type 和 confidence 在库里都有 CHECK，空串过不去。这里给足量证据，
+		// 是因为下面要断言「确认之后可默认引用」——两道闸得都开着才验得出来。
+		CardType:  insights.CardStatistic,
+		Judgement: insights.NewJudgement(insights.ConfidenceSufficient, ""),
+		Status:    insights.ExperiencePending, StatusChangedBy: userID, StatusChangedAt: &now,
 		Version: 1, CreatedBy: userID, CreatedAt: now, UpdatedAt: now,
 	}
 	stored, err := repository.CreateExperience(ctx, value, insights.ExperienceAudit{
@@ -421,6 +431,9 @@ func cleanupInsightsIntegration(t *testing.T, db *sql.DB, organizationID contrac
 		"DELETE FROM insight_experience_audits WHERE organization_id=?",
 		"DELETE FROM insight_experiences WHERE organization_id=?",
 		"DELETE FROM insight_reports WHERE organization_id=?",
+		// EnsureLocalProject 会顺手建一行运行时，它外键指向 projects。
+		// 不先删它，下面每一条清理都会连环失败，测试留一地脏数据。
+		"DELETE FROM platform_project_runtimes WHERE organization_id=?",
 		"DELETE FROM project_context_versions WHERE organization_id=?",
 		"DELETE FROM project_products WHERE organization_id=?",
 		"DELETE FROM project_memberships WHERE organization_id=?",
@@ -632,5 +645,95 @@ func TestDataIngestionAgainstMySQL(t *testing.T) {
 	if batches[0].Status != insights.ImportPartial || len(batches[0].Errors) != 1 ||
 		batches[0].WindowStart == nil || batches[0].WindowStart.Format("2006-01-02") != "2026-07-20" {
 		t.Fatalf("批次读回来不完整：%#v", batches[0])
+	}
+}
+
+// TestReportDraftSlotAgainstMySQL 盯的是「复盘提交之后，同一个窗口还能不能再记一笔」。
+//
+// 这件事只有真 DDL 能验：内存仓库不带唯一键，怎么写都过。而唯一键正是那条死路的
+// 成因——已确认的报告如果还占着 (项目 + 执行 + 窗口)，PinFinding 找不到草稿又建不出
+// 草稿，重试三次后只会抛一个刷新也没用的版本冲突（PRD §15.3 要的是开下一份草稿）。
+func TestReportDraftSlotAgainstMySQL(t *testing.T) {
+	dsn := os.Getenv("COOKIES_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("COOKIES_TEST_MYSQL_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	organizationID := contract.OrganizationID("org_insights_slot_" + suffix)
+	projectID := contract.ProjectID("project_insights_slot_" + suffix)
+	userID := "user_insights_slot_" + suffix
+	actor := contract.ActorContext{
+		OrganizationID: organizationID,
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: userID},
+		Scopes:         []contract.Scope{"project.read", "project.write"},
+	}
+	t.Cleanup(func() { cleanupInsightsIntegration(t, db, organizationID, userID) })
+	if err := (identity.MySQLStore{DB: db}).EnsureLocalActor(ctx, actor); err != nil {
+		t.Fatal(err)
+	}
+	if err := (project.MySQLStore{DB: db}).EnsureLocalProject(ctx, actor, projectID); err != nil {
+		t.Fatal(err)
+	}
+
+	repository := insights.MySQLRepository{DB: db}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	// 记一笔建出来的草稿：没有投放执行，只有窗口。
+	draft := func(id string) insights.InsightReport {
+		return insights.InsightReport{
+			ID: id, OrganizationID: organizationID, ProjectID: projectID,
+			Status: insights.ReportDraft, Findings: []string{},
+			Digest:      []insights.ReportFinding{{Kind: "pinned", Text: "开场三秒", Origin: insights.OriginPinned}},
+			WindowStart: "2026-07-01", WindowEnd: "2026-07-31",
+			Version: 1, CreatedBy: userID, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	first, err := repository.CreateReport(ctx, draft("insightreport_slot_1_"+suffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同一个窗口第二份草稿仍然要被挡住：并发的两次记一笔各建一份的话，
+	// 人记的东西会分散在两份草稿里，而屏幕上只看得见一份。
+	if _, err := repository.CreateReport(ctx, draft("insightreport_slot_2_"+suffix)); !errors.Is(err, insights.ErrInvalidState) {
+		t.Fatalf("同窗口第二份草稿应该被唯一键挡住，实际 err=%v", err)
+	}
+
+	// 提交，且不挂投放执行——执行是选填的，这正是最常见的一种提交。
+	submitted, err := repository.SubmitReport(ctx, insights.SubmitReportInput{
+		OrganizationID: organizationID, ProjectID: projectID, ReportID: first.ID,
+		ExpectedVersion: first.Version, ExecutionID: "", Summary: "七月这一轮",
+		Digest: first.Digest, ActorID: userID, At: now,
+	})
+	if err != nil || submitted.Status != insights.ReportConfirmed {
+		t.Fatalf("提交复盘 =%#v err=%v", submitted, err)
+	}
+
+	// 提交之后再记一笔：已确认的不算草稿，所以要能建出下一份草稿来。
+	if _, err := repository.FindDraftByWindow(ctx, organizationID, projectID, "2026-07-01", "2026-07-31"); !errors.Is(err, insights.ErrNotFound) {
+		t.Fatalf("已确认的报告不该被当成草稿，err=%v", err)
+	}
+	next, err := repository.CreateReport(ctx, draft("insightreport_slot_3_"+suffix))
+	if err != nil {
+		t.Fatalf("提交之后同窗口再记一笔应该开出新草稿，实际 err=%v", err)
+	}
+	found, err := repository.FindDraftByWindow(ctx, organizationID, projectID, "2026-07-01", "2026-07-31")
+	if err != nil || found.ID != next.ID {
+		t.Fatalf("再记一笔应该落在新草稿上：found=%s err=%v", found.ID, err)
+	}
+	// 老的那份还在，定格没被动过。
+	frozen, err := repository.GetReport(ctx, organizationID, projectID, first.ID)
+	if err != nil || frozen.Status != insights.ReportConfirmed || frozen.Summary != "七月这一轮" {
+		t.Fatalf("已提交的那份被动过了：%#v err=%v", frozen, err)
 	}
 }

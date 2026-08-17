@@ -3,18 +3,23 @@ import { CircleAlert, Layers3, Lightbulb, RefreshCw, ScrollText, Sparkles, UserC
 import { useProject } from '../context/ProjectContext'
 import {
   api,
+  ApiRequestError,
   type ApiAnalysisRun,
   type ApiConfidence,
   type ApiReviewState,
   type ApiFeatureInput,
   type ApiFeatureMatrix,
+  type ApiFeatureMatrixCell,
   type ApiFeatureSchema,
+  type ApiFeatureSource,
   type ApiFeatureValue,
   type ApiFeatureValueKind,
   type ApiInsightAsset,
   type ApiInsightAssetFeature,
   type ApiInsightAssetType,
 } from '../data/api'
+import { admissibleForAttribution, featureSourceLabel } from '../data/featureSource'
+import { isModelSetupFailure, modelSetupHint, readableError } from '../data/readableError'
 import type { DataState } from '../types'
 import { StateBoundary } from './StateBoundary'
 
@@ -23,7 +28,7 @@ import { StateBoundary } from './StateBoundary'
  *
  * 六类素材各有一套特征体系，不得混用——03 §MVP② 把「不把视频钩子字段套到公众号
  * 文章」列为明文验收。所以这里的每个类型标签只渲染该类型自己的字段，多素材看矩阵、
- * 单素材看逐项拆解（20 §4.1、22 §6.2 要求「不要堆洞察卡」）。
+ * 单素材看逐项拆解（20 §4.1、22 §6.2 要求「不要堆一屏卡片」）。
  */
 type ViewTarget = ApiInsightAssetType | 'single'
 
@@ -54,6 +59,9 @@ const assetTypeOrder: ApiInsightAssetType[] = [
 
 const confidenceLabels: Record<ApiConfidence, string> = { low: '低', medium: '中', high: '高' }
 
+// 一格里同时有多种来源时的显示顺序。归因只认前两种，所以它们排在前面。
+const sourceOrder: ApiFeatureSource[] = ['derived', 'human', 'ai']
+
 // 人工那一行的措辞。authored 不能写成「推翻 AI」——AI 根本没提过这一项，
 // 没有东西可推翻；也不能写成「认可」，人并没有认可过任何机器结论。
 const reviewLabels: Record<ApiReviewState, string> = {
@@ -63,12 +71,23 @@ const reviewLabels: Record<ApiReviewState, string> = {
   authored: '人工填写',
 }
 
+// awaiting_data 显示成「待认类型」：它等的是类型识别，不是投放数据。
+// 这一页正是判类型的地方，照字面译成「待数据」会把人支去接数据。
 const statusLabels: Record<string, string> = {
-  awaiting_data: '待数据', awaiting_match: '待匹配', analysable: '可分析', analysing: '分析中',
+  awaiting_data: '待认类型', awaiting_match: '待匹配', analysable: '可分析', analysing: '分析中',
   pending_confirmation: '待确认', confirmed: '已确认', needs_review: '待复审', retired: '已失效',
 }
 
-export function ContentAnalysisPage({ state, activeView }: { state: DataState; activeView: string }) {
+export function ContentAnalysisPage({ state, activeView, focusAssetId }: {
+  state: DataState
+  activeView: string
+  /**
+   * 进来就选中这一条。别处（米云素材那一页）把人送过来时带的素材 ID——
+   * 那边的人心里想的是「分析我刚导进来的这一条」，落到这一屏却要自己在一排
+   * 素材里认出它是哪个，这一路就白接了。
+   */
+  focusAssetId?: string
+}) {
   const { currentProject } = useProject()
   const target = viewTargets[activeView] ?? 'single'
   const [schemas, setSchemas] = useState<ApiFeatureSchema[]>([])
@@ -80,7 +99,8 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
   const [draft, setDraft] = useState('')
   const [notice, setNotice] = useState('')
   const [listState, setListState] = useState<'loading' | 'ready' | 'error'>('loading')
-  // 素材正文不在素材库里（素材库存的是身份和状态，不存正文），提取时必须由人带上。
+  // 图文类的正文不在库里（洞察只存身份和状态，不存正文），提取时必须由人带上。
+  // 视频类不用：画面交给多模态自己去看，这个框只是选填的补充。
   const [content, setContent] = useState('')
   const [note, setNote] = useState('')
   const [analyzing, setAnalyzing] = useState(false)
@@ -123,8 +143,14 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
 
   useEffect(() => {
     const ids = breakdownAssets.map(asset => asset.id)
-    setSelectedId(current => (ids.includes(current) ? current : ids[0] ?? ''))
-  }, [breakdownAssets.map(asset => asset.id).join('|')])
+    // 人已经选过的那一条优先——列表刷新（提完特征会刷）不该把人挪到别处去。
+    // 其次才是别处指名送过来的那一条，最后退回第一条。
+    setSelectedId(current => {
+      if (ids.includes(current)) return current
+      if (focusAssetId && ids.includes(focusAssetId)) return focusAssetId
+      return ids[0] ?? ''
+    })
+  }, [breakdownAssets.map(asset => asset.id).join('|'), focusAssetId])
 
   const selectedAsset = breakdownAssets.find(asset => asset.id === selectedId)
 
@@ -165,6 +191,13 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
   const typeSchema = schemas.find(schema =>
     schema.asset_type === (target === 'single' ? selectedAsset?.asset_type : target))
 
+  // 「这一条，模型能自己去看画面吗」——决定正文框是必填还是选填。
+  // 两个条件缺一不可：类型是视频（后端 IsVideo），而且指向了素材库里的文件。
+  // 只满足前一条的，模型没有文件可看，人还是得写一段描述（下面那条提示会说明）。
+  const modelWatchesTheVideo = Boolean(
+    typeSchema?.is_video && selectedAsset?.platform_asset_id && selectedAsset?.platform_asset_version,
+  )
+
   /**
    * 写人工层。后端的 PATCH 是整层替换（ReplaceLayer: human），所以要把已有的人工结论
    * 一起带上，否则会把别人此前的判断抹掉。AI 那一层始终不动（AM-006、§14）。
@@ -185,15 +218,19 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
       await loadList()
       await loadFeatures()
       // loadList 会清空提示，所以放在它之后再写，否则这条反馈一闪就没了。
+      //
+      // 回执里报中文名，不报字段键。界面上那一行写的是「主题」，回执却说
+      // 「已填写 theme」——人得先在心里把两个名字对上，才敢确认自己改对了地方。
+      const name = typeSchema?.fields.find(field => field.key === key)?.label ?? key
       setNotice(verdict === 'confirmed'
-        ? `已认可「${key}」，人工结论已单独记一行。`
+        ? `已认可「${name}」，人工结论已单独记一行。`
         : verdict === 'authored'
-          ? `已填写「${key}」。AI 没提过这一项，所以记的是人工原创，不是推翻。`
-          : `已推翻「${key}」并写入人工结论。`)
+          ? `已填写「${name}」。AI 没提过这一项，所以记的是人工原创，不是推翻。`
+          : `已推翻「${name}」并写入人工结论。`)
     } catch (cause) {
       setNotice(cause instanceof Error ? cause.message : '写入人工结论失败。')
     }
-  }, [currentProject.id, features, selectedAsset, loadList, loadFeatures])
+  }, [currentProject.id, features, selectedAsset, typeSchema, loadList, loadFeatures])
 
   const identifyType = useCallback(async (assetType: ApiInsightAssetType) => {
     if (!selectedAsset) return
@@ -218,11 +255,12 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
    * 提出来的结果只写 AI 那一层，状态停在待确认，不会自动变成已确认的结论（09 §8）。
    */
   const analyze = useCallback(async () => {
-    if (!selectedAsset || !content.trim()) return
+    if (!selectedAsset) return
     setAnalyzing(true)
     try {
       const result = await api.analyzeInsightAsset(currentProject.id, selectedAsset.id, {
         expected_version: selectedAsset.version,
+        // 视频类可以空着——后端会去问多模态。填了也不浪费，会当成人的补充一起给模型。
         content: content.trim(),
         note: note.trim() || undefined,
       })
@@ -233,7 +271,21 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
       // loadList 会清空提示，所以放在它之后再写。
       setNotice(`提取完成，AI 给出 ${result.features.length} 项特征${dropped}。这些还只是待确认，需要逐项认可或推翻。`)
     } catch (cause) {
-      // 失败的任务后端也会记一行，所以照样刷新历史，让人看得见它失败过。
+      // 「模型正在看这条视频」不是失败：这一趟压根没跑，后端也没记留痕
+      // （understanding.go），所以不刷新历史，也不说「具体原因见……」——
+      // 那边什么都没有，让人去翻只会更困惑。
+      if (cause instanceof ApiRequestError && cause.code === 'UNDERSTANDING_PENDING') {
+        setNotice(`${cause.message}。视频要先由多模态看一遍关键帧，通常一两分钟。`)
+        return
+      }
+      // 400 是「这个请求本身不成立」（缺正文、模型看不了这条视频），后端在跑之前
+      // 就退回来了，没有留痕。指路「见右侧最新一条」会让人去翻一条不存在的记录，
+      // 而报错里已经把原因说全了。
+      if (cause instanceof ApiRequestError && cause.status === 400) {
+        setNotice(cause.message)
+        return
+      }
+      // 剩下的是真的跑过并且失败了，后端记了一行，所以照样刷新历史，让人看得见。
       // 接口按平台惯例只回一句笼统的错误码文案，真正的原因在那条记录里。
       await loadRuns()
       setNotice(`${cause instanceof Error ? cause.message : '提取失败'}。具体原因见右侧「数据与方法」最新一条。`)
@@ -289,13 +341,26 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
             <div><span className="section-label">AI 提特征</span></div>
             <p>
               照「{typeSchema.label}」自己那套 {typeSchema.fields.length} 个变量提问，不会把别类素材的字段套过来。
-              素材正文没有存在库里，要提取就得先把正文贴进来。提出来的结果只进 AI 那一层，仍然要逐项人工认可才算数。
+              {/* 视频但没有文件引用的那种情况这里不说话——下面那条提示专门讲它，
+                  在这儿再说一句「本体就是那段文字」是错的，视频的本体是画面。 */}
+              {modelWatchesTheVideo
+                ? '这是视频，画面由模型自己去看素材库里的那个文件，你不用再写一遍——写了也行，会当成你的补充一起给模型。'
+                : typeSchema.is_video ? '' : '这类素材的本体就是那段文字，洞察这边没存正文，要提取就得先贴进来。'}
+              提出来的结果只进 AI 那一层，仍然要逐项人工认可才算数。
             </p>
+            {typeSchema.is_video && !modelWatchesTheVideo
+              ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span>
+                <small>模型看不到画面</small>这条视频没指向素材库里的文件，只有从创意导入的素材才带这个引用。
+                现在只能靠你写一段画面描述或脚本——那样模型分析的是这段描述，不是这条视频。
+              </span></div>
+              : null}
             <textarea
               aria-label="素材内容"
               rows={6}
               value={content}
-              placeholder="把这条素材的正文、口播稿或分镜说明贴进来"
+              placeholder={modelWatchesTheVideo
+                ? '选填：模型从画面里看不出来的背景，例如「这条是给老客户的续费提醒」'
+                : '把这条素材的正文、口播稿或分镜说明贴进来'}
               onChange={event => setContent(event.target.value)}
             />
             <input
@@ -305,7 +370,7 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
               onChange={event => setNote(event.target.value)}
             />
             <div className="actions">
-              <button className="primary-button" disabled={analyzing || !content.trim()} onClick={() => { void analyze() }}>
+              <button className="primary-button" disabled={analyzing || (!content.trim() && !modelWatchesTheVideo)} onClick={() => { void analyze() }}>
                 <Wand2 size={15}/>{analyzing ? '提取中…' : '提取特征'}
               </button>
               <span>只有点这个按钮才会真的调一次模型。登记素材时不会自动提——那样只会把待复核的结果堆满，没人看得完。</span>
@@ -338,8 +403,15 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
               : selectedAsset.asset_type_source === 'human' ? '（人工判定）' : ''}
           </b></span></div>
           <div className="prelaunch-fact"><Sparkles size={17}/><span><small>已提取</small><b>
-            AI {features.filter(feature => feature.source === 'ai').length} 项 · 人工 {features.filter(feature => feature.source === 'human').length} 项
+            {sourceOrder.map(source =>
+              `${featureSourceLabel[source]} ${features.filter(feature => feature.source === source).length} 项`).join(' · ')}
             {typeSchema ? ` · 这类素材共 ${typeSchema.fields.length} 个变量` : ''}
+          </b></span></div>
+          {/* 能进归因的有几项，要单独说一句。前面那行三个数并排，人会把它们加起来
+              当成「提取了多少」，而其中模型猜的那部分是不能拿去做归因的。 */}
+          <div className="prelaunch-fact"><UserCheck size={17}/><span><small>其中能进归因的</small><b>
+            {features.filter(feature => admissibleForAttribution(feature.source)).length} 项。
+            模型猜的那些只能参考——要让它们算数，得有人看过并确认。
           </b></span></div>
           {selectedAsset.analysis_status_reason
             ? <div className="prelaunch-fact"><Lightbulb size={17}/><span><small>最近一次状态说明</small><b>{selectedAsset.analysis_status_reason}</b></span></div>
@@ -359,7 +431,12 @@ export function ContentAnalysisPage({ state, activeView }: { state: DataState; a
                   提出 {run.feature_count} 项特征
                   {run.dropped_fields?.length ? ` · 有 ${run.dropped_fields.length} 项没采信：${run.dropped_fields.join('；')}` : ''}
                 </small> : null}
-                {run.status === 'failed' ? <small>{readableError(run.error_message) || '没有记下失败原因。'}</small> : null}
+                {/* 「还没配模型」是人自己能解决的，所以要连着说清楚在哪儿配；
+                    别的失败原因不加这一句，免得把「上游超时」也指到设置页去。 */}
+                {run.status === 'failed' ? <small>
+                  {readableError(run.error_message) || '没有记下失败原因。'}
+                  {isModelSetupFailure(run.error_message) ? ` ${modelSetupHint}` : ''}
+                </small> : null}
               </div>)
               : <div className="prelaunch-fact"><ScrollText size={17}/><span><small>还没有跑过提取</small><b>每次提取都会留一条记录：用的哪版 Skill、哪个模型、花了多久、哪几项没采信。失败的也会留，不然成功率永远是 100%。</b></span></div>}
           </div>
@@ -391,13 +468,18 @@ function FeatureMatrixTable({ matrix }: { matrix: ApiFeatureMatrix }) {
       {matrix.rows.filter(row => row.group === group).map(row => <div className="content-matrix-row" key={row.key}>
         <span><b>{row.label}</b><small>{row.key}</small></span>
         {matrix.assets.map(asset => {
-          const cells = (row.cells ?? []).filter(cell => cell.asset_id === asset.id)
-          const ai = cells.find(cell => cell.source === 'ai')
-          const human = cells.find(cell => cell.source === 'human')
+          // 三种来源都要显示，顺序固定成「量出来的 → 人标的 → 模型猜的」：
+          // 归因只认前两种，把能归因的排在前面，人一眼就知道这一格能不能用。
+          // 少列 derived 那一种的话，一个量出来的取值会显示成「—」，被读成「没提取」。
+          const cells = sourceOrder
+            .map(source => (row.cells ?? []).find(cell => cell.asset_id === asset.id && cell.source === source))
+            .filter((cell): cell is ApiFeatureMatrixCell => Boolean(cell))
           return <span key={asset.id}>
-            {human ? <b className="content-layer human">人工 · {formatValue(human.value)}</b> : null}
-            {ai ? <b className="content-layer ai">AI · {formatValue(ai.value)} · 置信{confidenceLabels[ai.confidence ?? 'low']}</b> : null}
-            {!ai && !human ? <b className="content-layer">—</b> : null}
+            {cells.map(cell => <b key={cell.source} className={`content-layer ${cell.source}`}>
+              {featureSourceLabel[cell.source]} · {formatValue(cell.value)}
+              {cell.source === 'ai' ? ` · 置信${confidenceLabels[cell.confidence ?? 'low']}` : ''}
+            </b>)}
+            {cells.length ? null : <b className="content-layer">—</b>}
           </span>
         })}
       </div>)}
@@ -427,12 +509,15 @@ function FeatureBreakdown({ schema, features, editingKey, draft, onDraft, onEdit
       {schema.fields.filter(field => field.group === group).map(field => {
         const ai = features.find(feature => feature.source === 'ai' && feature.key === field.key)
         const human = features.find(feature => feature.source === 'human' && feature.key === field.key)
+        // 量出来的那一层是只读的：它是算出来的，改它等于改算法，不该在这里改。
+        const derived = features.find(feature => feature.source === 'derived' && feature.key === field.key)
         const editing = editingKey === field.key
         return <div className="content-breakdown-row" key={field.key}>
           <span><b>{field.label}</b><small>{field.key} · {kindLabels[field.kind] ?? field.kind}{field.unit ? ` · ${field.unit}` : ''}</small></span>
           <span>
-            {ai ? <b className="content-layer ai">AI · {formatValue(ai.value)} · 置信{confidenceLabels[ai.confidence ?? 'low']}</b> : <b className="content-layer">AI 还没提取这一项</b>}
-            {human ? <b className="content-layer human">人工 · {formatValue(human.value)} · {reviewLabels[human.review_state] ?? human.review_state}</b> : null}
+            {derived ? <b className="content-layer derived">{featureSourceLabel.derived} · {formatValue(derived.value)}</b> : null}
+            {ai ? <b className="content-layer ai">{featureSourceLabel.ai} · {formatValue(ai.value)} · 置信{confidenceLabels[ai.confidence ?? 'low']}</b> : <b className="content-layer">模型还没提取这一项</b>}
+            {human ? <b className="content-layer human">{featureSourceLabel.human} · {formatValue(human.value)} · {reviewLabels[human.review_state] ?? human.review_state}</b> : null}
             {editing ? <input
               autoFocus
               aria-label={`改写 ${field.label}`}
@@ -461,15 +546,6 @@ const runStatusLabels: Record<string, string> = { running: '进行中', succeede
 function formatTime(raw: string): string {
   const at = new Date(raw)
   return Number.isNaN(at.getTime()) ? raw : at.toLocaleString('zh-CN', { hour12: false })
-}
-
-/**
- * 库里存的是整条错误链（英文 sentinel + 中文原因），排查时有用，但摆在页面上
- * 只会让人多看一串英文。这里只取那句给人看的中文。
- */
-function readableError(raw = ''): string {
-  const at = raw.search(/[一-龥]/)
-  return at > 0 && /: $/.test(raw.slice(0, at)) ? raw.slice(at) : raw
 }
 
 function formatLatency(ms: number): string {

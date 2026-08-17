@@ -50,33 +50,40 @@ const (
 // edits therefore cannot silently change the endpoint, model, or credential
 // used by an already accepted image job or text skill run.
 type GatewayRouteSnapshot struct {
-	RouteID              string                   `json:"route_id"`
-	RouteRevisionID      string                   `json:"route_revision_id"`
-	ConnectionID         string                   `json:"connection_id"`
-	ConnectionRevisionID string                   `json:"connection_revision_id"`
-	ConnectionType       string                   `json:"connection_type,omitempty"`
-	BaseURL              string                   `json:"base_url"`
-	UpstreamModel        string                   `json:"upstream_model"`
-	CredentialID         string                   `json:"credential_id"`
-	CredentialVersion    int64                    `json:"credential_version"`
-	TimeoutSeconds       int                      `json:"timeout_seconds"`
-	MaxResponseBytes     int64                    `json:"max_response_bytes"`
-	TextResponseMode     TextResponseMode         `json:"text_response_mode,omitempty"`
-	TextAPIMode          TextAPIMode              `json:"text_api_mode,omitempty"`
-	MaxOutputTokens      int                      `json:"max_output_tokens,omitempty"`
-	OutputTokenParameter TextOutputTokenParameter `json:"output_token_parameter,omitempty"`
-	Temperature          float64                  `json:"temperature,omitempty"`
-	TemperatureSet       bool                     `json:"-"`
-	ThinkingMode         string                   `json:"thinking_mode,omitempty"`
-	ReasoningSplit       bool                     `json:"reasoning_split,omitempty"`
-	ReasoningEffort      string                   `json:"reasoning_effort,omitempty"`
-	Background           bool                     `json:"background,omitempty"`
-	PollIntervalMS       int                      `json:"poll_interval_ms,omitempty"`
-	VideoInputModes      []VideoInputMode         `json:"video_input_modes,omitempty"`
-	VideoAudioPolicies   []VideoAudioPolicy       `json:"video_audio_policies,omitempty"`
-	VideoSubmitPath      string                   `json:"video_submit_path,omitempty"`
-	VideoPollPath        string                   `json:"video_poll_path,omitempty"`
-	SpeechVoiceAliases   map[string]string        `json:"speech_voice_aliases,omitempty"`
+	RouteID                      string                   `json:"route_id"`
+	RouteRevisionID              string                   `json:"route_revision_id"`
+	ConnectionID                 string                   `json:"connection_id"`
+	ConnectionRevisionID         string                   `json:"connection_revision_id"`
+	ConnectionType               string                   `json:"connection_type,omitempty"`
+	BaseURL                      string                   `json:"base_url"`
+	UpstreamModel                string                   `json:"upstream_model"`
+	CredentialID                 string                   `json:"credential_id"`
+	CredentialVersion            int64                    `json:"credential_version"`
+	TimeoutSeconds               int                      `json:"timeout_seconds"`
+	MaxResponseBytes             int64                    `json:"max_response_bytes"`
+	TextResponseMode             TextResponseMode         `json:"text_response_mode,omitempty"`
+	TextAPIMode                  TextAPIMode              `json:"text_api_mode,omitempty"`
+	MaxOutputTokens              int                      `json:"max_output_tokens,omitempty"`
+	OutputTokenParameter         TextOutputTokenParameter `json:"output_token_parameter,omitempty"`
+	Temperature                  float64                  `json:"temperature,omitempty"`
+	TemperatureSet               bool                     `json:"-"`
+	ThinkingMode                 string                   `json:"thinking_mode,omitempty"`
+	ReasoningSplit               bool                     `json:"reasoning_split,omitempty"`
+	ReasoningEffort              string                   `json:"reasoning_effort,omitempty"`
+	Background                   bool                     `json:"background,omitempty"`
+	PollIntervalMS               int                      `json:"poll_interval_ms,omitempty"`
+	VideoInputModes              []VideoInputMode         `json:"video_input_modes,omitempty"`
+	VideoAudioPolicies           []VideoAudioPolicy       `json:"video_audio_policies,omitempty"`
+	VideoSubmitPath              string                   `json:"video_submit_path,omitempty"`
+	VideoPollPath                string                   `json:"video_poll_path,omitempty"`
+	SpeechVoiceAliases           map[string]string        `json:"speech_voice_aliases,omitempty"`
+	DocumentSubmitPath           string                   `json:"document_submit_path,omitempty"`
+	DocumentPollPath             string                   `json:"document_poll_path,omitempty"`
+	DocumentOperatorVersion      string                   `json:"document_operator_version,omitempty"`
+	DocumentParseMode            string                   `json:"document_parse_mode,omitempty"`
+	DocumentFullResult           bool                     `json:"document_full_result,omitempty"`
+	DocumentAspectRatioThreshold float64                  `json:"document_aspect_ratio_threshold,omitempty"`
+	DocumentPollIntervalMS       int                      `json:"document_poll_interval_ms,omitempty"`
 }
 
 // ChatCompletionsEndpoint resolves the provider-specific OpenAI-compatible
@@ -109,6 +116,36 @@ func (s GatewayRouteSnapshot) ValidateVideoWithPolicy(allowInsecureHTTP bool) er
 		return err
 	}
 	return validateVideoAudioPolicies(s.VideoAudioPolicies)
+}
+
+func (s GatewayRouteSnapshot) ValidateDocumentVisionWithPolicy(allowInsecureHTTP bool) error {
+	if err := s.validateWithLimits(allowInsecureHTTP, 1800, 100<<20); err != nil {
+		return err
+	}
+	if s.ConnectionType != "las_operator" {
+		return fmt.Errorf("document vision route requires a las_operator connection")
+	}
+	if !validGatewayPath(s.DocumentSubmitPath, false) || !validGatewayPath(s.DocumentPollPath, false) {
+		return fmt.Errorf("document vision submit and poll paths are invalid")
+	}
+	if strings.TrimSpace(s.DocumentOperatorVersion) == "" || len(s.DocumentOperatorVersion) > 32 {
+		return fmt.Errorf("document vision operator version is invalid")
+	}
+	switch s.DocumentParseMode {
+	case "normal", "detail":
+	default:
+		return fmt.Errorf("document vision parse mode is invalid")
+	}
+	if !s.DocumentFullResult {
+		return fmt.Errorf("document vision route must request the full result")
+	}
+	if s.DocumentAspectRatioThreshold <= 0 || s.DocumentAspectRatioThreshold > 1 {
+		return fmt.Errorf("document vision aspect ratio threshold is invalid")
+	}
+	if s.DocumentPollIntervalMS < 500 || s.DocumentPollIntervalMS > 10_000 {
+		return fmt.Errorf("document vision poll interval must be between 500 and 10000 milliseconds")
+	}
+	return nil
 }
 
 func (s GatewayRouteSnapshot) validateWithLimits(allowInsecureHTTP bool, maxTimeoutSeconds int, maxResponseBytes int64) error {
@@ -198,6 +235,10 @@ type VisionRouteResolver interface {
 	ResolveVisionRoute(context.Context, contract.OrganizationID, string) (GatewayRouteSnapshot, error)
 }
 
+type DocumentVisionRouteResolver interface {
+	ResolveDocumentVisionRoute(context.Context, contract.OrganizationID, string) (GatewayRouteSnapshot, error)
+}
+
 type ResearchRouteResolver interface {
 	ResolveResearchRoute(context.Context, contract.OrganizationID, string) (GatewayRouteSnapshot, error)
 }
@@ -231,6 +272,7 @@ type CapabilityStatus struct {
 	Capability           string    `json:"capability"`
 	ModelAlias           string    `json:"model_alias"`
 	UpstreamModel        string    `json:"upstream_model"`
+	ConnectionType       string    `json:"connection_type"`
 	Available            bool      `json:"available"`
 	CredentialConfigured bool      `json:"credential_configured"`
 	UpdatedAt            time.Time `json:"updated_at"`
@@ -243,7 +285,7 @@ func (s MySQLGatewayConfigStore) ListCapabilities(ctx context.Context, organizat
 	if s.DB == nil {
 		return nil, fmt.Errorf("provider database is required")
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT r.capability, r.model_alias, rr.upstream_model,
+	rows, err := s.DB.QueryContext(ctx, `SELECT r.capability, r.model_alias, rr.upstream_model, connection.connection_type,
 		EXISTS(
 			SELECT 1 FROM provider_credentials credential
 			WHERE credential.connection_id = rr.connection_id
@@ -266,7 +308,7 @@ func (s MySQLGatewayConfigStore) ListCapabilities(ctx context.Context, organizat
 	result := []CapabilityStatus{}
 	for rows.Next() {
 		var item CapabilityStatus
-		if err := rows.Scan(&item.Capability, &item.ModelAlias, &item.UpstreamModel, &item.CredentialConfigured, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.Capability, &item.ModelAlias, &item.UpstreamModel, &item.ConnectionType, &item.CredentialConfigured, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		item.Available = item.CredentialConfigured
@@ -295,6 +337,10 @@ func (s MySQLGatewayConfigStore) ResolveTextRoute(ctx context.Context, organizat
 
 func (s MySQLGatewayConfigStore) ResolveVisionRoute(ctx context.Context, organizationID contract.OrganizationID, modelAlias string) (GatewayRouteSnapshot, error) {
 	return s.resolveRoute(ctx, organizationID, "vision.understand", modelAlias, "adapter_gateway")
+}
+
+func (s MySQLGatewayConfigStore) ResolveDocumentVisionRoute(ctx context.Context, organizationID contract.OrganizationID, modelAlias string) (GatewayRouteSnapshot, error) {
+	return s.resolveRoute(ctx, organizationID, "document.vision.parse", modelAlias, "las_operator")
 }
 
 func (s MySQLGatewayConfigStore) ResolveResearchRoute(ctx context.Context, organizationID contract.OrganizationID, modelAlias string) (GatewayRouteSnapshot, error) {
@@ -351,6 +397,10 @@ func (s MySQLGatewayConfigStore) resolveRoute(ctx context.Context, organizationI
 			return ImageRouteSnapshot{}, fmt.Errorf("invalid adapter gateway route %q constraints: %w", modelAlias, err)
 		}
 		normalizeTextRouteTransportLimits(&snapshot)
+	} else if capability == "document.vision.parse" {
+		if err := applyDocumentVisionRouteConstraints(&snapshot, constraintsJSON); err != nil {
+			return ImageRouteSnapshot{}, fmt.Errorf("invalid document vision route %q constraints: %w", modelAlias, err)
+		}
 	} else if capability == "video.generate" {
 		if err := applyVideoRouteConstraints(&snapshot, constraintsJSON); err != nil {
 			return ImageRouteSnapshot{}, fmt.Errorf("invalid adapter gateway route %q constraints: %w", modelAlias, err)
@@ -363,6 +413,8 @@ func (s MySQLGatewayConfigStore) resolveRoute(ctx context.Context, organizationI
 	validate := snapshot.ValidateWithPolicy
 	if capability == "text.generate" || capability == "vision.understand" {
 		validate = snapshot.ValidateTextWithPolicy
+	} else if capability == "document.vision.parse" {
+		validate = snapshot.ValidateDocumentVisionWithPolicy
 	} else if capability == "video.generate" {
 		validate = snapshot.ValidateVideoWithPolicy
 	}
@@ -384,6 +436,43 @@ func normalizeTextRouteTransportLimits(snapshot *GatewayRouteSnapshot) {
 	if snapshot.MaxResponseBytes > 100<<20 {
 		snapshot.MaxResponseBytes = 100 << 20
 	}
+}
+
+func applyDocumentVisionRouteConstraints(snapshot *GatewayRouteSnapshot, raw json.RawMessage) error {
+	if snapshot == nil {
+		return fmt.Errorf("route snapshot is required")
+	}
+	var constraints struct {
+		SubmitPath           string   `json:"endpoint"`
+		PollPath             string   `json:"poll_endpoint"`
+		OperatorVersion      string   `json:"operator_version"`
+		ParseMode            string   `json:"parse_mode"`
+		FullResult           *bool    `json:"full_result"`
+		AspectRatioThreshold *float64 `json:"aspect_ratio_threshold"`
+		PollIntervalMS       int      `json:"poll_interval_ms"`
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &constraints); err != nil {
+			return err
+		}
+	}
+	snapshot.DocumentSubmitPath = strings.TrimSpace(constraints.SubmitPath)
+	snapshot.DocumentPollPath = strings.TrimSpace(constraints.PollPath)
+	snapshot.DocumentOperatorVersion = strings.TrimSpace(constraints.OperatorVersion)
+	snapshot.DocumentParseMode = strings.ToLower(strings.TrimSpace(constraints.ParseMode))
+	snapshot.DocumentFullResult = true
+	if constraints.FullResult != nil {
+		snapshot.DocumentFullResult = *constraints.FullResult
+	}
+	snapshot.DocumentAspectRatioThreshold = 0.334
+	if constraints.AspectRatioThreshold != nil {
+		snapshot.DocumentAspectRatioThreshold = *constraints.AspectRatioThreshold
+	}
+	snapshot.DocumentPollIntervalMS = constraints.PollIntervalMS
+	if snapshot.DocumentPollIntervalMS == 0 {
+		snapshot.DocumentPollIntervalMS = 2000
+	}
+	return nil
 }
 
 func applySpeechRouteConstraints(snapshot *GatewayRouteSnapshot, raw json.RawMessage) error {

@@ -1,6 +1,22 @@
 # Delivery migrations
 
+`20260811120000_delivery_decision_workflows.up.sql` adds the immutable Phase C
+Decision -> Selection -> CompiledWorkflow authority spine. It reuses the
+existing immutable platform-configuration store and adds no executable
+credentials or remote runtime. Database CHECK constraints require
+`ready_for_final_approval` and reject `remote_write_enabled=true`.
+
+`20260811121000_delivery_contract_hash_algorithm_width.up.sql` and
+`20260811122000_delivery_contract_hash_identity_compat.up.sql`, together with
+`20260811123000_delivery_alert_provenance_width_compat.up.sql`, are forward-only
+compatibility corrections for environments that applied an early draft of the
+v2 configuration migration. They restore the frozen 64-character algorithm
+column, the intended `(id, version)` immutable identity, and the complete
+simulator provenance width without rewriting any payload or canonical hash.
+
 Owner: Delivery team.
+
+`20260810120000_delivery_platform_configuration_runtime.up.sql` 是 DeliveryIntent/PlatformConfiguration 的增量切换迁移。它创建不可变 Intent 与判别式配置存储，为 Plan/ChangeSet 增加 schema 判别器，并为 Approval 增加显式 Intent/配置绑定。迁移不对旧 `config_json`、`target_snapshot`、canonical hash 或 approval action hash 执行 `UPDATE`。
 
 `20260731120000_delivery_approval_content_hashes.up.sql` intentionally adds
 `delivery_plan_versions.canonical_hash` as nullable for the SQL phase. The
@@ -49,3 +65,22 @@ The monitoring migration is additive: it preserves legacy metric rows with
 the existing window end, and extends uniqueness for multi-window fixtures. It
 adds `delivery_alerts` with organization/project fingerprint uniqueness and CAS
 versions. No legacy metric or alert data is deleted or rewritten destructively.
+
+# Mock/Replay observatory
+
+`20260812120000_delivery_observatory_runs.up.sql` adds immutable observatory runs and append-only operator feedback. Runs reference an existing DecisionSelection and freeze the exact Decision, Configuration, and Workflow hashes. CHECK constraints admit only `mock`/`replay`, `observe_existing`/`prepare_new_local_form`, and `remote_write_enabled = FALSE`; the canonical input hash is unique per project for deterministic replay. Feedback references the immutable run, supports `accepted`/`modified`/`rejected`, and uses a project-scoped idempotency key. The migration does not rewrite any earlier payload or hash.
+
+`20260812121000_delivery_observatory_feedback_outcome.up.sql` freezes the reviewed run outcome directly on each feedback row. It is a forward-only compatibility migration because the initial observatory migration may already have been applied; no existing immutable JSON or canonical hash is rewritten.
+
+# Controlled Computer Use authority
+
+`20260812131000_delivery_controlled_execution_authority.up.sql` adds formal,
+write-capable authority records without reusing the legacy `execute_mock`
+approval. A controlled ChangeSet binds the latest accepted or modified
+Observatory feedback and every upstream canonical hash; the immutable approval
+uses the distinct `controlled_remote_write` scope and a 30-minute expiry. A
+separate business execution aggregate references the Platform-owned
+ComputerUseRun by stable ID. The legacy execution table receives only a
+nullable reference column: its mock source, adapter, scenario, approval hashes,
+and CHECK constraints remain unchanged. PlatformEntityMapping is confirmed
+only when both result-page and list-page evidence references are present.

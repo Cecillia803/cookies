@@ -28,6 +28,11 @@ type creativeBrandBriefManager interface {
 	ConfirmBrandBriefReview(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ConfirmBrandBriefReviewRequest) (creative.BrandBriefReview, error)
 }
 
+type creativeStrategyBrandWorkflowManager interface {
+	GetStrategyBrandWorkflow(context.Context, contract.ActorContext, contract.ProjectID, string) (creative.StrategyBrandWorkflowResult, error)
+	PrepareStrategyBrandWorkflow(context.Context, contract.ActorContext, contract.ProjectID, string, creative.PrepareStrategyBrandWorkflowRequest) (creative.StrategyBrandWorkflowResult, error)
+}
+
 type creativeImageTextManager interface {
 	GetImageTextWorkspace(context.Context, contract.ActorContext, contract.ProjectID, string) (creative.ImageTextWorkspace, error)
 	GenerateImageTextDraft(context.Context, contract.ActorContext, contract.ProjectID, string, creative.GenerateImageTextDraftRequest) (creative.ImageTextDraft, error)
@@ -633,6 +638,16 @@ func (s *Server) materializeBrandFilmAudioAssets(w http.ResponseWriter, r *http.
 	s.writeBrandFilmResult(w, r, value, err)
 }
 
+func (s *Server) generateBrandFilmSoundAssets(w http.ResponseWriter, r *http.Request) {
+	var body creative.BrandFilmRevisionRequest
+	if !s.decodeBrandFilmCommand(w, r, &body) {
+		return
+	}
+	rc, _ := contract.RequestContextFrom(r.Context())
+	value, err := s.creative.GenerateBrandFilmSoundAssets(r.Context(), rc, contract.ProjectID(r.PathValue("project_id")), r.PathValue("task_id"), body)
+	s.writeBrandFilmResult(w, r, value, err)
+}
+
 func (s *Server) renderBrandFilmAudioPreview(w http.ResponseWriter, r *http.Request) {
 	var body creative.BrandFilmRevisionRequest
 	if !s.decodeBrandFilmCommand(w, r, &body) {
@@ -923,6 +938,48 @@ func (s *Server) prepareCreativeBrandBrief(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, value)
 }
 
+func (s *Server) getCreativeStrategyBrandWorkflow(w http.ResponseWriter, r *http.Request) {
+	manager, ok := s.creative.(creativeStrategyBrandWorkflowManager)
+	if !ok {
+		s.notImplemented(w, r)
+		return
+	}
+	rc, _ := contract.RequestContextFrom(r.Context())
+	value, err := manager.GetStrategyBrandWorkflow(
+		r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("intake_id"),
+	)
+	if err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) prepareCreativeStrategyBrandWorkflow(w http.ResponseWriter, r *http.Request) {
+	if _, ok := idempotencyKey(w, r); !ok {
+		return
+	}
+	manager, ok := s.creative.(creativeStrategyBrandWorkflowManager)
+	if !ok {
+		s.notImplemented(w, r)
+		return
+	}
+	var body creative.PrepareStrategyBrandWorkflowRequest
+	if err := decodeJSON(w, r, &body); err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	rc, _ := contract.RequestContextFrom(r.Context())
+	value, err := manager.PrepareStrategyBrandWorkflow(
+		r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("intake_id"), body,
+	)
+	if err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
 func (s *Server) getCreativeBrandBrief(w http.ResponseWriter, r *http.Request) {
 	manager, ok := s.creative.(creativeBrandBriefManager)
 	if !ok {
@@ -1130,6 +1187,25 @@ func (s *Server) getCreativeTask(w http.ResponseWriter, r *http.Request) {
 	}
 	rc, _ := contract.RequestContextFrom(r.Context())
 	value, err := s.creative.GetTaskDetail(r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("task_id"))
+	if err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) renameCreativeTask(w http.ResponseWriter, r *http.Request) {
+	if s.creative == nil {
+		s.notImplemented(w, r)
+		return
+	}
+	var body creative.RenameTaskRequest
+	if err := decodeJSON(w, r, &body); err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	rc, _ := contract.RequestContextFrom(r.Context())
+	value, err := s.creative.RenameTask(r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("task_id"), body)
 	if err != nil {
 		s.writeServiceError(w, r, err)
 		return
@@ -1362,6 +1438,10 @@ type shortDramaV2CreativeCommands interface {
 	SelectShortDramaV2Direction(context.Context, contract.ActorContext, contract.ProjectID, string, creative.SelectShortDramaV2DirectionRequest) (creative.TaskDetail, error)
 	UpdateShortDramaV2Prompts(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateShortDramaV2PromptsRequest) (creative.TaskDetail, error)
 	PrepareShortDramaV2OpeningFrame(context.Context, contract.RequestContext, contract.ProjectID, string, creative.PrepareShortDramaV2OpeningFrameRequest) (creative.TaskDetail, error)
+	GenerateShortDramaReferenceBoards(context.Context, contract.ActorContext, contract.ProjectID, string, creative.GenerateShortDramaReferenceBoardsRequest) (creative.TaskDetail, error)
+	ReconcileShortDramaReferenceBoard(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ReconcileShortDramaReferenceBoardRequest) (creative.TaskDetail, error)
+	RetryShortDramaReferenceBoardCandidate(context.Context, contract.ActorContext, contract.ProjectID, string, creative.RetryShortDramaReferenceBoardCandidateRequest) (creative.TaskDetail, error)
+	SelectShortDramaReferenceBoard(context.Context, contract.ActorContext, contract.ProjectID, string, creative.SelectShortDramaReferenceBoardRequest) (creative.TaskDetail, error)
 	GenerateShortDramaV2FirstFrames(context.Context, contract.ActorContext, contract.ProjectID, string, creative.GenerateShortDramaV2FirstFramesRequest) (creative.TaskDetail, error)
 	ReconcileShortDramaV2FirstFrame(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ReconcileShortDramaV2FirstFrameRequest) (creative.TaskDetail, error)
 	SelectShortDramaV2FirstFrame(context.Context, contract.ActorContext, contract.ProjectID, string, creative.SelectShortDramaV2FirstFrameRequest) (creative.TaskDetail, error)
@@ -1428,6 +1508,47 @@ func (s *Server) shortDramaV2Command(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		value, err = manager.PrepareShortDramaV2OpeningFrame(r.Context(), rc, projectID, taskID, body)
+	case strings.HasSuffix(path, ":generate-reference-boards"):
+		var body creative.GenerateShortDramaReferenceBoardsRequest
+		if decodeErr := decodeJSON(w, r, &body); decodeErr != nil {
+			s.badRequest(w, r, decodeErr)
+			return
+		}
+		value, err = manager.GenerateShortDramaReferenceBoards(r.Context(), rc.Actor, projectID, taskID, body)
+	case strings.HasSuffix(path, ":reconcile-reference-board"):
+		if s.providerJobs == nil {
+			s.notImplemented(w, r)
+			return
+		}
+		var body struct {
+			ExpectedRevision int64  `json:"expected_revision"`
+			CandidateID      string `json:"candidate_id"`
+			ProviderJobID    string `json:"provider_job_id"`
+		}
+		if decodeErr := decodeJSON(w, r, &body); decodeErr != nil {
+			s.badRequest(w, r, decodeErr)
+			return
+		}
+		job, getErr := s.providerJobs.GetJob(r.Context(), rc.Actor.OrganizationID, projectID, body.ProviderJobID)
+		if getErr != nil {
+			s.writeServiceError(w, r, getErr)
+			return
+		}
+		value, err = manager.ReconcileShortDramaReferenceBoard(r.Context(), rc.Actor, projectID, taskID, creative.ReconcileShortDramaReferenceBoardRequest{ExpectedRevision: body.ExpectedRevision, CandidateID: body.CandidateID, Job: job})
+	case strings.HasSuffix(path, ":retry-reference-board-candidate"):
+		var body creative.RetryShortDramaReferenceBoardCandidateRequest
+		if decodeErr := decodeJSON(w, r, &body); decodeErr != nil {
+			s.badRequest(w, r, decodeErr)
+			return
+		}
+		value, err = manager.RetryShortDramaReferenceBoardCandidate(r.Context(), rc.Actor, projectID, taskID, body)
+	case strings.HasSuffix(path, ":select-reference-board"):
+		var body creative.SelectShortDramaReferenceBoardRequest
+		if decodeErr := decodeJSON(w, r, &body); decodeErr != nil {
+			s.badRequest(w, r, decodeErr)
+			return
+		}
+		value, err = manager.SelectShortDramaReferenceBoard(r.Context(), rc.Actor, projectID, taskID, body)
 	case strings.HasSuffix(path, ":generate-first-frames"):
 		var body creative.GenerateShortDramaV2FirstFramesRequest
 		if decodeErr := decodeJSON(w, r, &body); decodeErr != nil {
@@ -1596,6 +1717,25 @@ func (s *Server) updateViralPrompt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
+func (s *Server) updateViralInput(w http.ResponseWriter, r *http.Request) {
+	if s.creative == nil {
+		s.notImplemented(w, r)
+		return
+	}
+	var body creative.UpdateViralInputRequest
+	if err := decodeJSON(w, r, &body); err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	rc, _ := contract.RequestContextFrom(r.Context())
+	value, err := s.creative.UpdateViralInput(r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("task_id"), body)
+	if err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
 func (s *Server) confirmViralGeneration(w http.ResponseWriter, r *http.Request) {
 	if s.creative == nil {
 		s.notImplemented(w, r)
@@ -1611,6 +1751,30 @@ func (s *Server) confirmViralGeneration(w http.ResponseWriter, r *http.Request) 
 	}
 	rc, _ := contract.RequestContextFrom(r.Context())
 	value, err := s.creative.ConfirmViralGeneration(r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("task_id"), body)
+	if err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) retryViralWithoutReferenceImage(w http.ResponseWriter, r *http.Request) {
+	if s.creative == nil {
+		s.notImplemented(w, r)
+		return
+	}
+	if _, ok := idempotencyKey(w, r); !ok {
+		return
+	}
+	var body creative.RetryViralWithoutReferenceImageRequest
+	if err := decodeJSON(w, r, &body); err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	rc, _ := contract.RequestContextFrom(r.Context())
+	value, err := s.creative.RetryViralWithoutReferenceImage(
+		r.Context(), rc.Actor, contract.ProjectID(r.PathValue("project_id")), r.PathValue("task_id"), body,
+	)
 	if err != nil {
 		s.writeServiceError(w, r, err)
 		return

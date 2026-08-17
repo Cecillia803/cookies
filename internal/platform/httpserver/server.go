@@ -39,14 +39,28 @@ type Server struct {
 	uploads           AssetUploadManager
 	intakes           GeneratedIntakeManager
 	creative          CreativeManager
+	productionCenter  creative.ProductionCenterQuery
+	productionAssets  creative.ProductionAssetQuery
+	productionRetry   creative.ProductionRetryCommand
 	sessions          SessionManager
 	knowledge         KnowledgeManager
 	remixPlans        RemixPlanManager
 	evals             EvalManager
 	agentRuns         AgentRunManager
 	providerConfig    ProviderConfigurationReader
+	providerVideo     ProviderVideoConfigurationStore
+	providerVideoEnv  ProviderVideoEnvironment
 	mux               *http.ServeMux
 	newID             func() (string, error)
+}
+
+// ProviderVideoEnvironment describes the credential the process was started
+// with. The Settings page shows it as the fallback that keeps working until
+// someone saves a configuration of their own.
+type ProviderVideoEnvironment struct {
+	Configured bool
+	Model      string
+	BaseURL    string
 }
 
 type ReadinessChecker interface {
@@ -65,12 +79,19 @@ type Dependencies struct {
 	Uploads           AssetUploadManager
 	Intakes           GeneratedIntakeManager
 	Creative          CreativeManager
+	ProductionCenter  creative.ProductionCenterQuery
+	ProductionAssets  creative.ProductionAssetQuery
+	ProductionRetry   creative.ProductionRetryCommand
 	Sessions          SessionManager
 	Knowledge         KnowledgeManager
 	RemixPlans        RemixPlanManager
 	Evals             EvalManager
 	AgentRuns         AgentRunManager
 	ProviderConfig    ProviderConfigurationReader
+	// ProviderVideoConfiguration and ProviderVideoEnvironment together back the
+	// video model card in the Settings page.
+	ProviderVideoConfiguration ProviderVideoConfigurationStore
+	ProviderVideoEnvironment   ProviderVideoEnvironment
 	// AuthenticatedDomainMounts allow vertical systems to share the platform
 	// listener and identity context without making this package import them.
 	// Mount handlers remain responsible for project authorization and scopes.
@@ -190,11 +211,27 @@ type KnowledgeManager interface {
 	ImportDocument(context.Context, contract.ActorContext, contract.ProjectID, knowledge.ImportDocumentRequest) (knowledge.Document, error)
 	ListDocuments(context.Context, contract.ActorContext, contract.ProjectID, int) ([]knowledge.Document, error)
 	GetDocument(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.Document, error)
+	GetDocumentPreview(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.DocumentPreview, error)
+	GetDocumentVisionFallbackCapability(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.DocumentVisionFallbackCapabilityView, error)
+	OpenDocumentContent(context.Context, contract.ActorContext, contract.ProjectID, string) (io.ReadCloser, assets.ObjectInfo, string, error)
+	ExtractDocumentMedia(context.Context, contract.ActorContext, contract.ProjectID, string) ([]knowledge.ExtractedDocumentMedia, error)
+	OpenDocumentOriginal(context.Context, contract.ActorContext, contract.ProjectID, string) (io.ReadCloser, knowledge.Document, error)
 	Search(context.Context, contract.ActorContext, contract.ProjectID, knowledge.SearchRequest) ([]knowledge.SearchResult, error)
 	CreateDocument(context.Context, contract.ActorContext, contract.ProjectID, string, string, io.Reader, int64) (knowledge.Document, error)
+	CancelDocumentParse(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.JobControl, error)
+	RetryDocumentParse(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.Document, error)
+	RunDocumentVisionFallback(context.Context, contract.ActorContext, contract.ProjectID, string, knowledge.RunDocumentVisionFallbackRequest) (knowledge.Document, error)
+	ListDocumentVisionReconciliationCandidates(context.Context, contract.ActorContext, contract.ProjectID, int) ([]knowledge.DocumentVisionReconciliationCandidate, error)
+	GetDocumentVisionReconciliation(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.DocumentVisionReconciliation, error)
+	ProposeDocumentVisionReconciliation(context.Context, contract.ActorContext, contract.ProjectID, string, knowledge.ProposeDocumentVisionReconciliationRequest) (knowledge.DocumentVisionReconciliation, error)
+	ConfirmDocumentVisionReconciliation(context.Context, contract.ActorContext, contract.ProjectID, string, knowledge.ConfirmDocumentVisionReconciliationRequest) (knowledge.DocumentVisionReconciliation, error)
 	RunResearch(context.Context, contract.ActorContext, contract.ProjectID, knowledge.ResearchRequest) (knowledge.ResearchRun, error)
 	GetResearchRun(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.ResearchRun, error)
 	ListResearchRuns(context.Context, contract.ActorContext, contract.ProjectID, int) ([]knowledge.ResearchRun, error)
+	ListResearchFindings(context.Context, contract.ActorContext, contract.ProjectID, string) ([]knowledge.ResearchFinding, error)
+	GetResearchReport(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.ResearchArtifact, error)
+	CancelResearch(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.JobControl, error)
+	RetryResearch(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.ResearchRun, error)
 	ListResearchArtifacts(context.Context, contract.ActorContext, contract.ProjectID, string, int) ([]knowledge.ResearchArtifact, error)
 	GetResearchArtifact(context.Context, contract.ActorContext, contract.ProjectID, string) (knowledge.ResearchArtifact, error)
 }
@@ -233,6 +270,7 @@ type CreativeManager interface {
 	ComposeBrandFilmPreview(context.Context, contract.RequestContext, contract.ProjectID, string, creative.ComposeBrandFilmPreviewRequest) (creative.TaskDetail, error)
 	PrepareBrandFilmAudio(context.Context, contract.ActorContext, contract.ProjectID, string, creative.BrandFilmRevisionRequest) (creative.TaskDetail, error)
 	MaterializeBrandFilmAudioAssets(context.Context, contract.RequestContext, contract.ProjectID, string, creative.BrandFilmRevisionRequest) (creative.TaskDetail, error)
+	GenerateBrandFilmSoundAssets(context.Context, contract.RequestContext, contract.ProjectID, string, creative.BrandFilmRevisionRequest) (creative.TaskDetail, error)
 	UpdateBrandFilmAudioMix(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateBrandAudioMixRequest) (creative.TaskDetail, error)
 	SelectBrandFilmAudioVariant(context.Context, contract.ActorContext, contract.ProjectID, string, creative.SelectBrandAudioVariantRequest) (creative.TaskDetail, error)
 	RenderBrandFilmAudioPreview(context.Context, contract.RequestContext, contract.ProjectID, string, creative.BrandFilmRevisionRequest) (creative.TaskDetail, error)
@@ -250,6 +288,7 @@ type CreativeManager interface {
 	CreateTask(context.Context, contract.ActorContext, contract.ProjectID, string, creative.CreateTaskRequest) (creative.CreativeTask, error)
 	CreateVideoTask(context.Context, contract.ActorContext, contract.ProjectID, string, creative.CreateVideoTaskRequest) (creative.CreativeTask, error)
 	ListTasks(context.Context, contract.ActorContext, contract.ProjectID, int) ([]creative.CreativeTask, error)
+	RenameTask(context.Context, contract.ActorContext, contract.ProjectID, string, creative.RenameTaskRequest) (creative.CreativeTask, error)
 	GetTaskDetail(context.Context, contract.ActorContext, contract.ProjectID, string) (creative.TaskDetail, error)
 	GetLatestShortDramaWorkspace(context.Context, contract.ActorContext, contract.ProjectID) (creative.TaskDetail, error)
 	SelectShortDramaCandidate(context.Context, contract.ActorContext, contract.ProjectID, string, creative.SelectShortDramaCandidateRequest) (creative.TaskDetail, error)
@@ -263,8 +302,10 @@ type CreativeManager interface {
 	GamePrerollProviderInput(context.Context, contract.ActorContext, contract.ProjectID, string) (provider.VideoGenerationInput, string, error)
 	RegisterGamePrerollGenerationAttempt(context.Context, contract.ActorContext, contract.ProjectID, string, string) (creative.GamePrerollGenerationAttempt, error)
 	AnalyzeViralRemake(context.Context, contract.ActorContext, contract.ProjectID, string) (creative.TaskDetail, error)
+	UpdateViralInput(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateViralInputRequest) (creative.TaskDetail, error)
 	UpdateViralPrompt(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateViralPromptRequest) (creative.TaskDetail, error)
 	ConfirmViralGeneration(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ConfirmViralGenerationRequest) (creative.TaskDetail, error)
+	RetryViralWithoutReferenceImage(context.Context, contract.ActorContext, contract.ProjectID, string, creative.RetryViralWithoutReferenceImageRequest) (creative.TaskDetail, error)
 	ViralProviderInput(context.Context, contract.ActorContext, contract.ProjectID, string) (provider.VideoGenerationInput, string, error)
 	RegisterViralCandidateJob(context.Context, contract.ActorContext, contract.ProjectID, string, string) (creative.TaskDetail, error)
 	ReconcileViralCandidate(context.Context, contract.ActorContext, contract.ProjectID, string, contract.ProviderJob) (creative.TaskDetail, error)
@@ -297,6 +338,15 @@ type ProviderConfigurationReader interface {
 	ListCapabilities(context.Context, contract.OrganizationID) ([]provider.CapabilityStatus, error)
 }
 
+// ProviderVideoConfigurationStore backs the Settings page. Reads never return
+// the stored API key, and writes only land after the credential has been
+// probed against the upstream service.
+type ProviderVideoConfigurationStore interface {
+	GetVideoConfiguration(context.Context, contract.OrganizationID) (provider.VideoConfiguration, error)
+	VerifyVideoConfiguration(context.Context, contract.OrganizationID, provider.VideoConfigurationInput) (provider.VideoProbeResult, error)
+	SaveVideoConfiguration(context.Context, contract.OrganizationID, provider.VideoConfigurationInput) (provider.VideoConfiguration, error)
+}
+
 // New retains the bootstrap construction path for focused HTTP tests. The
 // application uses NewWithDependencies so readiness and project checks are real.
 func New(resolver identity.Resolver) *Server {
@@ -316,9 +366,10 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 		identities: dependencies.Identities, accounts: dependencies.Accounts, projects: dependencies.Projects,
 		projectMembers: dependencies.ProjectMembers, uploads: dependencies.Uploads,
 		intakes: dependencies.Intakes, newID: newRequestID,
-		creative: dependencies.Creative, sessions: dependencies.Sessions, knowledge: dependencies.Knowledge,
+		creative: dependencies.Creative, productionCenter: dependencies.ProductionCenter, productionAssets: dependencies.ProductionAssets, productionRetry: dependencies.ProductionRetry, sessions: dependencies.Sessions, knowledge: dependencies.Knowledge,
 		remixPlans: dependencies.RemixPlans, evals: dependencies.Evals, agentRuns: dependencies.AgentRuns,
 		providerConfig: dependencies.ProviderConfig,
+		providerVideo:  dependencies.ProviderVideoConfiguration, providerVideoEnv: dependencies.ProviderVideoEnvironment,
 	}
 	server.mux = http.NewServeMux()
 	server.mux.HandleFunc("GET /healthz", server.health)
@@ -334,6 +385,9 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("POST /platform/v1/organizations/{organization_id}/members", server.requireAuthentication(server.requireScope("organization.members.manage", http.HandlerFunc(server.addOrganizationMember))))
 	server.mux.Handle("PATCH /platform/v1/organizations/{organization_id}/members/{user_id}", server.requireAuthentication(server.requireScope("organization.members.manage", http.HandlerFunc(server.updateOrganizationMember))))
 	server.mux.Handle("GET /platform/v1/provider/capabilities", server.requireAuthentication(http.HandlerFunc(server.providerCapabilities)))
+	server.mux.Handle("GET /platform/v1/provider/video-configuration", server.requireAuthentication(http.HandlerFunc(server.readVideoConfiguration)))
+	server.mux.Handle("PUT /platform/v1/provider/video-configuration", server.requireAuthentication(server.requireScope("provider.configuration.write", http.HandlerFunc(server.saveVideoConfiguration))))
+	server.mux.Handle("POST /platform/v1/provider/video-configuration/verification", server.requireAuthentication(server.requireScope("provider.configuration.write", http.HandlerFunc(server.verifyVideoConfiguration))))
 	server.mux.Handle("POST /platform/v1/brands", server.requireAuthentication(server.requireScope("project.write", http.HandlerFunc(server.createBrand))))
 	server.mux.Handle("POST /platform/v1/projects", server.requireAuthentication(server.requireScope("project.write", http.HandlerFunc(server.createProject))))
 	server.mux.Handle("GET /platform/v1/projects", server.requireAuthentication(server.requireScope("project.read", http.HandlerFunc(server.listProjects))))
@@ -382,10 +436,26 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/documents", server.requireProject(server.requireScope(knowledge.ScopeWrite, http.HandlerFunc(server.knowledgeDocumentEntry))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/documents", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.listKnowledgeDocuments))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/documents/{document_id}", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.getKnowledgeDocument))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/preview", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.previewKnowledgeDocument))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/visual-fallback-capability", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.getKnowledgeDocumentVisionFallbackCapability))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/content", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.knowledgeDocumentContent))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/cancel", server.requireProject(server.requireScope(knowledge.ScopeWrite, http.HandlerFunc(server.cancelKnowledgeDocumentParse))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/retry", server.requireProject(server.requireScope(knowledge.ScopeWrite, http.HandlerFunc(server.retryKnowledgeDocumentParse))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/run-visual-fallback", server.requireProject(server.requireScope(knowledge.ScopeWrite, http.HandlerFunc(server.runKnowledgeDocumentVisionFallback))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/vision-reconciliations", server.requireProject(server.requireScope(knowledge.ScopeDocumentVisionReconcile, http.HandlerFunc(server.proposeKnowledgeDocumentVisionReconciliation))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/document-vision-reconciliation-candidates", server.requireProject(server.requireScope(knowledge.ScopeDocumentVisionReconcile, http.HandlerFunc(server.listKnowledgeDocumentVisionReconciliationCandidates))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/document-vision-reconciliations/{reconciliation_id}", server.requireProject(server.requireScope(knowledge.ScopeDocumentVisionReconcile, http.HandlerFunc(server.getKnowledgeDocumentVisionReconciliation))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/document-vision-reconciliations/{reconciliation_id}/confirm", server.requireProject(server.requireScope(knowledge.ScopeDocumentVisionReconcile, http.HandlerFunc(server.confirmKnowledgeDocumentVisionReconciliation))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/media:extract", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.extractKnowledgeDocumentMedia))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/documents/{document_id}/original", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.openKnowledgeDocumentOriginal))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/search", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.searchKnowledge))))
 	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/research-runs", server.requireProject(server.requireScope("strategy.write", http.HandlerFunc(server.runKnowledgeResearch))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/research-runs", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.listKnowledgeResearchRuns))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/research-runs/{research_run_id}", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.getKnowledgeResearchRun))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/research-runs/{research_run_id}/findings", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.listKnowledgeResearchFindings))))
+	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/research-runs/{research_run_id}/report", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.getKnowledgeResearchReport))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/research-runs/{research_run_id}/cancel", server.requireProject(server.requireScope("strategy.write", http.HandlerFunc(server.cancelKnowledgeResearch))))
+	server.mux.Handle("POST /platform/v1/projects/{project_id}/knowledge/research-runs/{research_run_id}/retry", server.requireProject(server.requireScope("strategy.write", http.HandlerFunc(server.retryKnowledgeResearch))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/research-artifacts", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.listKnowledgeResearchArtifacts))))
 	server.mux.Handle("GET /platform/v1/projects/{project_id}/knowledge/research-artifacts/{artifact_id}", server.requireProject(server.requireScope(knowledge.ScopeRead, http.HandlerFunc(server.getKnowledgeResearchArtifact))))
 	server.mux.Handle("POST /platform/v1/projects/{project_id}/remix-plans", server.requireProject(server.requireScope(remix.ScopePlanWrite, http.HandlerFunc(server.createRemixPlan))))
@@ -425,6 +495,8 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-brief", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getCreativeBrandBrief))))
 	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-brief", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.updateCreativeBrandBrief))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-brief:confirm", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.confirmCreativeBrandBrief))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-workflow", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getCreativeStrategyBrandWorkflow))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-workflow:prepare", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.prepareCreativeStrategyBrandWorkflow))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/direction-candidate-batches/latest", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getLatestCreativeDirectionBatch))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/direction-candidate-batches", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.createCreativeDirectionBatch))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-directions/{direction_id}/confirm", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.confirmCreativeDirection))))
@@ -435,6 +507,7 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-workspaces/brand-film:ensure-fixture", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.ensureBrandFilmFixtureWorkspace))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/ai-native-ads/requirements:analyze", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.analyzeAINativeRequirement))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/ai-native-ads/products:resolve", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.resolveAINativeProductPreview))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/ai-native-ads/output-presets", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.listAINativeOutputPresets))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/ai-native-ads", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.listAINativeAdWorkspaces))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/ai-native-ads:latest", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getLatestAINativeRequirementWorkspace))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/ai-native-ads/{workspace_id}", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getAINativeRequirementWorkspace))))
@@ -459,6 +532,12 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/ai-native-ads/{workspace_id}/production:cancel", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.cancelAINativeProduction))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-intakes/{intake_action}", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.createCreativeTask))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.listCreativeTasks))))
+	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/metadata", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.renameCreativeTask))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/production-runs", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.listProductionRuns))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/production-runs/{production_source}/{production_run_id}", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getProductionRun))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/production-runs/{production_source}/{production_run_action}", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.retryProductionRun))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/production-assets", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.listProductionAssets))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/edit-tasks", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.listEditTasks))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/edit-tasks", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.createEditTask))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/edit-tasks/{edit_task_id}", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getEditTask))))
 	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/edit-tasks/{edit_task_id}/timeline", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.saveEditTimeline))))
@@ -474,6 +553,8 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-workspaces/commerce-preroll", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getLatestCommercePrerollWorkspace))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-workspaces/short-drama-preroll", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getLatestShortDramaPrerollWorkspace))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-workspaces/game-preroll", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getLatestGamePrerollWorkspace))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/game-preroll-workspaces", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.gamePrerollV2))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/game-preroll-workspaces/{task_id}", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.gamePrerollV2))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-workspaces/brand-film", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getLatestBrandFilmWorkspace))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getBrandFilmWorkspace))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:initialize-from-strategy", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.initializeStrategyBrandFilmWorkspace))))
@@ -494,6 +575,7 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film/audio", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getBrandFilmAudio))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:prepare-audio", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.prepareBrandFilmAudio))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:materialize-audio-assets", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.materializeBrandFilmAudioAssets))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:generate-sound-assets", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.generateBrandFilmSoundAssets))))
 	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film/audio/mix", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.updateBrandFilmAudioMix))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film/audio:select-variant", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.selectBrandFilmAudioVariant))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:render-audio-preview", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.renderBrandFilmAudioPreview))))
@@ -509,6 +591,20 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/commerce-preroll", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getCommercePrerollWorkspace))))
 	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/commerce-preroll-draft", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.updateCommercePrerollDraft))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/commerce-preroll:confirm-generation", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.confirmCommerceGeneration))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/commerce-preroll-v2:latest", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.commercePrerollV2))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/commerce-preroll-v2", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.commercePrerollV2))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/commerce-preroll-v2", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.commercePrerollV2))))
+	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/commerce-preroll-v2/versions", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.commercePrerollV2))))
+	for _, action := range []string{
+		"analyze-source", "confirm-understanding", "generate-hooks", "select-hook",
+		"prepare-references", "bind-product-reference", "select-product-reference",
+		"update-storyboard", "update-prompt", "save-version", "restore-version",
+		"bind-custom-first-frame", "generate-first-frames", "reconcile-first-frame",
+		"select-first-frame", "generate-video", "reconcile-video", "adopt-output",
+	} {
+		pattern := "POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/commerce-preroll-v2:" + action
+		server.mux.Handle(pattern, server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.commercePrerollV2))))
+	}
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll:select-candidate", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.selectShortDramaCandidate))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll:regenerate-candidates", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.regenerateShortDramaCandidates))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:analyze-source", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
@@ -517,6 +613,10 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:select-direction", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:update-prompts", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:prepare-opening-frame", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:generate-reference-boards", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:reconcile-reference-board", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:retry-reference-board-candidate", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:select-reference-board", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:generate-first-frames", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:reconcile-first-frame", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/short-drama-preroll-v2:select-first-frame", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.shortDramaV2Command))))
@@ -528,9 +628,14 @@ func NewWithDependencies(dependencies Dependencies) *Server {
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/game-preroll:select-candidate", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.selectGamePrerollCandidate))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/game-preroll:prepare-evidence", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.prepareGamePrerollEvidence))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/game-preroll:regenerate-candidates", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.regenerateGamePrerollCandidates))))
+	for _, action := range []string{"analyze-source", "confirm-brief", "plan-candidates", "update-generation-config", "select-candidate", "prepare-evidence", "generate-video", "reconcile-video"} {
+		server.mux.Handle("POST /api/creative/v1/projects/{project_id}/game-preroll-workspaces/{task_id}/actions/"+action, server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.gamePrerollV2))))
+	}
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake:analyze-reference", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.analyzeViralRemake))))
+	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake/input-draft", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.updateViralInput))))
 	server.mux.Handle("PATCH /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake/prompt-draft", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.updateViralPrompt))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake:confirm-generation", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.confirmViralGeneration))))
+	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake:retry-without-reference-image", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.retryViralWithoutReferenceImage))))
 	server.mux.Handle("POST /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake/candidates/{candidate_action}", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.transitionViralCandidate))))
 	server.mux.Handle("GET /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}", server.requireProject(server.requireScope(creative.ScopeRead, http.HandlerFunc(server.getCreativeTask))))
 	server.mux.Handle("DELETE /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}", server.requireProject(server.requireScope(creative.ScopeWrite, http.HandlerFunc(server.archiveCreativeTask))))
@@ -825,7 +930,7 @@ func (s *Server) createKnowledgeDocument(writer http.ResponseWriter, request *ht
 	file, header, err := request.FormFile("file")
 	if err != nil {
 		writeProblem(writer, http.StatusBadRequest, contract.Error{
-			Code: "INVALID_DOCUMENT", Message: "必须提供名为 file 的 .md 或 .docx 文件",
+			Code: "INVALID_DOCUMENT", Message: "必须提供名为 file 的 MD、TXT、DOCX、XLSX 或 PDF 文件",
 			RequestID: requestContext.RequestID, Retryable: false,
 		})
 		return
@@ -837,7 +942,7 @@ func (s *Server) createKnowledgeDocument(writer http.ResponseWriter, request *ht
 	)
 	if errors.Is(err, knowledge.ErrInvalidDocument) {
 		writeProblem(writer, http.StatusBadRequest, contract.Error{
-			Code: "INVALID_DOCUMENT", Message: "仅支持有效的 .md 或 .docx，单个文件不超过 10MB",
+			Code: "INVALID_DOCUMENT", Message: "仅支持有效的 MD、TXT、DOCX、XLSX 或 PDF，单个文件不超过 10MB",
 			RequestID: requestContext.RequestID, Retryable: false,
 		})
 		return
@@ -896,10 +1001,19 @@ func (s *Server) runKnowledgeResearch(writer http.ResponseWriter, request *http.
 		return
 	}
 	status := http.StatusCreated
-	if value.Status == "running" {
+	if researchResponseIsActive(value.Status) {
 		status = http.StatusAccepted
 	}
 	writeJSON(writer, status, value)
+}
+
+func researchResponseIsActive(status string) bool {
+	switch status {
+	case "queued", "planning", "searching", "reading", "cross_checking", "drafting", "auditing":
+		return true
+	default:
+		return false
+	}
 }
 
 type modelJobCreateBody struct {

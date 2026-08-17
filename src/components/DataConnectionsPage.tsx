@@ -97,7 +97,7 @@ const mappingStatusLabels: Record<string, string> = {
 }
 
 const emptyHints: Record<ViewTarget, string> = {
-  sources: '当前 Project 还没有接入任何数据源。用右侧的表单接一个，接入后才谈得上投后分析。',
+  sources: '当前 Project 还没有接入任何数据源。点右上角「接入数据源」接一个，接入后才谈得上投后分析。',
   imports: '还没有人工发起过导入。文件导入、历史回补和更正批次会出现在这里。',
   'field-mapping': '还没有数据源，也就没有字段映射可配。字段映射把平台报表的列名对到统一指标名，没配完不允许导入。',
   'asset-mapping': '还没有平台对象回流。素材映射决定一条花费能不能算到某个素材头上，认不出来的会留在待匹配。',
@@ -113,6 +113,10 @@ export function DataConnectionsPage({ state, activeView }: { state: DataState; a
   // 改归属时要从现有素材版本里挑，不能让人手填 ID。只在素材映射视图取。
   const [assets, setAssets] = useState<ApiInsightAsset[]>([])
   const [selectedId, setSelectedId] = useState('')
+  // 新建数据源是一个独立的模式，不和详情并排。两者都住在右栏，同时出现时
+  // 上下两组长得一样的表单会被读成「上面是这条的字段、下面还是这条的字段」，
+  // 而实际上填下面那组是在造第二条数据源。一栏同一时刻只讲一件事。
+  const [creating, setCreating] = useState(false)
   const [query, setQuery] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
@@ -154,7 +158,7 @@ export function DataConnectionsPage({ state, activeView }: { state: DataState; a
   }, [currentProject.id, target])
 
   useEffect(() => { void loadList() }, [loadList])
-  useEffect(() => { setNotice(''); setQuery('') }, [target])
+  useEffect(() => { setNotice(''); setQuery(''); setCreating(false) }, [target])
 
   const matches = (text: string) => text.toLowerCase().includes(query.trim().toLowerCase())
 
@@ -217,7 +221,13 @@ export function DataConnectionsPage({ state, activeView }: { state: DataState; a
             <h2>{headings[target].title}</h2>
             <p>当前 Project：{currentProject.name}。{headings[target].blurb}</p>
           </div>
-          <button className="secondary-button" disabled={listState === 'loading'} onClick={() => { void loadList() }}><RefreshCw size={15}/>刷新</button>
+          <div className="core-flow-actions">
+            {target === 'sources'
+              ? <button className="secondary-button" disabled={busy}
+                onClick={() => setCreating(current => !current)}><Plug size={15}/>{creating ? '取消接入' : '接入数据源'}</button>
+              : null}
+            <button className="secondary-button" disabled={listState === 'loading'} onClick={() => { void loadList() }}><RefreshCw size={15}/>刷新</button>
+          </div>
         </div>
         <div className="prelaunch-filterbar">
           <div className="search-field"><Search size={15}/><input aria-label="搜索" value={query} onChange={event => setQuery(event.target.value)} placeholder={headings[target].search}/></div>
@@ -230,7 +240,8 @@ export function DataConnectionsPage({ state, activeView }: { state: DataState; a
           {listState === 'ready' && !rowCount ? <div className="panel-empty">{emptyHints[target]}</div> : null}
 
           {(target === 'sources' || target === 'field-mapping') && visibleSources.map(source =>
-            <button role="listitem" key={source.id} className={selectedId === source.id ? 'prelaunch-row active' : 'prelaunch-row'} onClick={() => setSelectedId(source.id)}>
+            <button role="listitem" key={source.id} className={selectedId === source.id ? 'prelaunch-row active' : 'prelaunch-row'}
+              onClick={() => { setSelectedId(source.id); setCreating(false) }}>
               <span><b>{sourceName(source)}</b><small>{ingestModeLabels[source.ingest_mode]} · {source.account_ref || '未填账户标识'} · 更新于 {formatTime(source.updated_at)}</small></span>
               <span>{target === 'field-mapping' ? `${Object.keys(source.field_mapping ?? {}).length} 个字段` : statusLabels[source.status]}</span>
               <span>{target === 'field-mapping'
@@ -247,19 +258,29 @@ export function DataConnectionsPage({ state, activeView }: { state: DataState; a
               <span>{batchTrouble(batch) ? <CircleAlert size={14}/> : <CircleCheck size={14}/>}{importKindLabels[batch.kind] ?? batch.kind}</span>
             </button>)}
 
-          {target === 'asset-mapping' && visibleMappings.map(mapping =>
-            <button role="listitem" key={mapping.id} className={selectedId === mapping.id ? 'prelaunch-row active' : 'prelaunch-row'} onClick={() => setSelectedId(mapping.id)}>
+          {target === 'asset-mapping' && visibleMappings.map(mapping => {
+            // 归属列要给名字。素材短号（ast_9f3c…）在这一列里认不出是哪条创意，
+            // 而这一列问的正是「这笔钱花在哪条创意上」。
+            const owner = mapping.asset_id ? assets.find(asset => asset.id === mapping.asset_id) : undefined
+            return <button role="listitem" key={mapping.id} className={selectedId === mapping.id ? 'prelaunch-row active' : 'prelaunch-row'} onClick={() => setSelectedId(mapping.id)}>
               <span><b>{mapping.platform_object_name || mapping.platform_object_id}</b><small>{platformLabels[mapping.platform as ApiPlatform] ?? mapping.platform} · {mapping.platform_object_kind} · {mapping.platform_object_id}</small></span>
               <span>{mappingStatusLabels[mapping.status] ?? mapping.status}</span>
-              <span>{mapping.asset_id ? `已归到素材 ${shortId(mapping.asset_id)}` : mapping.note || '还没认领，花费计入总盘但不算到任何素材头上'}</span>
-              <span>{mapping.status === 'matched' ? <CircleCheck size={14}/> : <CircleAlert size={14}/>}v{mapping.version}</span>
-            </button>)}
+              <span>{mapping.asset_id
+                ? owner ? owner.title : `素材 ${shortId(mapping.asset_id)}（已不在当前列表里）`
+                : mapping.note || '还没认领，花费计入总盘但不算到任何素材头上'}</span>
+              <span>
+                {mapping.status === 'matched' ? <CircleCheck size={14}/> : <CircleAlert size={14}/>}
+                {owner ? `第 ${owner.revision} 版` : mapping.asset_id ? '查不到版本' : '未认领'}
+              </span>
+            </button>
+          })}
         </div>
       </section>
 
       <aside className="prelaunch-detail">
         {target === 'sources' ? <DataSourceDetail source={selectedSource} busy={busy} projectId={currentProject.id}
-          onWrite={runWrite} onCreated={() => { void loadList() }}/> : null}
+          creating={creating} onCancelCreate={() => setCreating(false)}
+          onWrite={runWrite} onCreated={() => setCreating(false)}/> : null}
         {target === 'field-mapping' ? <FieldMappingDetail source={selectedSource} busy={busy} projectId={currentProject.id} onWrite={runWrite}/> : null}
         {target === 'imports' ? <ImportDetail batch={selectedBatch} sources={sources} busy={busy} projectId={currentProject.id} onWrite={runWrite}/> : null}
         {target === 'syncs' ? <SyncDetail batch={selectedBatch} sources={sources}/> : null}
@@ -273,10 +294,12 @@ export function DataConnectionsPage({ state, activeView }: { state: DataState; a
 
 // --- 数据源 ---
 
-function DataSourceDetail({ source, busy, projectId, onWrite, onCreated }: {
+function DataSourceDetail({ source, busy, projectId, creating, onCancelCreate, onWrite, onCreated }: {
   source?: ApiDataSource
   busy: boolean
   projectId: string
+  creating: boolean
+  onCancelCreate: () => void
   onWrite: (label: string, work: () => Promise<unknown>, explain?: (code: string) => string) => Promise<void>
   onCreated: () => void
 }) {
@@ -309,39 +332,11 @@ function DataSourceDetail({ source, busy, projectId, onWrite, onCreated }: {
 
   const mappedFields = Object.keys(source?.field_mapping ?? {}).length
 
-  return <>
-    {source ? <>
-      <span className="section-label">当前数据源</span><h3>{sourceName(source)}</h3>
-      <p>{ingestModeLabels[source.ingest_mode]} · {statusLabels[source.status]} · v{source.version}</p>
-      <div className="prelaunch-fact"><Database size={17}/><span><small>口径</small><b>{source.caliber.currency} · 归因 {source.caliber.attribution_window} · 指标口径 {source.caliber.metric_schema_version} · 时区 {source.caliber.time_zone}</b></span></div>
-      <div className="prelaunch-fact"><Link2 size={17}/><span><small>数据覆盖到</small><b>{source.data_through ? formatDate(source.data_through) : '还没有任何数据'}{source.last_synced_at ? ` · 最近同步 ${formatTime(source.last_synced_at)}` : ''}</b></span></div>
-      {sourceTrouble(source) ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>{qualityLabels[source.quality_status]}</small>{source.quality_note || '这个状态会阻止它的数字生成强结论，也不会触发自动优化动作。'}</span></div> : null}
-      {!mappedFields ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>字段映射未配置</small>没配完字段映射不允许导入，也不能启用。去「字段映射」视图补齐。</span></div> : null}
-
-      <label className="experience-reason">
-        <small>质量状态（正常以外必须写原因，会显示在每一张用到它的图旁边）</small>
-        <select value={qualityStatus} onChange={event => setQualityStatus(event.target.value as ApiQualityStatus)}>
-          {Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-        </select>
-        <textarea value={qualityNote} onChange={event => setQualityNote(event.target.value)} rows={2} placeholder="例如：平台报表延迟一天，今天的数字还会变。"/>
-      </label>
-      <div className="prelaunch-actions">
-        <button className="secondary-button full" disabled={busy} onClick={() => void onWrite('质量状态', () =>
-          api.setDataSourceQuality(projectId, source.id, {
-            expected_version: source.version, quality_status: qualityStatus, note: qualityNote.trim(),
-          }))}>{busy ? '处理中…' : '记录质量状态'}</button>
-        {source.status === 'active'
-          ? <button className="secondary-button full" disabled={busy} onClick={() => void onWrite('暂停', () =>
-            api.updateDataSource(projectId, source.id, { expected_version: source.version, status: 'paused' }))}>暂停同步</button>
-          : <button className="primary-button full" disabled={busy || !mappedFields} onClick={() => void onWrite('启用', () =>
-            api.updateDataSource(projectId, source.id, { expected_version: source.version, status: 'active' }))}>{mappedFields ? '启用数据源' : '先配字段映射'}</button>}
-      </div>
-    </> : <div className="panel-empty">左侧选一个数据源查看口径、新鲜度和质量状态。</div>}
-
-    <div className="feature-stack">
-      <span>接入一个新数据源</span>
-      <b>新接入的数据源是「未启用」，配完字段映射才能启用——这是防止半配好的映射把脏数据导进来。</b>
-    </div>
+  // 新建模式独占右栏：接入表单和某条数据源的详情不同时出现，避免两组同样的
+  // 字段读成同一件事，也避免「启用数据源」和「接入数据源」两个主按钮并排。
+  if (creating) return <>
+    <span className="section-label">接入一个新数据源</span><h3>这个账户的数据从哪来</h3>
+    <p>新接入的数据源是「未启用」，配完字段映射才能启用——这是防止半配好的映射把脏数据导进来。</p>
     <label className="experience-reason">
       <small>平台</small>
       <select value={platform} onChange={event => setPlatform(event.target.value as ApiPlatform)}>
@@ -370,7 +365,38 @@ function DataSourceDetail({ source, busy, projectId, onWrite, onCreated }: {
     <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>这里不要粘凭据</small>只填密钥服务里的引用键，凭据不进业务库。含 bearer、access_token、refresh_token、secret、password 字样或超过 128 字的值会被后端直接拒绝。</span></div>
     <div className="prelaunch-actions">
       <button className="primary-button full" disabled={busy} onClick={() => void register()}><Plug size={15}/>{busy ? '处理中…' : '接入数据源'}</button>
+      <button className="secondary-button full" disabled={busy} onClick={onCancelCreate}>取消</button>
     </div>
+  </>
+
+  return <>
+    {source ? <>
+      <span className="section-label">当前数据源</span><h3>{sourceName(source)}</h3>
+      <p>{ingestModeLabels[source.ingest_mode]} · {statusLabels[source.status]} · v{source.version}</p>
+      <div className="prelaunch-fact"><Database size={17}/><span><small>口径</small><b>{source.caliber.currency} · 归因 {source.caliber.attribution_window} · 指标口径 {source.caliber.metric_schema_version} · 时区 {source.caliber.time_zone}</b></span></div>
+      <div className="prelaunch-fact"><Link2 size={17}/><span><small>数据覆盖到</small><b>{source.data_through ? formatDate(source.data_through) : '还没有任何数据'}{source.last_synced_at ? ` · 最近同步 ${formatTime(source.last_synced_at)}` : ''}</b></span></div>
+      {sourceTrouble(source) ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>{qualityLabels[source.quality_status]}</small>{source.quality_note || '这个状态会阻止它的数字算出能归因的结论，也不会触发自动优化动作。'}</span></div> : null}
+      {!mappedFields ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>字段映射未配置</small>没配完字段映射不允许导入，也不能启用。去「字段映射」视图补齐。</span></div> : null}
+
+      <label className="experience-reason">
+        <small>质量状态（正常以外必须写原因，会显示在每一张用到它的图旁边）</small>
+        <select value={qualityStatus} onChange={event => setQualityStatus(event.target.value as ApiQualityStatus)}>
+          {Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+        <textarea value={qualityNote} onChange={event => setQualityNote(event.target.value)} rows={2} placeholder="例如：平台报表延迟一天，今天的数字还会变。"/>
+      </label>
+      <div className="prelaunch-actions">
+        <button className="secondary-button full" disabled={busy} onClick={() => void onWrite('质量状态', () =>
+          api.setDataSourceQuality(projectId, source.id, {
+            expected_version: source.version, quality_status: qualityStatus, note: qualityNote.trim(),
+          }))}>{busy ? '处理中…' : '记录质量状态'}</button>
+        {source.status === 'active'
+          ? <button className="secondary-button full" disabled={busy} onClick={() => void onWrite('暂停', () =>
+            api.updateDataSource(projectId, source.id, { expected_version: source.version, status: 'paused' }))}>暂停同步</button>
+          : <button className="primary-button full" disabled={busy || !mappedFields} onClick={() => void onWrite('启用', () =>
+            api.updateDataSource(projectId, source.id, { expected_version: source.version, status: 'active' }))}>{mappedFields ? '启用数据源' : '先配字段映射'}</button>}
+      </div>
+    </> : <div className="panel-empty">左侧选一个数据源查看口径、新鲜度和质量状态；要接新的，点右上角「接入数据源」。</div>}
   </>
 }
 
@@ -538,8 +564,8 @@ function SyncDetail({ batch, sources }: { batch?: ApiImportBatch; sources: ApiDa
 // --- 素材映射 ---
 
 /**
- * 这里是全部平台对象（含已认领的），所以改归属只能在这一屏做——「分析素材库 ·
- * 待匹配」查的是未认领队列，认领完那条就从队列里消失了。
+ * 这里是全部平台对象（含已认领的），所以改归属只能在这一屏做：别处列的都是
+ * 未认领队列，认领完那条就从队列里消失了，想改回来就再也找不到它。
  */
 function AssetMappingDetail({ mapping, assets, projectId, onDone }: {
   mapping?: ApiInsightAssetMapping
@@ -548,13 +574,20 @@ function AssetMappingDetail({ mapping, assets, projectId, onDone }: {
   onDone: (message: string) => void
 }) {
   if (!mapping) return <div className="panel-empty">左侧选一个平台对象，查看它归到了哪个素材版本。</div>
+  // 归属这一行以前直接把 asset_id 整串打出来。那串东西回答不了「这笔钱花在哪条创意上」，
+  // 而这正是人点进来要问的。名字在前，短号在后当核对用。
+  const owner = mapping.asset_id ? assets.find(asset => asset.id === mapping.asset_id) : undefined
   return <>
     <span className="section-label">素材映射</span><h3>{mapping.platform_object_name || mapping.platform_object_id}</h3>
     <p>{platformLabels[mapping.platform as ApiPlatform] ?? mapping.platform} · {mapping.platform_object_kind} · {mappingStatusLabels[mapping.status] ?? mapping.status}</p>
-    <div className="prelaunch-fact"><Link2 size={17}/><span><small>归到哪个素材</small><b>{mapping.asset_id ? mapping.asset_id : '还没认领'}</b></span></div>
+    <div className="prelaunch-fact"><Link2 size={17}/><span><small>归到哪个素材</small><b>
+      {!mapping.asset_id ? '还没认领'
+        : owner ? `${owner.title} · 第 ${owner.revision} 版 · ${shortId(owner.id)}`
+        : `${shortId(mapping.asset_id)}（这条素材不在当前列表里，可能已作废）`}
+    </b></span></div>
     <div className="prelaunch-fact"><Database size={17}/><span><small>怎么认的</small><b>{mapping.match_source === 'human' ? `人工指定${mapping.matched_by ? ` · ${mapping.matched_by}` : ''}` : mapping.match_source === 'auto' ? '系统自动匹配' : '尚未匹配'}{mapping.matched_at ? ` · ${formatTime(mapping.matched_at)}` : ''}</b></span></div>
     {mapping.note ? <div className="prelaunch-fact"><CircleCheck size={17}/><span><small>备注</small><b>{mapping.note}</b></span></div> : null}
-    {mapping.status !== 'matched' ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>没认领的后果</small>它的花费仍然计入总盘，但不会算到任何素材头上，也不能支撑「这条创意更好」这类结论。认领在「分析素材库 · 待匹配」里做。</span></div> : null}
+    {mapping.status !== 'matched' ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>没认领的后果</small>它的花费仍然计入总盘，但不会算到任何素材头上，也不能支撑「这条创意更好」这类结论。就在下面那一格里挑素材认领，不用去别处。</span></div> : null}
     <MappingResolveForm key={mapping.id} mapping={mapping} assets={assets} projectId={projectId} onDone={onDone}/>
     {mapping.status === 'matched' ? <div className="prelaunch-boundary"><CircleAlert size={16}/><span><small>改归属会动历史数字</small>这条对象过往所有天的花费都会跟着换主人，不是从今天起才改。原来那一版素材的投后结论如果已经出过报告，报告里的数字不会自动更新——那是定格的快照，得重新出一份。</span></div> : null}
   </>
@@ -589,7 +622,10 @@ const headings: Record<ViewTarget, { title: string; blurb: string; search: strin
     blurb: '认不出来的排在最前面——它的花费算进总盘，但撑不起任何创意级结论。',
     search: '搜索平台对象',
     unit: '个平台对象',
-    columns: ['平台对象', '状态', '归属', '版本'],
+    // 第四列以前写「版本」，显示的却是这条映射记录自己的乐观锁版本号（v3 = 被改过三次）
+    // ——标题问的是「哪个素材版本」，这个数字答的是「这行记录改过几次」，风马牛不相及。
+    // 现在直接给素材版本；一条还没认领的自然没有版本可给。
+    columns: ['平台对象', '状态', '归到哪个素材', '素材第几版'],
   },
   syncs: {
     title: '系统自己跑的每一次同步，成功和失败都留痕',

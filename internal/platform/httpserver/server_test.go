@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/shikanon/cookies/internal/platform/assets"
 	"github.com/shikanon/cookies/internal/platform/contract"
 	"github.com/shikanon/cookies/internal/platform/identity"
+	"github.com/shikanon/cookies/internal/platform/knowledge"
 	"github.com/shikanon/cookies/internal/platform/project"
 	"github.com/shikanon/cookies/internal/platform/provider"
 	"github.com/shikanon/cookies/internal/platform/remix"
@@ -34,6 +36,122 @@ func TestHealthDoesNotRequireIdentity(t *testing.T) {
 	if response.Header().Get("X-Request-ID") == "" {
 		t.Fatal("expected response request ID")
 	}
+}
+
+func TestListEditTasksRouteIsRegistered(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1",
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: "user_1"},
+		Scopes:         []contract.Scope{creative.ScopeRead},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewWithDependencies(Dependencies{
+		Resolver:          resolver,
+		ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"},
+	})
+	response := httptest.NewRecorder()
+
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/creative/v1/projects/project_1/edit-tasks", nil))
+
+	if got, want := response.Code, http.StatusServiceUnavailable; got != want {
+		t.Fatalf("status = %d, want %d; body=%s", got, want, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), `"code":"RESOURCE_NOT_FOUND"`) {
+		t.Fatalf("list route fell through to the 404 handler: %s", response.Body.String())
+	}
+}
+
+func TestKnowledgeOriginalStreamsAuthorizedImmutableBytes(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1",
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: "user_1"},
+		Scopes:         []contract.Scope{knowledge.ScopeRead},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &originalKnowledgeManager{content: "xlsx bytes", document: knowledge.Document{
+		ID: "doc_1", ProjectID: "project_1", Filename: "产品 数据.xlsx",
+		MIMEType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", SizeBytes: 10,
+	}}
+	server := NewWithDependencies(Dependencies{
+		Resolver: resolver, ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"},
+		Knowledge: manager,
+	})
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/platform/v1/projects/project_1/knowledge/documents/doc_1/original", nil))
+
+	if response.Code != http.StatusOK || response.Body.String() != manager.content {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "private, no-store" || response.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("security headers = %#v", response.Header())
+	}
+	if !strings.Contains(response.Header().Get("Content-Disposition"), "attachment") || manager.projectID != "project_1" || manager.documentID != "doc_1" {
+		t.Fatalf("disposition=%q scope=%q/%q", response.Header().Get("Content-Disposition"), manager.projectID, manager.documentID)
+	}
+	denied := httptest.NewRecorder()
+	server.ServeHTTP(denied, httptest.NewRequest(http.MethodGet, "/platform/v1/projects/project_2/knowledge/documents/doc_1/original", nil))
+	if denied.Code != http.StatusForbidden || manager.projectID != "project_1" {
+		t.Fatalf("cross-project status=%d manager project=%q", denied.Code, manager.projectID)
+	}
+}
+
+func TestKnowledgeUploadRejectionListsSupportedFormats(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1", Principal: contract.Principal{Kind: contract.PrincipalUser, ID: "user_1"},
+		Scopes: []contract.Scope{knowledge.ScopeWrite},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &originalKnowledgeManager{createErr: knowledge.ErrInvalidDocument}
+	server := NewWithDependencies(Dependencies{
+		Resolver: resolver, ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"}, Knowledge: manager,
+	})
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	file, err := form.CreateFormFile("file", "design.psd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = file.Write([]byte("unsupported"))
+	if err := form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/platform/v1/projects/project_1/knowledge/documents", &body)
+	request.Header.Set("Content-Type", form.FormDataContentType())
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "TXT") || !strings.Contains(response.Body.String(), "XLSX") || !strings.Contains(response.Body.String(), "PDF") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+type originalKnowledgeManager struct {
+	KnowledgeManager
+	content    string
+	document   knowledge.Document
+	projectID  contract.ProjectID
+	documentID string
+	createErr  error
+}
+
+func (m *originalKnowledgeManager) OpenDocumentOriginal(_ context.Context, _ contract.ActorContext, projectID contract.ProjectID, documentID string) (io.ReadCloser, knowledge.Document, error) {
+	m.projectID, m.documentID = projectID, documentID
+	return io.NopCloser(strings.NewReader(m.content)), m.document, nil
+}
+
+func (m *originalKnowledgeManager) CreateDocument(context.Context, contract.ActorContext, contract.ProjectID, string, string, io.Reader, int64) (knowledge.Document, error) {
+	return knowledge.Document{}, m.createErr
 }
 
 func TestProjectActionClassifiesRoleSensitiveRoutes(t *testing.T) {
@@ -206,10 +324,21 @@ func TestCreativeDomainErrorsAreMappedToActionableHTTPProblems(t *testing.T) {
 		wantRetryable bool
 	}{
 		{name: "invalid state", err: creative.ErrInvalidState, wantStatus: http.StatusConflict, wantCode: "INVALID_STATE"},
+		{name: "edit timeline conflict", err: creative.ErrEditTimelineVersionConflict, wantStatus: http.StatusConflict, wantCode: "EDIT_TIMELINE_VERSION_CONFLICT"},
+		{name: "edit operation conflict", err: creative.ErrOperationVersionConflict, wantStatus: http.StatusConflict, wantCode: "EDIT_OPERATION_VERSION_CONFLICT"},
+		{name: "strategy brand direction required", err: creative.ErrStrategyBrandDirectionRequired, wantStatus: http.StatusConflict, wantCode: "STRATEGY_BRAND_DIRECTION_REQUIRED"},
+		{name: "strategy brand lineage mismatch", err: creative.ErrStrategyBrandLineageMismatch, wantStatus: http.StatusConflict, wantCode: "STRATEGY_BRAND_LINEAGE_MISMATCH"},
+		{name: "strategy brand legacy review", err: creative.ErrStrategyBrandLegacyTaskNeedsReview, wantStatus: http.StatusConflict, wantCode: "STRATEGY_BRAND_LEGACY_TASK_REQUIRES_REVIEW"},
 		{name: "stale version", err: creative.ErrVersionConflict, wantStatus: http.StatusPreconditionFailed, wantCode: "CREATIVE_VERSION_CONFLICT"},
 		{name: "viral source unavailable", err: creative.ErrViralAnalysisSourceUnavailable, wantStatus: http.StatusUnprocessableEntity, wantCode: "VIRAL_ANALYSIS_SOURCE_UNAVAILABLE"},
 		{name: "viral provider unavailable", err: creative.ErrViralAnalysisProviderUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: "VIRAL_ANALYSIS_PROVIDER_UNAVAILABLE", wantRetryable: true},
 		{name: "viral invalid response", err: creative.ErrViralAnalysisResponseInvalid, wantStatus: http.StatusBadGateway, wantCode: "VIRAL_ANALYSIS_RESPONSE_INVALID", wantRetryable: true},
+		{name: "incomplete AI native requirement", err: creative.AINativeRequirementConfirmationError{Issues: []creative.AINativeRequirementFieldIssue{{Field: "media", Code: "PRODUCT_IMAGE_REQUIRED", Message: "链接没有权限提取，需要用户手动上传"}}}, wantStatus: http.StatusBadRequest, wantCode: "AI_NATIVE_REQUIREMENT_INCOMPLETE"},
+		{name: "document vision reconciliation", err: knowledge.ErrDocumentVisionReconciliationRequired, wantStatus: http.StatusConflict, wantCode: "DOCUMENT_VISION_RECONCILIATION_REQUIRED"},
+		{name: "document vision reconciliation forbidden", err: knowledge.ErrDocumentVisionReconciliationForbidden, wantStatus: http.StatusForbidden, wantCode: "DOCUMENT_VISION_RECONCILIATION_FORBIDDEN"},
+		{name: "invalid document vision reconciliation", err: knowledge.ErrDocumentVisionReconciliationInvalid, wantStatus: http.StatusBadRequest, wantCode: "INVALID_DOCUMENT_VISION_RECONCILIATION"},
+		{name: "same document vision operator", err: knowledge.ErrDocumentVisionReconciliationSameActor, wantStatus: http.StatusConflict, wantCode: "DOCUMENT_VISION_RECONCILIATION_SECOND_OPERATOR_REQUIRED"},
+		{name: "document vision reconciliation conflict", err: knowledge.ErrDocumentVisionReconciliationConflict, wantStatus: http.StatusConflict, wantCode: "DOCUMENT_VISION_RECONCILIATION_CONFLICT"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -233,8 +362,92 @@ func TestCreativeDomainErrorsAreMappedToActionableHTTPProblems(t *testing.T) {
 			if problem.Error.Retryable != tt.wantRetryable {
 				t.Fatalf("retryable = %t, want %t", problem.Error.Retryable, tt.wantRetryable)
 			}
+			if tt.name == "incomplete AI native requirement" && (len(problem.Error.Details) != 1 || problem.Error.Details[0].Field != "media") {
+				t.Fatalf("field details = %#v", problem.Error.Details)
+			}
 		})
 	}
+}
+
+func TestStrategyBrandWorkflowRoutesPreserveReadAndWriteSemantics(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1",
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: "user_1"},
+		Scopes:         []contract.Scope{creative.ScopeRead, creative.ScopeWrite},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &creativeManagerStub{brandWorkflow: creative.StrategyBrandWorkflowResult{
+		ContractVersion: creative.StrategyBrandWorkflowV1,
+		Mode:            creative.StrategyBrandDirectionReady, IntakeID: "intake_1",
+		InputIdentityHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Issues:            []creative.StrategyBrandWorkflowIssue{}, NextAction: "generate_directions",
+	}}
+	server := NewWithDependencies(Dependencies{
+		Resolver: resolver, ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"}, Creative: manager,
+	})
+
+	read := httptest.NewRecorder()
+	server.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/creative/v1/projects/project_1/creative-intakes/intake_1/brand-workflow", nil))
+	if read.Code != http.StatusOK || manager.getBrandWorkflowCalls != 1 || manager.prepareBrandWorkflowCalls != 0 {
+		t.Fatalf("GET status/calls=%d/%d/%d body=%s", read.Code, manager.getBrandWorkflowCalls, manager.prepareBrandWorkflowCalls, read.Body.String())
+	}
+
+	body := `{"expected_input_identity_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","selected_route_id":"route_brand","accept_strategy_projection":true}`
+	missingKey := httptest.NewRecorder()
+	server.ServeHTTP(missingKey, httptest.NewRequest(http.MethodPost, "/api/creative/v1/projects/project_1/creative-intakes/intake_1/brand-workflow:prepare", strings.NewReader(body)))
+	if missingKey.Code != http.StatusBadRequest || manager.prepareBrandWorkflowCalls != 0 {
+		t.Fatalf("missing key status/calls=%d/%d body=%s", missingKey.Code, manager.prepareBrandWorkflowCalls, missingKey.Body.String())
+	}
+
+	prepared := httptest.NewRecorder()
+	prepareRequest := httptest.NewRequest(http.MethodPost, "/api/creative/v1/projects/project_1/creative-intakes/intake_1/brand-workflow:prepare", strings.NewReader(body))
+	prepareRequest.Header.Set("Idempotency-Key", "strategy-brand-prepare-sha256-aaaaaaaa")
+	server.ServeHTTP(prepared, prepareRequest)
+	if prepared.Code != http.StatusOK || manager.prepareBrandWorkflowCalls != 1 || manager.prepareBrandWorkflowRequest.SelectedRouteID != "route_brand" {
+		t.Fatalf("POST status/calls/request=%d/%d/%+v body=%s", prepared.Code, manager.prepareBrandWorkflowCalls, manager.prepareBrandWorkflowRequest, prepared.Body.String())
+	}
+}
+
+func TestDocumentVisionReconciliationConfirmationRequiresExplicitDecision(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1",
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: "admin_2"},
+		Scopes:         []contract.Scope{knowledge.ScopeDocumentVisionReconcile},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &knowledge.Service{}
+	server := NewWithDependencies(Dependencies{
+		Resolver: resolver, ProjectAuthorizer: allowingProjectAuthorizer{}, Knowledge: service,
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/platform/v1/projects/project_1/knowledge/document-vision-reconciliations/reconciliation_1/confirm",
+		strings.NewReader(`{}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "INVALID_DOCUMENT_VISION_RECONCILIATION") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+type allowingProjectAuthorizer struct{}
+
+func (allowingProjectAuthorizer) AuthorizeProject(context.Context, contract.ActorContext, contract.ProjectID) error {
+	return nil
+}
+
+func (allowingProjectAuthorizer) AuthorizeProjectAction(context.Context, contract.ActorContext, contract.ProjectID, string) error {
+	return nil
 }
 
 func TestAuthenticatedDomainMountReceivesTrustedRequestContext(t *testing.T) {
@@ -1411,6 +1624,36 @@ func TestGetViralRemakeWorkspaceRestoresPersistedDraft(t *testing.T) {
 	}
 }
 
+func TestRetryViralWithoutReferenceImageForwardsExpectedRevision(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1",
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: "usr_1"},
+		Scopes:         []contract.Scope{creative.ScopeRead, creative.ScopeWrite},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &creativeManagerStub{}
+	server := NewWithDependencies(Dependencies{
+		Resolver: resolver, ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"}, Creative: manager,
+	})
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/creative/v1/projects/project_1/creative-tasks/creative_task_viral/viral-remake:retry-without-reference-image",
+		strings.NewReader(`{"expected_revision":7}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "viral-safe-retry-7")
+	response := httptest.NewRecorder()
+
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || manager.retryViralTaskID != "creative_task_viral" || manager.retryViralRequest.ExpectedRevision != 7 {
+		t.Fatalf("status=%d task=%q request=%+v body=%s", response.Code, manager.retryViralTaskID, manager.retryViralRequest, response.Body.String())
+	}
+}
+
 func TestRegenerateShortDramaCandidatesForwardsVersionedConfig(t *testing.T) {
 	t.Parallel()
 	actor := contract.ActorContext{
@@ -1669,6 +1912,24 @@ func TestGetLatestAINativeWorkspaceRestoresThePersistedStage(t *testing.T) {
 	}
 }
 
+func TestListAINativeOutputPresetsReturnsOnlyManagerCatalog(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{OrganizationID: "org_1", Principal: contract.Principal{Kind: contract.PrincipalUser, ID: "user_1"}, Scopes: []contract.Scope{creative.ScopeRead}}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &creativeManagerStub{aiNativeOutputPresets: []creative.AINativeOutputPreset{{
+		AINativeOutputPresetSnapshot: creative.DefaultAINativeOutputPreset(), Status: creative.AINativeOutputPresetAvailable,
+	}}}
+	server := NewWithDependencies(Dependencies{Resolver: resolver, ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"}, Creative: manager})
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/creative/v1/projects/project_1/ai-native-ads/output-presets", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"id":"douyin_feed_9x16_v1"`) || manager.aiNativeOutputPresetProjectID != "project_1" {
+		t.Fatalf("status=%d project=%q body=%s", response.Code, manager.aiNativeOutputPresetProjectID, response.Body.String())
+	}
+}
+
 func TestGamePrerollWorkspaceRestoresAndForwardsHumanSelection(t *testing.T) {
 	t.Parallel()
 	actor := contract.ActorContext{
@@ -1741,6 +2002,42 @@ func TestGamePrerollWorkspaceRestoresAndForwardsHumanSelection(t *testing.T) {
 		manager.selectedGameRequest.ExpectedRevision != 2 ||
 		manager.selectedGameRequest.CandidateID != "game_candidate_2" {
 		t.Fatalf("game selection was not forwarded: task=%q request=%+v", manager.selectedGameTaskID, manager.selectedGameRequest)
+	}
+}
+
+func TestGamePrerollV2RestoresExactTaskAndForwardsAnalysisRevision(t *testing.T) {
+	t.Parallel()
+	actor := contract.ActorContext{
+		OrganizationID: "org_1",
+		Principal:      contract.Principal{Kind: contract.PrincipalUser, ID: "usr_1"},
+		Scopes:         []contract.Scope{creative.ScopeRead, creative.ScopeWrite},
+	}
+	resolver, err := identity.NewStaticResolver(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &creativeManagerStub{detail: creative.TaskDetail{
+		Task: creative.CreativeTask{ID: "game_task_v2", ProjectID: "project_1"},
+		VideoDraft: &creative.VideoDraft{Revision: 7, GamePreroll: &creative.GamePrerollDraft{
+			ContractVersion: creative.GamePrerollV2ContractVersion, TaskID: "game_task_v2",
+			Revision: 7, Stage: creative.GamePrerollStageSourceReady,
+		}},
+	}}
+	server := NewWithDependencies(Dependencies{
+		Resolver: resolver, ProjectAuthorizer: identity.StaticProjectAuthorizer{ProjectID: "project_1"}, Creative: manager,
+	})
+	getResponse := httptest.NewRecorder()
+	server.ServeHTTP(getResponse, httptest.NewRequest(http.MethodGet, "/api/creative/v1/projects/project_1/game-preroll-workspaces/game_task_v2", nil))
+	if getResponse.Code != http.StatusOK || manager.gameV2TaskID != "game_task_v2" || !strings.Contains(getResponse.Body.String(), creative.GamePrerollV2ContractVersion) {
+		t.Fatalf("restore status=%d task=%q body=%s", getResponse.Code, manager.gameV2TaskID, getResponse.Body.String())
+	}
+	analyze := httptest.NewRequest(http.MethodPost, "/api/creative/v1/projects/project_1/game-preroll-workspaces/game_task_v2/actions/analyze-source", bytes.NewBufferString(`{"expected_revision":7}`))
+	analyze.Header.Set("Content-Type", "application/json")
+	analyze.Header.Set("Idempotency-Key", "game-v2-analyze-1")
+	analyzeResponse := httptest.NewRecorder()
+	server.ServeHTTP(analyzeResponse, analyze)
+	if analyzeResponse.Code != http.StatusOK || manager.gameV2TaskID != "game_task_v2" || manager.gameV2AnalyzeRequest.ExpectedRevision != 7 {
+		t.Fatalf("analyze status=%d task=%q request=%+v body=%s", analyzeResponse.Code, manager.gameV2TaskID, manager.gameV2AnalyzeRequest, analyzeResponse.Body.String())
 	}
 }
 
@@ -2299,9 +2596,13 @@ type creativeManagerStub struct {
 	latestShortDramaProjectID          contract.ProjectID
 	latestAINativeWorkspace            creative.AINativeRequirementWorkspace
 	latestAINativeProjectID            contract.ProjectID
+	aiNativeOutputPresets              []creative.AINativeOutputPreset
+	aiNativeOutputPresetProjectID      contract.ProjectID
 	latestGamePrerollProjectID         contract.ProjectID
 	selectedGameTaskID                 string
 	selectedGameRequest                creative.SelectGamePrerollCandidateRequest
+	gameV2TaskID                       string
+	gameV2AnalyzeRequest               creative.AnalyzeGamePrerollV2SourceRequest
 	createdIntakeRequest               creative.CreateIntakeRequest
 	imageWorkspace                     creative.ImageTextWorkspace
 	imagePrompt                        creative.ImagePromptPackage
@@ -2309,11 +2610,60 @@ type creativeManagerStub struct {
 	preparedImageOrder                 int
 	attachedImageProviderJobID         string
 	failedImageAttemptID               string
+	brandWorkflow                      creative.StrategyBrandWorkflowResult
+	getBrandWorkflowCalls              int
+	prepareBrandWorkflowCalls          int
+	prepareBrandWorkflowRequest        creative.PrepareStrategyBrandWorkflowRequest
+	retryViralTaskID                   string
+	retryViralRequest                  creative.RetryViralWithoutReferenceImageRequest
+}
+
+func (s *creativeManagerStub) CreateGamePrerollV2Workspace(context.Context, contract.RequestContext, contract.ProjectID, contract.IdempotencyKey, creative.CreateGamePrerollV2WorkspaceRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+func (s *creativeManagerStub) GetGamePrerollV2Workspace(_ context.Context, _ contract.ActorContext, _ contract.ProjectID, taskID string) (creative.TaskDetail, error) {
+	s.gameV2TaskID = taskID
+	return s.detail, nil
+}
+func (s *creativeManagerStub) AnalyzeGamePrerollV2Source(_ context.Context, _ contract.ActorContext, _ contract.ProjectID, taskID string, request creative.AnalyzeGamePrerollV2SourceRequest) (creative.TaskDetail, error) {
+	s.gameV2TaskID, s.gameV2AnalyzeRequest = taskID, request
+	return s.detail, nil
+}
+func (s *creativeManagerStub) ConfirmGamePrerollV2Brief(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ConfirmGamePrerollV2BriefRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+func (s *creativeManagerStub) PlanGamePrerollV2Candidates(context.Context, contract.ActorContext, contract.ProjectID, string, creative.PlanGamePrerollV2CandidatesRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+func (s *creativeManagerStub) UpdateGamePrerollV2GenerationConfig(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateGamePrerollV2GenerationConfigRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+func (s *creativeManagerStub) RegisterGamePrerollV2VideoJob(context.Context, contract.ActorContext, contract.ProjectID, string, int64, string) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+func (s *creativeManagerStub) ReconcileGamePrerollV2Video(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ReconcileGamePrerollV2VideoRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+
+func (s *creativeManagerStub) GetStrategyBrandWorkflow(context.Context, contract.ActorContext, contract.ProjectID, string) (creative.StrategyBrandWorkflowResult, error) {
+	s.getBrandWorkflowCalls++
+	return s.brandWorkflow, nil
+}
+
+func (s *creativeManagerStub) PrepareStrategyBrandWorkflow(_ context.Context, _ contract.ActorContext, _ contract.ProjectID, _ string, request creative.PrepareStrategyBrandWorkflowRequest) (creative.StrategyBrandWorkflowResult, error) {
+	s.prepareBrandWorkflowCalls++
+	s.prepareBrandWorkflowRequest = request
+	return s.brandWorkflow, nil
 }
 
 func (s *creativeManagerStub) GetLatestAINativeRequirementWorkspace(_ context.Context, _ contract.ActorContext, projectID contract.ProjectID) (creative.AINativeRequirementWorkspace, error) {
 	s.latestAINativeProjectID = projectID
 	return s.latestAINativeWorkspace, nil
+}
+
+func (s *creativeManagerStub) ListAINativeOutputPresets(_ context.Context, _ contract.ActorContext, projectID contract.ProjectID) ([]creative.AINativeOutputPreset, error) {
+	s.aiNativeOutputPresetProjectID = projectID
+	return s.aiNativeOutputPresets, nil
 }
 
 func (s *creativeManagerStub) ListCommercePrerollSources(context.Context, contract.ActorContext, contract.ProjectID) ([]creative.CreativeSourceOption, error) {
@@ -2406,6 +2756,9 @@ func (s *creativeManagerStub) PrepareBrandFilmAudio(context.Context, contract.Ac
 func (s *creativeManagerStub) MaterializeBrandFilmAudioAssets(context.Context, contract.RequestContext, contract.ProjectID, string, creative.BrandFilmRevisionRequest) (creative.TaskDetail, error) {
 	return s.detail, nil
 }
+func (s *creativeManagerStub) GenerateBrandFilmSoundAssets(context.Context, contract.RequestContext, contract.ProjectID, string, creative.BrandFilmRevisionRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
 func (s *creativeManagerStub) UpdateBrandFilmAudioMix(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateBrandAudioMixRequest) (creative.TaskDetail, error) {
 	return s.detail, nil
 }
@@ -2493,6 +2846,9 @@ func (s *creativeManagerStub) GamePrerollProviderInput(context.Context, contract
 func (s *creativeManagerStub) ListTasks(context.Context, contract.ActorContext, contract.ProjectID, int) ([]creative.CreativeTask, error) {
 	return nil, nil
 }
+func (s *creativeManagerStub) RenameTask(context.Context, contract.ActorContext, contract.ProjectID, string, creative.RenameTaskRequest) (creative.CreativeTask, error) {
+	return creative.CreativeTask{}, nil
+}
 func (s *creativeManagerStub) GetTaskDetail(context.Context, contract.ActorContext, contract.ProjectID, string) (creative.TaskDetail, error) {
 	return s.detail, nil
 }
@@ -2502,7 +2858,14 @@ func (s *creativeManagerStub) AnalyzeViralRemake(context.Context, contract.Actor
 func (s *creativeManagerStub) UpdateViralPrompt(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateViralPromptRequest) (creative.TaskDetail, error) {
 	return s.detail, nil
 }
+func (s *creativeManagerStub) UpdateViralInput(context.Context, contract.ActorContext, contract.ProjectID, string, creative.UpdateViralInputRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
 func (s *creativeManagerStub) ConfirmViralGeneration(context.Context, contract.ActorContext, contract.ProjectID, string, creative.ConfirmViralGenerationRequest) (creative.TaskDetail, error) {
+	return s.detail, nil
+}
+func (s *creativeManagerStub) RetryViralWithoutReferenceImage(_ context.Context, _ contract.ActorContext, _ contract.ProjectID, taskID string, request creative.RetryViralWithoutReferenceImageRequest) (creative.TaskDetail, error) {
+	s.retryViralTaskID, s.retryViralRequest = taskID, request
 	return s.detail, nil
 }
 func (s *creativeManagerStub) ViralProviderInput(context.Context, contract.ActorContext, contract.ProjectID, string) (provider.VideoGenerationInput, string, error) {

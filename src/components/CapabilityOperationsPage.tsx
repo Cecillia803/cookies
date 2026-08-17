@@ -7,10 +7,13 @@ import {
   type ApiCapabilityOperations,
   type ApiConfidenceLevel,
   type ApiFeatureFieldUsage,
+  type ApiFeatureSource,
   type ApiFeatureSystemHealth,
+  type ApiFeatureValueKind,
   type ApiMetricDictionaryEntry,
   type ApiSkillEvaluation,
 } from '../data/api'
+import { admissibleForAttribution, featureSourceLabel } from '../data/featureSource'
 import type { DataState } from '../types'
 import { StateBoundary } from './StateBoundary'
 
@@ -227,8 +230,11 @@ function FeatureSystemView({ report, rows, selected, onSelect }: {
       {used.map(row => <button role="listitem" key={row.id}
         className={`prelaunch-row insight-issue-row${row.id === selected ? ' active' : ''}${row.field.merge_candidates?.length ? ' warning' : ''}`}
         onClick={() => onSelect(row.id)}>
-        <span><b>{row.field.label}</b><small>{row.system.label} · {row.field.group}</small></span>
-        <span>{row.field.governed ? '已发布' : '未发布'}</span>
+        <span>
+          <b>{row.field.label}</b>
+          <small>{row.system.label} · {row.field.group} · {describeSources(row.field.source_counts)}</small>
+        </span>
+        <span>{vocabularyLabel(row.field)}</span>
         <span>{row.field.asset_count} / {row.system.asset_count} 条素材</span>
         <span>
           {row.field.merge_candidates?.length ? <CircleAlert size={14}/> : <CircleCheck size={14}/>}
@@ -258,6 +264,15 @@ function FieldDetail({ system, field }: { system: ApiFeatureSystemHealth; field:
       {system.asset_count} 条{system.label}里有 {field.asset_count} 条填了这个字段，写出了 {field.distinct_values} 种不同的取值。
     </b></span></div>
 
+    {/* 「谁写的」和「填了多少」必须并排看。归因只认量出来的和人标的，一个几乎全是
+        模型猜的字段，填得再满也不能拿去分组比较——只看覆盖率看不出这一点。 */}
+    <div className="prelaunch-fact"><Sparkles size={17}/><span><small>这些取值是谁写的</small><b>
+      {describeSources(field.source_counts)}。
+      {admissibleShare(field.source_counts) < 0.5
+        ? '一半以上是模型猜的：这个字段现在不适合拿去做驱动因素分组，先让人复核。'
+        : '归因只认量出来的和人标的，模型猜的那部分不参与分组比较。'}
+    </b></span></div>
+
     {head ? <div className="prelaunch-fact"><Sparkles size={17}/><span><small>最常见的写法</small><b>
       {head.value}（{head.asset_count} 条）
       {top.length > 1 ? ` · 其余 ${top.length - 1} 种见下` : ''}
@@ -277,7 +292,13 @@ function FieldDetail({ system, field }: { system: ApiFeatureSystemHealth; field:
       </b>
     </div> : null}
 
-    {field.governed
+    {!needsVocabulary(field)
+      ? <div className="prelaunch-fact"><ShieldCheck size={17}/><span><small>{fieldKindLabels[field.kind] ?? '这类字段'}不需要词表</small><b>
+          {field.kind === 'text' || field.kind === 'tags'
+            ? '它本来就是自由填的，每条不一样是设计如此，不存在「该收敛没收敛」。'
+            : '它的取值是量出来的数，两条素材写 15 和 16 不是两个该合并的说法。'}
+        </b></span></div>
+      : field.governed
       ? <div className="prelaunch-fact"><ShieldCheck size={17}/><span><small>词表已发布</small><b>
           共 {field.vocabulary?.length ?? 0} 个受控取值，新的提取只能落在表内。
         </b></span></div>
@@ -442,8 +463,8 @@ function SkillAside({ report }: { report: ApiCapabilityOperations }) {
     </div> : null}
 
     <div className="prelaunch-boundary"><CircleAlert size={16}/><span>
-      <small>低置信提取值得单独看</small>
-      置信低的提取不会被自动丢弃，它们照样进了特征库，也照样参与分组。
+      <small>AI 自己都没把握的那些提取值得单独看</small>
+      AI 提取时把握不大的特征不会被自动丢弃，它们照样进了特征库，也照样参与分组。
       要么让人复核掉，要么在结论里带上样本量说明。
     </span></div>
   </>
@@ -595,6 +616,51 @@ function DashboardAside({ report }: { report: ApiCapabilityOperations }) {
 
 // 金额（含千次曝光成本）后端存的是分；比率类派生指标按百分比读；
 // 投产比是倍数——写成百分比会被读成「回本 190%」这种模棱两可的说法。
+/**
+ * 哪些字段才谈得上「词表发没发布」。
+ *
+ * 只有枚举字段。时长、目标时长这种数值字段本来就没有词表可发——把它们也标成
+ * 「未发布」，等于在治理页上凭空造出一堆永远修不好的欠账，而顶上那句
+ * 「N 个枚举字段还没发布词表」数的只有枚举字段，同一屏两个数字算的不是一回事。
+ * 后端在算待归并队列时就是这么分的（operations.go 的 convergent）。
+ */
+function needsVocabulary(field: ApiFeatureFieldUsage): boolean {
+  return field.kind === 'enum' || field.kind === 'enum_multi' || field.governed
+}
+
+function vocabularyLabel(field: ApiFeatureFieldUsage): string {
+  if (!needsVocabulary(field)) return '不适用'
+  return field.governed ? '已发布' : '未发布'
+}
+
+const fieldKindLabels: Record<ApiFeatureValueKind, string> = {
+  text: '自由文本字段',
+  tags: '开放标签字段',
+  enum: '枚举字段',
+  enum_multi: '多选枚举字段',
+  number: '数值字段',
+  bool: '是否字段',
+  duration_seconds: '时长字段',
+}
+
+/** 「量出来的 3 · 人标的 1 · 模型猜的 8」。缺省时说清是没人填过，不是数出来都是 0。 */
+function describeSources(counts?: Partial<Record<ApiFeatureSource, number>>): string {
+  const entries = (Object.keys(featureSourceLabel) as ApiFeatureSource[])
+    .filter(source => (counts?.[source] ?? 0) > 0)
+    .map(source => `${featureSourceLabel[source]} ${counts?.[source]}`)
+  return entries.length ? entries.join(' · ') : '还没人填过'
+}
+
+/** 能进归因的那部分占比。没人填过时算 1：没有数据不等于「都是模型猜的」。 */
+function admissibleShare(counts?: Partial<Record<ApiFeatureSource, number>>): number {
+  const total = (Object.values(counts ?? {}) as number[]).reduce((sum, value) => sum + value, 0)
+  if (!total) return 1
+  const admissible = (Object.keys(counts ?? {}) as ApiFeatureSource[])
+    .filter(admissibleForAttribution)
+    .reduce((sum, source) => sum + (counts?.[source] ?? 0), 0)
+  return admissible / total
+}
+
 function formatMetric(metric: ApiMetricDictionaryEntry): string {
   if (metric.unit === '分') return formatMoney(metric.total)
   if (metric.key === 'roi') return `${metric.total.toFixed(2)} 倍`

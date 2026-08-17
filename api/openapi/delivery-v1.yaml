@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Cookies Delivery API
-  version: 1.4.0
-  description: Versioned mock delivery plans, authoritative preflight, content-bound approvals, durable controlled local-simulation execution evidence, and an owner-scoped repeatable mock tour.
+  version: 2.0.0
+  description: Immutable DeliveryIntent and tagged PlatformConfiguration plans, authoritative preflight, content-bound approvals, and legacy read-only history.
 servers:
   - url: /
 security:
@@ -26,12 +26,12 @@ paths:
         default: { $ref: '#/components/responses/Problem' }
     post:
       operationId: createDeliveryPlan
-      summary: Create and persist a mock delivery plan draft
+      summary: Create an immutable DeliveryIntent and tagged PlatformConfiguration plan
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/PlanDraft' }
+            schema: { $ref: '#/components/schemas/CreatePlan' }
       responses:
         '201':
           description: Plan and immutable V1 created.
@@ -129,37 +129,24 @@ paths:
       - $ref: '#/components/parameters/ProjectID'
       - $ref: '#/components/parameters/PlanID'
     post:
+      deprecated: true
       operationId: compileDeliveryPlanConfiguration
-      summary: Server-compile a deterministic three-tier mock configuration into a new immutable PlanVersion
-      requestBody: { $ref: '#/components/requestBodies/CompileDeliveryConfiguration' }
+      summary: Rejected legacy ThreeTier write endpoint
+      description: Always returns LEGACY_CONFIGURATION_UNSUPPORTED. Legacy ThreeTier snapshots remain readable but immutable.
       responses:
-        '201':
-          description: A new immutable PlanVersion containing the server-authored three-tier snapshot.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/DeliveryPlan' }
         '409': { $ref: '#/components/responses/Problem' }
-        '412': { $ref: '#/components/responses/Problem' }
-        '404': { $ref: '#/components/responses/Problem' }
         default: { $ref: '#/components/responses/Problem' }
   /api/delivery/v1/projects/{project_id}/plans/{plan_id}/configuration:override:
     parameters:
       - $ref: '#/components/parameters/ProjectID'
       - $ref: '#/components/parameters/PlanID'
     post:
+      deprecated: true
       operationId: overrideDeliveryPlanConfigurationField
-      summary: Override exactly one three-tier creative field and create a new immutable PlanVersion
-      requestBody: { $ref: '#/components/requestBodies/OverrideDeliveryConfigurationField' }
+      summary: Rejected legacy ThreeTier write endpoint
+      description: Always returns LEGACY_CONFIGURATION_UNSUPPORTED. Create a new DeliveryIntent and PlatformConfiguration version instead.
       responses:
-        '200':
-          description: Updated current projection with a newly immutable three-tier PlanVersion.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/DeliveryPlan' }
-        '400': { $ref: '#/components/responses/Problem' }
         '409': { $ref: '#/components/responses/Problem' }
-        '412': { $ref: '#/components/responses/Problem' }
-        '404': { $ref: '#/components/responses/Problem' }
         default: { $ref: '#/components/responses/Problem' }
   /api/delivery/v1/projects/{project_id}/plans/{plan_id}/recommendations:generate:
     parameters:
@@ -167,7 +154,8 @@ paths:
       - $ref: '#/components/parameters/PlanID'
     post:
       operationId: generateDeliveryRecommendation
-      summary: Generate one deterministic optimization recommendation from post-launch simulation evidence
+      deprecated: true
+      summary: Generate one historical Tour-only optimization recommendation
       description: >-
         Requires a succeeded platform-operation rehearsal, two persisted metric windows, and
         monitoring alerts for the same execution. The recommendation freezes those exact evidence
@@ -179,6 +167,27 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DeliveryRecommendation' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/plans/{plan_id}/decisions:generate:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - $ref: '#/components/parameters/PlanID'
+    post:
+      operationId: generateDeliveryDecision
+      summary: Generate an immutable explainable decision with three policy candidates
+      description: >-
+        Binds the current DeliveryIntent and PlatformConfiguration to exact simulation and metric
+        facts. This Phase C operation is deterministic and cannot write to an advertising platform.
+      requestBody: { $ref: '#/components/requestBodies/ExpectedVersion' }
+      responses:
+        '201':
+          description: Immutable DeliveryDecision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryDecision' }
         '409': { $ref: '#/components/responses/Problem' }
         '412': { $ref: '#/components/responses/Problem' }
         '404': { $ref: '#/components/responses/Problem' }
@@ -209,6 +218,363 @@ paths:
         '201': { $ref: '#/components/responses/ChangeSet' }
         '412': { $ref: '#/components/responses/Problem' }
         default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/observatory-runs/{run_id}/controlled-change-sets:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: createControlledDeliveryChangeSet
+      summary: Freeze the latest accepted or modified feedback into a formal controlled ChangeSet
+      description: >-
+        This operation never writes an advertising platform. It freezes Plan, Intent, feedback,
+        Decision, final Configuration, Workflow, account, action, budget and the
+        oceanengine-ecommerce-manual@v0.1-calibration Skill identities. The Skill identity binds
+        the stage B calibration baseline and its partial live project-form revalidation; it does
+        not claim promotion-form locators, a complete real Browser Driver or submit authority.
+        The service selects the latest feedback for the run itself. Rejected feedback,
+        an older feedback record or any hash/version drift is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateControlledChangeSetRequest' }
+      responses:
+        '201':
+          description: Formal controlled ChangeSet ready for remote-write approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '200':
+          description: Idempotent replay of the same frozen request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/controlled-change-sets/{controlled_change_set_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: controlled_change_set_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      operationId: getControlledDeliveryChangeSet
+      summary: Read one formal controlled ChangeSet and its current approval validity
+      responses:
+        '200':
+          description: Controlled ChangeSet.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/controlled-change-sets/{controlled_change_set_id}:approve:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: controlled_change_set_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: approveControlledDeliveryChangeSet
+      summary: Approve the exact controlled remote-write scope without upgrading execute_mock
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_version]
+              properties:
+                expected_version: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Immutable formal remote-write Approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemoteWriteApproval' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/controlled-change-sets/{controlled_change_set_id}:invalidate-calibration:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: controlled_change_set_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: invalidateCalibratedControlledDeliveryChangeSet
+      summary: Invalidate a cancelled zero-attempt calibration authority while preserving its immutable approval history
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_version]
+              properties:
+                expected_version: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Invalidated ChangeSet and cancelled controlled execution.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [change_set, execution]
+                properties:
+                  change_set: { $ref: '#/components/schemas/ControlledChangeSet' }
+                  execution: { $ref: '#/components/schemas/ControlledExecution' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/controlled-change-sets/{controlled_change_set_id}:execute:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: controlled_change_set_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: createControlledDeliveryExecution
+      summary: Create the business execution aggregate for one unexpired formal approval
+      responses:
+        '201':
+          description: Controlled business execution awaiting its Platform ComputerUseRun.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledExecution' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/controlled-executions/{execution_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - $ref: '#/components/parameters/ExecutionID'
+    get:
+      operationId: getControlledDeliveryExecution
+      summary: Read the server-authoritative controlled business execution projection
+      responses:
+        '200':
+          description: Controlled business execution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledExecution' }
+        '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    post:
+      operationId: createPendingDeliveryPlatformEntityMapping
+      summary: Create a pending internal-to-platform mapping with no client-supplied platform result values
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePlatformEntityMappingRequest' }
+      responses:
+        '201':
+          description: Pending mapping containing no platform object ID, status, or evidence IDs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformEntityMapping' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      operationId: getDeliveryPlatformEntityMapping
+      summary: Read a project-scoped platform entity mapping
+      responses:
+        '200':
+          description: Mapping projection.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformEntityMapping' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}/controlled-change-sets:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: createMappedControlledDeliveryChangeSet
+      summary: Freeze one finite modification of an exact confirmed promotion mapping
+      description: >-
+        Compiles a new ChangeSet and requires a new Approval. The server owns the mapped
+        platform object identity and binds the current and target state hashes. It never
+        reuses the creation Approval or mutates the confirmed mapping in place.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMappedControlledChangeSetRequest' }
+      responses:
+        '201':
+          description: New controlled promotion modification ready for approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '200':
+          description: Idempotent replay of the same mapping version and target state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}/emergency-pause-change-sets:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: createEmergencyPauseDeliveryChangeSet
+      summary: Freeze an operator-bound emergency pause for one delivering promotion
+      description: >-
+        Starts from a confirmed promotion mapping, requires the current normalized
+        platform status to be delivering, server-forces the target status to paused,
+        and creates a fresh ChangeSet that must receive its own Approval.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEmergencyPauseChangeSetRequest' }
+      responses:
+        '201':
+          description: New emergency-pause ChangeSet ready for approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '200':
+          description: Idempotent replay of the same exact pause authority.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}/controlled-restart-change-sets:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: createControlledRestartDeliveryChangeSet
+      summary: Freeze a fresh operator-bound restart after a controlled emergency pause
+      description: >-
+        Requires a confirmed promotion Mapping whose latest controlled state is
+        paused, rebinds the exact approved daily budget, active schedule,
+        authorized available materials and landing page, and server-forces the
+        target normalized status to delivering. This is never an automatic
+        compensation or approval reuse path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateControlledRestartChangeSetRequest' }
+      responses:
+        '201':
+          description: New controlled-restart ChangeSet ready for approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '200':
+          description: Idempotent replay of the same exact restart authority.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlledChangeSet' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}:confirm:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: confirmDeliveryPlatformEntityMapping
+      summary: Confirm a mapping from two server-loaded Computer Use evidence records
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmPlatformEntityMappingRequest' }
+      responses:
+        '200':
+          description: Confirmed mapping with matching object ID and status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformEntityMapping' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}:confirm-mutation:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: confirmDeliveryPlatformEntityMappingMutation
+      summary: Advance a mapping version from two matching post-write Computer Use readbacks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmPlatformEntityMappingMutationRequest' }
+      responses:
+        '200':
+          description: Versioned mapping mutation and immutable revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfirmPlatformEntityMappingMutationResult' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/platform-entity-mappings/{mapping_id}:confirm-change:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: mapping_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: confirmDeliveryPlatformEntityMappingChange
+      summary: Advance a mapping after any controlled existing-promotion change
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmPlatformEntityMappingMutationRequest' }
+      responses:
+        '200':
+          description: Versioned mapping change and immutable revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfirmPlatformEntityMappingMutationResult' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
   /api/delivery/v1/projects/{project_id}/change-sets:
     parameters:
       - $ref: '#/components/parameters/ProjectID'
@@ -230,7 +596,8 @@ paths:
       - $ref: '#/components/parameters/ProjectID'
     get:
       operationId: listDeliveryRecommendations
-      summary: List project-scoped deterministic delivery recommendations
+      deprecated: true
+      summary: List project-scoped historical Tour recommendations
       parameters:
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -247,6 +614,7 @@ paths:
       - $ref: '#/components/parameters/RecommendationID'
     get:
       operationId: getDeliveryRecommendation
+      deprecated: true
       summary: Get one project-scoped immutable recommendation
       responses:
         '200':
@@ -263,6 +631,7 @@ paths:
       - $ref: '#/components/parameters/IdempotencyKey'
     post:
       operationId: acceptDeliveryRecommendation
+      deprecated: true
       summary: Accept a recommendation and create only one new draft ChangeSet
       description: >-
         Acceptance does not mutate the Plan, preflight or approve the ChangeSet,
@@ -291,6 +660,7 @@ paths:
       - $ref: '#/components/parameters/RecommendationID'
     post:
       operationId: rejectDeliveryRecommendation
+      deprecated: true
       summary: Reject a proposed recommendation without modifying a Plan or ChangeSet
       requestBody: { $ref: '#/components/requestBodies/ExpectedVersion' }
       responses:
@@ -302,6 +672,206 @@ paths:
         '409': { $ref: '#/components/responses/Problem' }
         '412': { $ref: '#/components/responses/Problem' }
         '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    get:
+      operationId: listDeliveryDecisions
+      summary: List immutable project-scoped DeliveryDecisions
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Immutable decisions ordered newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryDecisionList' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/decisions/{decision_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: decision_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      operationId: getDeliveryDecision
+      summary: Get one immutable DeliveryDecision
+      responses:
+        '200':
+          description: DeliveryDecision and its exact input bindings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryDecision' }
+        '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/decisions/{decision_id}:select:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: decision_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+      - $ref: '#/components/parameters/IdempotencyKey'
+    post:
+      operationId: selectDeliveryDecisionCandidate
+      summary: Select one candidate and compile a write-disabled workflow
+      description: >-
+        Creates a new immutable PlatformConfiguration version and deterministic workflow. It does
+        not create a formal approval. The result stops at ready_for_final_approval, and every
+        remote_write step is blocked by PHASE_C_REMOTE_WRITE_PROHIBITED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SelectDecisionRequest' }
+      responses:
+        '201':
+          description: Immutable selection and compiled workflow.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DecisionSelection' }
+        '200':
+          description: Idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DecisionSelection' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '412': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/decision-selections/{selection_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: selection_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      operationId: getDeliveryDecisionSelection
+      summary: Get an immutable candidate selection and compiled workflow
+      responses:
+        '200':
+          description: Selection frozen at the final-approval boundary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DecisionSelection' }
+        '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/decision-selections/{selection_id}/observatory-runs:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: selection_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    post:
+      operationId: runDeliveryObservatoryReplay
+      summary: Run a deterministic Mock/Replay observation without platform access
+      description: >-
+        Accepts only mock or replay fixtures. The runner can observe existing values or prepare
+        an unsubmitted local form, and always records PHASE_C_REMOTE_WRITE_PROHIBITED before the
+        platform-write boundary. Identical frozen inputs return the same immutable run.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RunObservatoryRequest' }
+      responses:
+        '201':
+          description: Immutable observatory run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryObservatoryRun' }
+        '200':
+          description: Deterministic replay of an existing run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryObservatoryRun' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/observatory-runs:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    get:
+      operationId: listDeliveryObservatoryRuns
+      summary: List immutable Mock/Replay observatory runs
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Project-scoped runs ordered newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/DeliveryObservatoryRun' } }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/observatory-runs/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      operationId: getDeliveryObservatoryRun
+      summary: Get an immutable run with evidence and field diffs
+      responses:
+        '200':
+          description: Exact stored run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryObservatoryRun' }
+        '404': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/delivery/v1/projects/{project_id}/observatory-runs/{run_id}/feedback:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      operationId: listDeliveryObservatoryFeedback
+      summary: List append-only operator feedback for a run
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Immutable feedback records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/DeliveryObservatoryFeedback' } }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      operationId: submitDeliveryObservatoryFeedback
+      summary: Append accepted, modified, or rejected operator feedback
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmitObservatoryFeedbackRequest' }
+      responses:
+        '201':
+          description: New immutable feedback record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryObservatoryFeedback' }
+        '200':
+          description: Idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryObservatoryFeedback' }
+        '409': { $ref: '#/components/responses/Problem' }
         default: { $ref: '#/components/responses/Problem' }
   /api/delivery/v1/projects/{project_id}/change-sets/{change_set_id}:
     parameters:
@@ -336,38 +906,24 @@ paths:
       - $ref: '#/components/parameters/ProjectID'
       - $ref: '#/components/parameters/ChangeSetID'
     get:
+      deprecated: true
       operationId: getDeliveryManualActionPackage
-      summary: Read an immutable approved-only manual action package
+      summary: Read a historical immutable manual action package for audit
       responses:
         '200':
           description: Immutable manual action package. Its content never implies a platform write.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ManualActionPackage' }
+              schema: { $ref: '#/components/schemas/LegacyManualActionPackage' }
         '404': { $ref: '#/components/responses/Problem' }
         default: { $ref: '#/components/responses/Problem' }
     post:
+      deprecated: true
       operationId: compileDeliveryManualActionPackage
-      summary: Compile or idempotently replay the approved ChangeSet manual action package
-      requestBody: { $ref: '#/components/requestBodies/ExpectedVersion' }
+      summary: Rejected legacy manual action package write endpoint
+      description: Always returns LEGACY_CONFIGURATION_UNSUPPORTED and performs no business operation.
       responses:
-        '201':
-          description: New immutable manual action package compiled from an approved ChangeSet.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ManualActionPackage' }
-        '200':
-          description: Idempotent replay of the already compiled package.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ManualActionPackage' }
-        '409':
-          description: APPROVAL_REQUIRED, INVALID_STATE, or VERSION_CONFLICT.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Problem' }
-        '412': { $ref: '#/components/responses/Problem' }
-        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
         default: { $ref: '#/components/responses/Problem' }
   /api/delivery/v1/projects/{project_id}/change-sets/{change_set_id}:approve:
     parameters:
@@ -832,33 +1388,6 @@ components:
             properties:
               expected_version: { type: integer, minimum: 1 }
               scenario: { $ref: '#/components/schemas/ExecutionScenario' }
-    CompileDeliveryConfiguration:
-      required: true
-      content:
-        application/json:
-          schema:
-            type: object
-            additionalProperties: false
-            required: [expected_version, fixture]
-            properties:
-              expected_version: { type: integer, minimum: 1 }
-              fixture: { $ref: '#/components/schemas/DeliveryConfigurationFixture' }
-    OverrideDeliveryConfigurationField:
-      required: true
-      content:
-        application/json:
-          schema:
-            type: object
-            additionalProperties: false
-            required: [expected_version, group_id, plan_id, creative_id, field_key, value, confirmed]
-            properties:
-              expected_version: { type: integer, minimum: 1 }
-              group_id: { type: string, minLength: 1 }
-              plan_id: { type: string, minLength: 1 }
-              creative_id: { type: string, minLength: 1 }
-              field_key: { type: string, minLength: 1 }
-              value: { $ref: '#/components/schemas/DeliveryFieldValue' }
-              confirmed: { type: boolean }
   responses:
     ChangeSet:
       description: Updated ChangeSet.
@@ -900,7 +1429,7 @@ components:
       properties:
         key:
           type: string
-          enum: [plan_creation, configuration, first_approval, execution, monitoring, recommendation, new_change_set, second_approval, manual_action_package]
+          enum: [plan_creation, configuration, first_approval, execution, monitoring, recommendation, new_change_set, second_approval]
         title: { type: string }
         completion_condition: { type: string }
         complete: { type: boolean }
@@ -938,12 +1467,12 @@ components:
           items: { $ref: '#/components/schemas/DeliveryTourCase' }
         steps:
           type: array
-          minItems: 9
-          maxItems: 9
+          minItems: 8
+          maxItems: 8
           items: { $ref: '#/components/schemas/DeliveryTourStep' }
         current_step:
           type: string
-          enum: [plan_creation, configuration, first_approval, execution, monitoring, recommendation, new_change_set, second_approval, manual_action_package, complete]
+          enum: [plan_creation, configuration, first_approval, execution, monitoring, recommendation, new_change_set, second_approval, complete]
         suggested_next_url: { type: string }
     DeliveryTourResetResult:
       type: object
@@ -964,6 +1493,302 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Problem' }
   schemas:
+    ControlledAuthorityBinding:
+      type: object
+      additionalProperties: false
+      required: [selection_id, observatory_run_id, observatory_run_canonical_hash, operator_feedback_id, operator_feedback_canonical_hash, operator_feedback_disposition, plan_id, plan_version, plan_canonical_hash, intent_id, intent_version, intent_canonical_hash, decision_id, decision_canonical_hash, configuration_id, configuration_version, configuration_canonical_hash, workflow_id, workflow_canonical_hash, account_reference_id, object_fingerprint]
+      properties:
+        selection_id: { type: string }
+        observatory_run_id: { type: string }
+        observatory_run_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        operator_feedback_id: { type: string }
+        operator_feedback_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        operator_feedback_disposition: { type: string, enum: [accepted, modified] }
+        plan_id: { type: string }
+        plan_version: { type: integer, minimum: 1 }
+        plan_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        intent_id: { type: string }
+        intent_version: { type: integer, minimum: 1 }
+        intent_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        decision_id: { type: string }
+        decision_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        configuration_id: { type: string }
+        configuration_version: { type: integer, minimum: 1 }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        workflow_id: { type: string }
+        workflow_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        account_reference_id: { type: string }
+        parent_platform_project_id: { type: string }
+        target_mapping_id: { type: string }
+        target_mapping_version: { type: integer, minimum: 1 }
+        target_platform_object_id: { type: string }
+        target_platform_object_kind: { type: string, enum: [promotion] }
+        operator_principal_id: { type: string }
+        supersedes_controlled_change_set_id: { type: string, minLength: 1 }
+        project_budget_mode: { type: string, enum: [daily, unlimited] }
+        project_budget_limit_minor: { type: integer, minimum: 0 }
+        promotion_budget_limit_minor: { type: integer, minimum: 0 }
+        object_fingerprint: { type: string }
+        skill_id: { type: string }
+        skill_version: { type: string }
+        promotion_mutation: { $ref: '#/components/schemas/ControlledPromotionMutation' }
+        promotion_control: { $ref: '#/components/schemas/ControlledPromotionControl' }
+        promotion_restart: { $ref: '#/components/schemas/ControlledPromotionRestart' }
+    ControlledScheduleWindow:
+      type: object
+      additionalProperties: false
+      required: [start_at, end_at, timezone]
+      properties:
+        start_at: { type: string, format: date-time }
+        end_at: { type: string, format: date-time }
+        timezone: { type: string, minLength: 1 }
+    ControlledMaterialReference:
+      type: object
+      additionalProperties: false
+      required: [reference_id, authorization_evidence_id]
+      properties:
+        reference_id: { type: string, minLength: 1 }
+        authorization_evidence_id: { type: string, minLength: 1 }
+    ControlledLandingPageReference:
+      type: object
+      additionalProperties: false
+      required: [reference_id, authorization_evidence_id]
+      properties:
+        reference_id: { type: string, minLength: 1 }
+        authorization_evidence_id: { type: string, minLength: 1 }
+    ControlledPromotionMutation:
+      type: object
+      additionalProperties: false
+      required: [current_daily_budget_minor, target_daily_budget_minor, current_state_hash, target_state_hash]
+      properties:
+        current_daily_budget_minor: { type: integer, minimum: 30000 }
+        target_daily_budget_minor: { type: integer, minimum: 30000 }
+        current_materials:
+          type: array
+          items: { $ref: '#/components/schemas/ControlledMaterialReference' }
+        target_materials:
+          type: array
+          items: { $ref: '#/components/schemas/ControlledMaterialReference' }
+        current_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        target_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+    ControlledPromotionControl:
+      type: object
+      additionalProperties: false
+      required: [current_daily_budget_minor, current_platform_status, target_platform_status, current_state_hash, target_state_hash]
+      properties:
+        current_daily_budget_minor: { type: integer, minimum: 30000 }
+        current_platform_status: { type: string, const: delivering }
+        target_platform_status: { type: string, const: paused }
+        current_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        target_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+    ControlledPromotionRestart:
+      type: object
+      additionalProperties: false
+      required: [current_daily_budget_minor, approved_daily_budget_minor, current_platform_status, target_platform_status, schedule, materials, landing_page, current_state_hash, target_state_hash]
+      properties:
+        current_daily_budget_minor: { type: integer, minimum: 30000 }
+        approved_daily_budget_minor: { type: integer, minimum: 30000 }
+        current_platform_status: { type: string, const: paused }
+        target_platform_status: { type: string, const: delivering }
+        schedule: { $ref: '#/components/schemas/ControlledScheduleWindow' }
+        materials:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/ControlledMaterialReference' }
+        landing_page: { $ref: '#/components/schemas/ControlledLandingPageReference' }
+        current_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        target_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+    CreateControlledChangeSetRequest:
+      type: object
+      additionalProperties: false
+      required: [observatory_run_id]
+      properties:
+        observatory_run_id: { type: string, minLength: 1 }
+        action: { type: string, enum: [create_project_and_promotions, create_promotions_in_existing_project] }
+        parent_platform_project_id: { type: string, minLength: 1 }
+    CreateMappedControlledChangeSetRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_mapping_version, action, current_daily_budget_minor, target_daily_budget_minor]
+      properties:
+        expected_mapping_version: { type: integer, minimum: 2 }
+        action: { type: string, enum: [update_promotion_budget, update_promotion_materials] }
+        current_daily_budget_minor: { type: integer, minimum: 30000 }
+        target_daily_budget_minor: { type: integer, minimum: 30000 }
+        current_materials:
+          type: array
+          items: { $ref: '#/components/schemas/ControlledMaterialReference' }
+        target_materials:
+          type: array
+          items: { $ref: '#/components/schemas/ControlledMaterialReference' }
+        supersedes_controlled_change_set_id: { type: string, minLength: 1 }
+    CreateEmergencyPauseChangeSetRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_mapping_version, current_daily_budget_minor, current_platform_status]
+      properties:
+        expected_mapping_version: { type: integer, minimum: 2 }
+        current_daily_budget_minor: { type: integer, minimum: 30000 }
+        current_platform_status: { type: string, const: delivering }
+        supersedes_controlled_change_set_id: { type: string, minLength: 1 }
+    CreateControlledRestartChangeSetRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_mapping_version, current_daily_budget_minor, approved_daily_budget_minor, current_platform_status, schedule, materials, landing_page]
+      properties:
+        expected_mapping_version: { type: integer, minimum: 2 }
+        current_daily_budget_minor: { type: integer, minimum: 30000 }
+        approved_daily_budget_minor: { type: integer, minimum: 30000 }
+        current_platform_status: { type: string, const: paused }
+        schedule: { $ref: '#/components/schemas/ControlledScheduleWindow' }
+        materials:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/ControlledMaterialReference' }
+        landing_page: { $ref: '#/components/schemas/ControlledLandingPageReference' }
+        supersedes_controlled_change_set_id: { type: string, minLength: 1 }
+    ControlledChangeSet:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, binding, action, budget_limit_minor, currency, status, canonical_hash, version, created_by, created_at, updated_at]
+      properties:
+        schema_version: { type: string, const: delivery-controlled-change-set/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        binding: { $ref: '#/components/schemas/ControlledAuthorityBinding' }
+        action: { type: string, enum: [create_project_and_promotions, create_promotions_in_existing_project, update_promotion_budget, update_promotion_materials, pause_promotion, resume_promotion] }
+        budget_limit_minor: { type: integer, minimum: 0 }
+        currency: { type: string, const: CNY }
+        status: { type: string, enum: [ready_for_approval, approved, rejected, executing, executed, invalidated] }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        version: { type: integer, minimum: 1 }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        approval: { $ref: '#/components/schemas/RemoteWriteApproval' }
+    RemoteWriteApproval:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, controlled_change_set_id, controlled_change_set_hash, binding, action, scope, budget_limit_minor, currency, action_hash, approved_by, approved_at, expires_at]
+      properties:
+        schema_version: { type: string, const: delivery-remote-write-approval/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        controlled_change_set_id: { type: string }
+        controlled_change_set_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        binding: { $ref: '#/components/schemas/ControlledAuthorityBinding' }
+        action: { type: string, enum: [create_project_and_promotions, create_promotions_in_existing_project, update_promotion_budget, update_promotion_materials, pause_promotion, resume_promotion] }
+        scope: { type: string, const: controlled_remote_write }
+        budget_limit_minor: { type: integer, minimum: 0 }
+        currency: { type: string, const: CNY }
+        action_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        approved_by: { type: string }
+        approved_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+    ControlledExecution:
+      type: object
+      additionalProperties: false
+      required: [id, organization_id, project_id, controlled_change_set_id, remote_write_approval_id, status, version, created_by, created_at, updated_at]
+      properties:
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        controlled_change_set_id: { type: string }
+        remote_write_approval_id: { type: string }
+        computer_use_run_id: { type: string }
+        status: { type: string, enum: [pending, running, succeeded, failed, partial, result_unknown, cancelled] }
+        version: { type: integer, minimum: 1 }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreatePlatformEntityMappingRequest:
+      type: object
+      additionalProperties: false
+      required: [id, account_reference_id, plan_id, configuration_id, business_execution_id, computer_use_run_id, internal_object_kind, internal_object_id, platform_object_kind]
+      properties:
+        id: { type: string, minLength: 1 }
+        account_reference_id: { type: string, minLength: 1 }
+        plan_id: { type: string, minLength: 1 }
+        configuration_id: { type: string, minLength: 1 }
+        business_execution_id: { type: string, minLength: 1 }
+        computer_use_run_id: { type: string, minLength: 1 }
+        internal_object_kind: { type: string, minLength: 1 }
+        internal_object_id: { type: string, minLength: 1 }
+        platform_object_kind: { type: string, minLength: 1 }
+    PlatformEntityMapping:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, account_reference_id, plan_id, configuration_id, business_execution_id, computer_use_run_id, internal_object_kind, internal_object_id, platform_object_kind, status, version, created_at, updated_at]
+      properties:
+        schema_version: { type: string, const: delivery-platform-entity-mapping/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        account_reference_id: { type: string }
+        plan_id: { type: string }
+        configuration_id: { type: string }
+        business_execution_id: { type: string }
+        computer_use_run_id: { type: string }
+        internal_object_kind: { type: string }
+        internal_object_id: { type: string }
+        platform_object_kind: { type: string }
+        platform_object_id: { type: string }
+        platform_status: { type: string }
+        current_state_action: { type: string, enum: [update_promotion_budget, update_promotion_materials, pause_promotion, resume_promotion] }
+        current_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        result_evidence_id: { type: string }
+        list_evidence_id: { type: string }
+        status: { type: string, enum: [pending_verification, confirmed] }
+        version: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    PlatformEntityMappingRevision:
+      type: object
+      additionalProperties: false
+      required: [mapping_id, organization_id, project_id, version, action, business_execution_id, computer_use_run_id, platform_object_id, platform_status, result_evidence_id, list_evidence_id, created_at]
+      properties:
+        mapping_id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        version: { type: integer, minimum: 1 }
+        action: { type: string, enum: [create_project_and_promotions, create_promotions_in_existing_project, update_promotion_budget, update_promotion_materials, pause_promotion, resume_promotion] }
+        business_execution_id: { type: string }
+        computer_use_run_id: { type: string }
+        platform_object_id: { type: string }
+        platform_status: { type: string }
+        previous_state_action: { type: string, enum: [update_promotion_budget, update_promotion_materials, pause_promotion, resume_promotion] }
+        previous_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        current_state_action: { type: string, enum: [update_promotion_budget, update_promotion_materials, pause_promotion, resume_promotion] }
+        current_state_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        result_evidence_id: { type: string }
+        list_evidence_id: { type: string }
+        created_at: { type: string, format: date-time }
+    ConfirmPlatformEntityMappingRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version, result_evidence_id, list_evidence_id]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        result_evidence_id: { type: string, minLength: 1 }
+        list_evidence_id: { type: string, minLength: 1 }
+    ConfirmPlatformEntityMappingMutationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version, business_execution_id, result_evidence_id, list_evidence_id]
+      properties:
+        expected_version: { type: integer, minimum: 2 }
+        business_execution_id: { type: string, minLength: 1 }
+        result_evidence_id: { type: string, minLength: 1 }
+        list_evidence_id: { type: string, minLength: 1 }
+    ConfirmPlatformEntityMappingMutationResult:
+      type: object
+      additionalProperties: false
+      required: [mapping, revision]
+      properties:
+        mapping: { $ref: '#/components/schemas/PlatformEntityMapping' }
+        revision: { $ref: '#/components/schemas/PlatformEntityMappingRevision' }
     Principal:
       type: object
       additionalProperties: false
@@ -1043,36 +1868,151 @@ components:
           items: { $ref: '#/components/schemas/CreativeReference' }
         strategy_reference: { $ref: '#/components/schemas/StrategyReference' }
         source_strategy_version: { type: string }
+    StableReference:
+      type: object
+      additionalProperties: false
+      required: [namespace, object_kind, scope, state]
+      properties:
+        namespace: { type: string, minLength: 1 }
+        object_kind: { type: string, minLength: 1 }
+        scope: { type: string, minLength: 1 }
+        id: { type: string }
+        version: { type: string }
+        content_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        state: { type: string, enum: [resolved, unresolved, blocked, redacted] }
+        reason: { type: string }
+        display_name_snapshot: { type: string }
+        evidence_version: { type: string }
+    DeliveryIntent:
+      type: object
+      additionalProperties: false
+      required: [schema_version, intent_id, version_number, hash_algorithm, payload, configuration_provenance, fact_provenance]
+      properties:
+        schema_version: { type: string, const: delivery-intent/v1 }
+        intent_id: { type: string, minLength: 1 }
+        version_number: { type: integer, minimum: 1 }
+        hash_algorithm: { type: string, const: RFC8785-JCS-SHA256(canonical_payload) }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        payload:
+          type: object
+          required: [payload_schema_version, marketing_objective, budget_boundary, schedule_boundary, optimization_preferences, material_references, audience_constraints, strategy_reference]
+          properties:
+            payload_schema_version: { type: string, const: delivery-intent/v1 }
+            marketing_objective: { type: string, minLength: 1 }
+            budget_boundary: { type: object }
+            schedule_boundary: { type: object }
+            optimization_preferences: { type: array, items: { type: object } }
+            product_references: { type: array, items: { $ref: '#/components/schemas/StableReference' } }
+            landing_page_references: { type: array, items: { $ref: '#/components/schemas/StableReference' } }
+            material_references: { type: array, minItems: 1, items: { $ref: '#/components/schemas/StableReference' } }
+            audience_constraints: { type: object }
+            strategy_reference: { $ref: '#/components/schemas/StableReference' }
+        configuration_provenance: { type: object }
+        fact_provenance: { type: object }
+        audit: { type: object, readOnly: true }
+    PlatformConfiguration:
+      type: object
+      additionalProperties: false
+      required: [schema_version, configuration_id, version_number, platform, profile_version, hash_algorithm, payload, configuration_provenance, fact_provenance, compilation_metadata]
+      properties:
+        schema_version: { type: string, const: delivery-platform-configuration/v2 }
+        configuration_id: { type: string, minLength: 1 }
+        version_number: { type: integer, minimum: 1 }
+        platform: { type: string, enum: [ocean_engine, magnetic_engine] }
+        profile_version: { type: string, enum: [oceanengine-configuration/v1, magnetic-engine-configuration/v1] }
+        intent: { type: object, readOnly: true }
+        hash_algorithm: { type: string, const: RFC8785-JCS-SHA256(canonical_payload) }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        payload:
+          oneOf:
+            - $ref: '#/components/schemas/OceanEngineConfigurationPayload'
+            - $ref: '#/components/schemas/MagneticEngineConfigurationPayload'
+        configuration_provenance: { type: object }
+        fact_provenance: { type: object }
+        audit: { type: object, readOnly: true }
+        compilation_metadata: { type: object }
+    OceanEngineConfigurationPayload:
+      type: object
+      additionalProperties: false
+      required: [profile, ocean_engine]
+      properties:
+        profile: { type: string, const: ocean_engine }
+        ocean_engine:
+          type: object
+          additionalProperties: false
+          required: [profile, project, promotions]
+          properties:
+            profile: { type: string, const: ocean_engine }
+            project: { type: object, description: Exactly one OceanEngine Project draft. }
+            promotions: { type: array, minItems: 0, items: { type: object } }
+    MagneticEngineConfigurationPayload:
+      type: object
+      additionalProperties: false
+      required: [profile, magnetic_engine]
+      properties:
+        profile: { type: string, const: magnetic_engine }
+        magnetic_engine:
+          type: object
+          additionalProperties: false
+          required: [profile, status, reason_code, reason]
+          properties:
+            profile: { type: string, const: magnetic_engine }
+            status: { type: string, const: capability_pending }
+            reason_code: { type: string, const: CAPABILITY_PENDING }
+            reason: { type: string, minLength: 1 }
+    CreatePlan:
+      type: object
+      additionalProperties: false
+      required: [intent, platform_configuration]
+      properties:
+        intent: { $ref: '#/components/schemas/DeliveryIntent' }
+        platform_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
     UpdatePlan:
       type: object
       additionalProperties: false
-      required: [expected_version, name, objective, advertiser, budget, schedule, tracking, creative_references, strategy_reference, source_strategy_version]
+      required: [expected_version, intent, platform_configuration]
       properties:
         expected_version: { type: integer, minimum: 1 }
-        name: { type: string, minLength: 1, maxLength: 255 }
-        objective: { type: string, minLength: 1, maxLength: 2000 }
-        advertiser: { $ref: '#/components/schemas/Advertiser' }
-        budget: { $ref: '#/components/schemas/Budget' }
-        schedule: { $ref: '#/components/schemas/Schedule' }
-        tracking: { $ref: '#/components/schemas/Tracking' }
-        creative_references:
-          type: array
-          maxItems: 50
-          items: { $ref: '#/components/schemas/CreativeReference' }
-        strategy_reference: { $ref: '#/components/schemas/StrategyReference' }
-        source_strategy_version: { type: string }
+        intent: { $ref: '#/components/schemas/DeliveryIntent' }
+        platform_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
     DeliveryPlanVersion:
+      oneOf:
+        - $ref: '#/components/schemas/PlatformDeliveryPlanVersion'
+        - $ref: '#/components/schemas/LegacyDeliveryPlanVersion'
+    PlatformDeliveryPlanVersion:
+      type: object
+      additionalProperties: false
+      required: [schema_version, runtime_status, plan_id, organization_id, project_id, version_number, canonical_hash, intent, platform_configuration, platform, source, scenario, created_by, created_at]
+      properties:
+        schema_version: { type: string, const: delivery-plan-version/v2 }
+        runtime_status: { type: string, enum: [active, capability_pending] }
+        read_only: { type: boolean, const: false }
+        plan_id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        version_number: { type: integer, minimum: 1 }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash', description: Exactly equals platform_configuration.canonical_hash. }
+        intent: { $ref: '#/components/schemas/DeliveryIntent' }
+        platform_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
+        platform: { type: string, enum: [ocean_engine, magnetic_engine] }
+        source: { type: string, const: mock }
+        scenario: { type: string, enum: [platform_configuration, capability_pending] }
+        created_by: { $ref: '#/components/schemas/Principal' }
+        created_at: { type: string, format: date-time }
+    LegacyDeliveryPlanVersion:
       allOf:
         - $ref: '#/components/schemas/PlanDraft'
         - type: object
-          required: [plan_id, organization_id, project_id, version_number, canonical_hash, platform, source, scenario, created_by, created_at]
+          required: [runtime_status, read_only, plan_id, organization_id, project_id, version_number, canonical_hash, platform, source, scenario, created_by, created_at]
           properties:
+            runtime_status: { type: string, const: legacy_unsupported }
+            read_only: { type: boolean, const: true }
             plan_id: { type: string }
             organization_id: { type: string }
             project_id: { type: string }
             version_number: { type: integer, minimum: 1 }
             canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
-            three_tier_configuration: { $ref: '#/components/schemas/DeliveryConfigurationSnapshot' }
+            three_tier_configuration: { $ref: '#/components/schemas/LegacyThreeTierSnapshot', deprecated: true, readOnly: true }
             platform: { type: string, const: ocean_engine_mock }
             source: { type: string, const: mock }
             scenario: { $ref: '#/components/schemas/Scenario' }
@@ -1095,7 +2035,7 @@ components:
         end_at: { type: string, format: date-time }
         status: { type: string, const: draft }
         version: { type: integer, minimum: 1 }
-        platform: { type: string, const: ocean_engine_mock }
+        platform: { type: string, enum: [ocean_engine, magnetic_engine, ocean_engine_mock] }
         source: { type: string, const: mock }
         scenario: { $ref: '#/components/schemas/Scenario' }
         tour_run_id:
@@ -1120,7 +2060,7 @@ components:
         updated_at: { type: string, format: date-time }
     Scenario:
       type: string
-      enum: [golden_path, budget_zero, creative_unconfirmed, tracking_missing, incomplete_draft, project_plan_list, approval_queue, missing_required_field, orphan_dependency, missing_confirmation, platform_fields_pending, recommendation_generated, recommendation_accepted, recommendation_rejected, manual_action_package, preflight_failure, approval_expired, plan_stale, partial_execution, result_unknown, review_rejected_alert]
+      enum: [golden_path, budget_zero, creative_unconfirmed, tracking_missing, incomplete_draft, project_plan_list, approval_queue, platform_configuration, capability_pending, recommendation_generated, recommendation_accepted, recommendation_rejected, preflight_failure, approval_expired, plan_stale, partial_execution, result_unknown, review_rejected_alert]
     PlanList:
       type: object
       required: [items, source, scenario]
@@ -1144,7 +2084,7 @@ components:
       required: [field, section, label]
       properties:
         field: { type: string }
-        section: { type: string, enum: [目标与账户, 预算与排期, 追踪, 素材引用] }
+        section: { type: string, enum: [目标与账户, 预算与排期, 追踪, 素材引用, 平台配置, 稳定引用] }
         label: { type: string }
     PreflightCheck:
       type: object
@@ -1152,7 +2092,7 @@ components:
       properties:
         code:
           type: string
-          enum: [advertiser_available, budget_positive, schedule_valid, creative_present, creative_confirmed, tracking_complete, three_tier_structure, three_tier_required_fields, three_tier_dependencies, three_tier_confirmation, three_tier_platform_pending]
+          enum: [delivery_intent_valid, platform_configuration_valid, INVALID_STABLE_REFERENCE, CANONICAL_HASH_MISMATCH, CAPABILITY_PENDING, platform_pending, blocked_by_event_asset, write_validation_pending]
         severity: { type: string, enum: [error, warning] }
         passed: { type: boolean }
         message: { type: string }
@@ -1174,9 +2114,11 @@ components:
         source: { type: string, const: mock }
         scenario: { $ref: '#/components/schemas/Scenario' }
         checked_at: { type: string, format: date-time }
-    DeliveryConfigurationFixture:
+    LegacyThreeTierFixture:
       type: string
-      description: Server-authored deterministic three-tier fixture; real-platform values and constraints are intentionally not modeled.
+      deprecated: true
+      readOnly: true
+      description: Frozen discriminator retained only to decode historical snapshots.
       enum: [golden_path, missing_required_field, orphan_dependency, missing_confirmation, platform_fields_pending]
     DeliveryFieldValue:
       type: object
@@ -1191,7 +2133,7 @@ components:
       required: [source, scenario, evidence_refs]
       properties:
         source: { type: string, const: mock }
-        scenario: { $ref: '#/components/schemas/DeliveryConfigurationFixture' }
+        scenario: { $ref: '#/components/schemas/LegacyThreeTierFixture' }
         evidence_refs:
           type: array
           items: { type: string }
@@ -1281,15 +2223,18 @@ components:
           type: array
           minItems: 1
           items: { $ref: '#/components/schemas/DeliveryPlanConfiguration' }
-    DeliveryConfigurationSnapshot:
+    LegacyThreeTierSnapshot:
       type: object
+      deprecated: true
+      readOnly: true
+      description: Frozen historical payload. It is never accepted by a write operation.
       additionalProperties: false
       required: [schema, source, scenario, fixture_scenario, generated_at, evidence, groups]
       properties:
         schema: { type: string, const: delivery-three-tier/v1 }
         source: { type: string, const: mock }
-        scenario: { $ref: '#/components/schemas/DeliveryConfigurationFixture' }
-        fixture_scenario: { $ref: '#/components/schemas/DeliveryConfigurationFixture' }
+        scenario: { $ref: '#/components/schemas/LegacyThreeTierFixture' }
+        fixture_scenario: { $ref: '#/components/schemas/LegacyThreeTierFixture' }
         generated_at: { type: string, format: date-time }
         evidence:
           type: array
@@ -1298,13 +2243,332 @@ components:
           type: array
           minItems: 1
           items: { $ref: '#/components/schemas/DeliveryGroupConfiguration' }
+    DecisionInputBindings:
+      type: object
+      additionalProperties: false
+      required: [plan_id, plan_version, plan_canonical_hash, intent_id, intent_version, intent_canonical_hash, configuration_id, configuration_version, configuration_canonical_hash, fact_snapshot_ref]
+      properties:
+        plan_id: { type: string }
+        plan_version: { type: integer, minimum: 1 }
+        plan_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        intent_id: { type: string }
+        intent_version: { type: integer, minimum: 1 }
+        intent_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        configuration_id: { type: string }
+        configuration_version: { type: integer, minimum: 1 }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        fact_snapshot_ref: { type: string }
+        simulation_run_id: { type: string }
+        simulation_input_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        baseline_metric_id: { type: string }
+        baseline_metric_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        current_metric_id: { type: string }
+        current_metric_hash: { $ref: '#/components/schemas/CanonicalHash' }
+    DecisionConstraint:
+      type: object
+      additionalProperties: false
+      required: [code, passed, explanation]
+      properties:
+        code: { type: string }
+        passed: { type: boolean }
+        explanation: { type: string }
+    DeliveryDecisionCandidate:
+      type: object
+      additionalProperties: false
+      required: [id, kind, target_configuration, budget_change_percent, rationale, constraints, risks, uncertainty]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [conservative, balanced, exploratory] }
+        target_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
+        budget_change_percent: { type: integer, maximum: 0 }
+        rationale:
+          type: array
+          items: { type: string }
+        constraints:
+          type: array
+          items: { $ref: '#/components/schemas/DecisionConstraint' }
+        risks:
+          type: array
+          items: { type: string }
+        uncertainty: { type: string, enum: [low, medium, high] }
+    DeliveryDecision:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, policy_version, diagnostic, inputs, candidates, recommended_candidate_id, evidence, canonical_hash, created_by, created_at]
+      properties:
+        schema_version: { type: string, const: delivery-decision/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        policy_version: { type: string, const: delivery-decision-policy/v1 }
+        diagnostic:
+          type: object
+          additionalProperties: false
+          required: [code, explanation, next_action]
+          properties:
+            code: { type: string, enum: [ready, insufficient_data, stale_data, blocked_by_asset, platform_pending] }
+            explanation: { type: string }
+            next_action: { type: string }
+        inputs: { $ref: '#/components/schemas/DecisionInputBindings' }
+        candidates:
+          type: array
+          maxItems: 3
+          items: { $ref: '#/components/schemas/DeliveryDecisionCandidate' }
+        recommended_candidate_id: { type: string }
+        evidence:
+          type: array
+          items: { type: string }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    DeliveryDecisionList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeliveryDecision' }
+    SelectDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, expected_plan_version]
+      properties:
+        candidate_id: { type: string, minLength: 1 }
+        expected_plan_version: { type: integer, minimum: 1 }
+    WorkflowField:
+      type: object
+      additionalProperties: false
+      required: [key, value, expected_readback, evidence_ref]
+      properties:
+        key: { type: string }
+        value: {}
+        expected_readback: {}
+        evidence_ref: { type: string }
+    CompiledWorkflowStep:
+      type: object
+      additionalProperties: false
+      required: [id, sequence, page, action, risk, preconditions, fields, timeout_seconds, recovery, blocked]
+      properties:
+        id: { type: string }
+        sequence: { type: integer, minimum: 1 }
+        page: { type: string }
+        action: { type: string }
+        risk: { type: string, enum: [observe, prepare_local_form, remote_write] }
+        preconditions:
+          type: array
+          items: { type: string }
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowField' }
+        timeout_seconds: { type: integer, minimum: 0 }
+        recovery: { type: string }
+        blocked: { type: boolean }
+        block_reason: { type: string, enum: [PHASE_C_REMOTE_WRITE_PROHIBITED] }
+    CompiledDeliveryWorkflow:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, decision_id, decision_canonical_hash, selected_candidate_id, configuration_canonical_hash, configuration_id, configuration_version, platform, profile_version, account_reference, capability_contract_version, selector_contract_version, action_contract_version, compiler_version, status, remote_write_enabled, steps, canonical_hash, created_by, created_at]
+      properties:
+        schema_version: { type: string, const: compiled-delivery-workflow/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        decision_id: { type: string }
+        decision_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        selected_candidate_id: { type: string }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        configuration_id: { type: string }
+        configuration_version: { type: integer, minimum: 1 }
+        platform: { type: string, const: ocean_engine }
+        profile_version: { type: string, const: oceanengine-configuration/v1 }
+        account_reference: { $ref: '#/components/schemas/StableReference' }
+        capability_contract_version: { type: string, const: oceanengine-capability/v0.1 }
+        selector_contract_version: { type: string, const: oceanengine-selector-contract/v0.1 }
+        action_contract_version: { type: string, const: oceanengine-action-contract/v0.1 }
+        compiler_version: { type: string, const: oceanengine-workflow-compiler/v1 }
+        status: { type: string, const: ready_for_final_approval }
+        remote_write_enabled: { type: boolean, const: false }
+        steps:
+          type: array
+          minItems: 3
+          items: { $ref: '#/components/schemas/CompiledWorkflowStep' }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    FinalApprovalBinding:
+      type: object
+      additionalProperties: false
+      required: [status, action, plan_canonical_hash, intent_canonical_hash, decision_canonical_hash, configuration_canonical_hash, workflow_canonical_hash]
+      properties:
+        status: { type: string, const: ready_for_final_approval }
+        action: { type: string, const: remote_write }
+        plan_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        intent_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        decision_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        workflow_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+    DecisionSelection:
+      type: object
+      additionalProperties: false
+      required: [id, organization_id, project_id, decision_id, decision_canonical_hash, candidate_id, configuration, workflow, final_approval_binding, created_by, created_at]
+      properties:
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        decision_id: { type: string }
+        decision_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        candidate_id: { type: string }
+        configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
+        workflow: { $ref: '#/components/schemas/CompiledDeliveryWorkflow' }
+        final_approval_binding: { $ref: '#/components/schemas/FinalApprovalBinding' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    ObservatoryFixture:
+      type: object
+      additionalProperties: false
+      required: [fixture_id, data_state, data_state_reason, observed_at, data_through, observed_values, selector_matches, evidence_refs, page_refs]
+      properties:
+        fixture_id: { type: string, minLength: 1 }
+        data_state: { type: string, enum: [ready, insufficient_data, stale_data, blocked_by_asset, platform_pending] }
+        data_state_reason: { type: string }
+        observed_at: { type: string, format: date-time }
+        data_through: { type: string, format: date-time }
+        observed_values: { type: object, additionalProperties: true }
+        selector_matches:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+        evidence_refs:
+          type: array
+          minItems: 1
+          items: { type: string }
+        page_refs:
+          type: array
+          items: { type: string }
+        failure_step_id: { type: string, description: Deterministic Mock/Replay failure injection; never calls a platform. }
+    RunObservatoryRequest:
+      type: object
+      additionalProperties: false
+      required: [source, mode, fixture]
+      properties:
+        source: { type: string, enum: [mock, replay] }
+        mode: { type: string, enum: [observe_existing, prepare_new_local_form] }
+        fixture: { $ref: '#/components/schemas/ObservatoryFixture' }
+    ObservatoryBinding:
+      type: object
+      additionalProperties: false
+      required: [selection_id, decision_id, decision_canonical_hash, configuration_id, configuration_version, configuration_canonical_hash, workflow_id, workflow_canonical_hash, decision_schema_version, configuration_schema_version, workflow_schema_version]
+      properties:
+        selection_id: { type: string }
+        decision_id: { type: string }
+        decision_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        configuration_id: { type: string }
+        configuration_version: { type: integer, minimum: 1 }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        workflow_id: { type: string }
+        workflow_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        decision_schema_version: { type: string, const: delivery-decision/v1 }
+        configuration_schema_version: { type: string }
+        workflow_schema_version: { type: string, const: compiled-delivery-workflow/v1 }
+    ObservatoryFieldDiff:
+      type: object
+      additionalProperties: false
+      required: [key, evidence_ref, expected_value, observed_value, matches]
+      properties:
+        key: { type: string }
+        evidence_ref: { type: string }
+        expected_value: {}
+        observed_value: {}
+        matches: { type: boolean }
+    ObservatoryStepObservation:
+      type: object
+      additionalProperties: false
+      required: [step_id, sequence, page, workflow_action, executed_action, status, selector_matches, evidence_refs, page_refs, diffs]
+      properties:
+        step_id: { type: string }
+        sequence: { type: integer, minimum: 1 }
+        page: { type: string }
+        workflow_action: { type: string }
+        executed_action: { type: string, enum: [observe, prepare_local_form] }
+        status: { type: string, enum: [observed, prepared_locally, blocked, failed] }
+        selector_matches: { type: array, items: { type: string } }
+        evidence_refs: { type: array, items: { type: string } }
+        page_refs: { type: array, items: { type: string } }
+        diffs: { type: array, items: { $ref: '#/components/schemas/ObservatoryFieldDiff' } }
+        block_reason: { type: string, enum: [PHASE_C_REMOTE_WRITE_PROHIBITED, insufficient_data, stale_data, blocked_by_asset, platform_pending, MOCK_REPLAY_RUNNER_FAILURE] }
+    DeliveryObservatoryRun:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, runner_version, source, mode, input_hash, binding, data_state, data_state_reason, observed_at, data_through, status, outcome, remote_write_enabled, steps, evidence_refs, page_refs, canonical_hash, created_by, created_at]
+      properties:
+        schema_version: { type: string, const: delivery-observatory-run/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        runner_version: { type: string, const: mock-replay-observatory-runner/v1 }
+        source: { type: string, enum: [mock, replay] }
+        mode: { type: string, enum: [observe_existing, prepare_new_local_form] }
+        input_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        binding: { $ref: '#/components/schemas/ObservatoryBinding' }
+        data_state: { type: string, enum: [ready, insufficient_data, stale_data, blocked_by_asset, platform_pending] }
+        data_state_reason: { type: string }
+        observed_at: { type: string, format: date-time }
+        data_through: { type: string, format: date-time }
+        status: { type: string, enum: [completed, blocked, runner_failed] }
+        outcome: { type: string, enum: [in_sync, drift_detected, local_form_prepared, insufficient_data, stale_data, blocked_by_asset, platform_pending, runner_failure] }
+        remote_write_enabled: { type: boolean, const: false }
+        steps: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ObservatoryStepObservation' } }
+        evidence_refs: { type: array, minItems: 1, items: { type: string } }
+        page_refs: { type: array, items: { type: string } }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    SubmitObservatoryFeedbackRequest:
+      type: object
+      additionalProperties: false
+      required: [disposition, reason, diff_keys]
+      properties:
+        disposition: { type: string, enum: [accepted, modified, rejected] }
+        reason: { type: string, minLength: 1 }
+        diff_keys: { type: array, items: { type: string } }
+        final_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
+      allOf:
+        - if: { properties: { disposition: { const: modified } }, required: [disposition] }
+          then: { required: [final_configuration] }
+        - if: { properties: { disposition: { enum: [accepted, rejected] } }, required: [disposition] }
+          then: { not: { required: [final_configuration] } }
+    DeliveryObservatoryFeedback:
+      type: object
+      additionalProperties: false
+      required: [schema_version, id, organization_id, project_id, run_id, run_canonical_hash, run_outcome, disposition, reason, diff_keys, canonical_hash, created_by, created_at]
+      properties:
+        schema_version: { type: string, const: delivery-observatory-feedback/v1 }
+        id: { type: string }
+        organization_id: { type: string }
+        project_id: { type: string }
+        run_id: { type: string }
+        run_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        run_outcome: { type: string, enum: [in_sync, drift_detected, local_form_prepared, insufficient_data, stale_data, blocked_by_asset, platform_pending, runner_failure] }
+        disposition: { type: string, enum: [accepted, modified, rejected] }
+        reason: { type: string }
+        diff_keys: { type: array, items: { type: string } }
+        final_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
+        final_configuration_canonical_hash:
+          oneOf:
+            - { $ref: '#/components/schemas/CanonicalHash' }
+            - { type: string, const: '' }
+        canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
     RecommendationStatus:
       type: string
       enum: [proposed, accepted, rejected]
     DeliveryRecommendation:
       type: object
       additionalProperties: false
-      required: [id, organization_id, project_id, plan_id, plan_version, simulation_run_id, fingerprint, status, base_snapshot, base_snapshot_hash, target_snapshot, target_snapshot_hash, evidence, action, impact, risks, observation, provenance, version, created_by, created_at, updated_at]
+      required: [id, organization_id, project_id, plan_id, plan_version, simulation_run_id, fingerprint, status, base_snapshot_hash, target_snapshot_hash, evidence, action, impact, risks, observation, provenance, version, created_by, created_at, updated_at]
       properties:
         id: { type: string }
         organization_id: { type: string }
@@ -1314,10 +2578,14 @@ components:
         simulation_run_id: { type: string }
         fingerprint: { type: string, minLength: 1 }
         status: { $ref: '#/components/schemas/RecommendationStatus' }
-        base_snapshot: { $ref: '#/components/schemas/DeliveryConfigurationSnapshot' }
+        base_snapshot: { $ref: '#/components/schemas/LegacyThreeTierSnapshot', deprecated: true, readOnly: true }
+        base_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
         base_snapshot_hash: { $ref: '#/components/schemas/CanonicalHash' }
-        target_snapshot: { $ref: '#/components/schemas/DeliveryConfigurationSnapshot' }
+        target_snapshot: { $ref: '#/components/schemas/LegacyThreeTierSnapshot', deprecated: true, readOnly: true }
+        target_configuration: { $ref: '#/components/schemas/PlatformConfiguration' }
         target_snapshot_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        runtime_status: { type: string, enum: [active, capability_pending, legacy_unsupported] }
+        read_only: { type: boolean }
         evidence:
           type: array
           items: { type: string }
@@ -1363,8 +2631,11 @@ components:
         plan_name: { type: string, minLength: 1 }
         plan_version: { type: integer, minimum: 1 }
         plan_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
-        target_snapshot: { $ref: '#/components/schemas/DeliveryConfigurationSnapshot' }
+        target_snapshot: { $ref: '#/components/schemas/PlatformConfiguration' }
+        legacy_target_snapshot: { $ref: '#/components/schemas/LegacyThreeTierSnapshot', deprecated: true, readOnly: true }
         target_snapshot_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        runtime_status: { type: string, enum: [active, capability_pending, legacy_unsupported] }
+        read_only: { type: boolean }
         recommendation_id: { type: string }
         budget_limit: { $ref: '#/components/schemas/Budget' }
         status: { type: string, enum: [draft, preflight_passed, preflight_failed, approved, rejected, executed, rolled_back] }
@@ -1410,6 +2681,18 @@ components:
         change_set_version: { type: integer, minimum: 1 }
         plan_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
         target_snapshot_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        runtime_status: { type: string, enum: [active, capability_pending, legacy_unsupported] }
+        read_only: { type: boolean }
+        configuration_schema_version: { type: string, const: delivery-platform-configuration/v2 }
+        configuration_id: { type: string }
+        configuration_version: { type: integer, minimum: 1 }
+        configuration_platform: { type: string, enum: [ocean_engine, magnetic_engine] }
+        configuration_profile_version: { type: string }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        intent_schema_version: { type: string, const: delivery-intent/v1 }
+        intent_id: { type: string }
+        intent_version: { type: integer, minimum: 1 }
+        intent_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
         action_hash: { $ref: '#/components/schemas/CanonicalHash' }
         action: { type: string, const: execute }
         scope: { type: string, const: execute_mock }
@@ -1431,7 +2714,7 @@ components:
       additionalProperties: false
       required: [layer, group_id, plan_id, creative_id, field_key, effective, source, confirmation_required, expected_result, evidence_refs]
       properties:
-        layer: { type: string, enum: [group, plan, creative] }
+        layer: { type: string, enum: [project, promotion, group, plan, creative] }
         group_id: { type: string }
         plan_id: { type: string }
         creative_id: { type: string }
@@ -1443,8 +2726,11 @@ components:
         evidence_refs:
           type: array
           items: { type: string }
-    ManualActionPackage:
+    LegacyManualActionPackage:
       type: object
+      deprecated: true
+      readOnly: true
+      description: Frozen historical audit payload. No write operation creates this object.
       additionalProperties: false
       required: [id, organization_id, project_id, change_set_id, target_snapshot_hash, content_hash, instructions, forbidden_actions, evidence, provenance, optimized_plan_version, optimized_plan_hash, source, scenario, created_at]
       properties:
@@ -1453,6 +2739,16 @@ components:
         project_id: { type: string }
         change_set_id: { type: string }
         target_snapshot_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        configuration_schema_version: { type: string, const: delivery-platform-configuration/v2 }
+        configuration_id: { type: string }
+        configuration_version: { type: integer, minimum: 1 }
+        configuration_platform: { type: string, enum: [ocean_engine, magnetic_engine] }
+        configuration_profile_version: { type: string }
+        configuration_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
+        intent_schema_version: { type: string, const: delivery-intent/v1 }
+        intent_id: { type: string }
+        intent_version: { type: integer, minimum: 1 }
+        intent_canonical_hash: { $ref: '#/components/schemas/CanonicalHash' }
         content_hash: { $ref: '#/components/schemas/CanonicalHash' }
         instructions:
           type: array
@@ -1898,7 +3194,7 @@ components:
           type: object
           required: [code, message, request_id, retryable, details]
           properties:
-            code: { type: string, enum: [INVALID_REQUEST, RESOURCE_NOT_FOUND, PROJECT_ACCESS_DENIED, INVALID_STATE, VERSION_CONFLICT, IDEMPOTENCY_CONFLICT, STALE_PLAN_VERSION, APPROVAL_REQUIRED, APPROVAL_EXPIRED, APPROVAL_CONTENT_MISMATCH, APPROVAL_SCOPE_EXCEEDED, TOUR_OWNER_MISMATCH, SCOPE_REQUIRED, INTERNAL] }
+            code: { type: string, enum: [INVALID_REQUEST, RESOURCE_NOT_FOUND, PROJECT_ACCESS_DENIED, INVALID_STATE, VERSION_CONFLICT, IDEMPOTENCY_CONFLICT, STALE_PLAN_VERSION, APPROVAL_REQUIRED, APPROVAL_EXPIRED, APPROVAL_CONTENT_MISMATCH, APPROVAL_SCOPE_EXCEEDED, LEGACY_CONFIGURATION_UNSUPPORTED, TOUR_OWNER_MISMATCH, SCOPE_REQUIRED, INTERNAL] }
             message: { type: string }
             request_id: { type: string }
             retryable: { type: boolean }

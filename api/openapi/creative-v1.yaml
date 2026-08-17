@@ -14,10 +14,45 @@ servers:
 security:
   - cookiesAuth: []
 paths:
+  /api/creative/v1/projects/{project_id}/ai-native-ads/output-presets:
+    get:
+      operationId: listAINativeAdOutputPresets
+      summary: List only output presets whose channel profile and provider route are verified.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}]
+      responses:
+        '200':
+          description: Available immutable placement and aspect-ratio presets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/AINativeOutputPreset'}
+  /api/creative/v1/projects/{project_id}/ai-native-ads/products:resolve:
+    post:
+      operationId: resolveAINativeAdProductPreview
+      summary: Recognize a Douyin, Taobao, Tmall, or 1688 product link without calling a commerce-platform API.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [product_link]
+              properties:
+                product_link: {type: string, minLength: 1, maxLength: 65536}
+      responses:
+        '200':
+          description: Platform and external identity were recognized; missing product facts are explicit.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AINativeProductPreview'}
+        '422': {description: The input is incomplete, unsupported, or does not contain a product/content identity.}
   /api/creative/v1/projects/{project_id}/ai-native-ads/requirements:analyze:
     post:
       operationId: analyzeAINativeAdRequirement
-      summary: Resolve a Douyin Mall product link and produce one editable AI-native-ad requirement draft.
+      summary: Resolve a supported commerce link and produce one editable AI-native-ad requirement draft.
       parameters: [{$ref: '#/components/parameters/ProjectID'}]
       requestBody:
         required: true
@@ -28,12 +63,12 @@ paths:
               additionalProperties: false
               required: [product_link, supplemental_requirement]
               properties:
-                product_link: {type: string, minLength: 1, maxLength: 16384}
+                product_link: {type: string, minLength: 1, maxLength: 65536}
                 supplemental_requirement: {type: string, maxLength: 2000}
-                channel: {type: string, enum: [douyin], default: douyin}
-                aspect_ratio: {type: string, enum: ['9:16'], default: '9:16'}
                 duration_seconds: {type: integer, minimum: 15, maximum: 30, default: 20}
                 language: {type: string, enum: [zh-CN], default: zh-CN}
+                output_preset_id: {type: string, enum: [douyin_feed_9x16_v1], default: douyin_feed_9x16_v1}
+                delivery_treatment: {$ref: '#/components/schemas/AINativeDeliveryTreatment'}
       responses:
         '200':
           description: Editable requirement-analysis draft; price and incomplete product facts remain explicitly unconfirmed.
@@ -82,7 +117,7 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [expected_revision, product_name, product_description, target_audiences, media, core_selling_points, supplemental_requirement, aspect_ratio, duration_seconds, language]
+              required: [expected_revision, product_name, product_description, target_audiences, media, core_selling_points, supplemental_requirement, output_preset_id, duration_seconds, language]
               properties:
                 expected_revision: {type: integer, minimum: 1}
                 product_name: {type: string, minLength: 1}
@@ -91,9 +126,10 @@ paths:
                 media: {type: array, maxItems: 20, items: {$ref: '#/components/schemas/AINativeRequirementMedia'}}
                 core_selling_points: {type: array, minItems: 1, maxItems: 20, items: {$ref: '#/components/schemas/AINativeEditableText'}}
                 supplemental_requirement: {type: string, maxLength: 2000}
-                aspect_ratio: {const: '9:16'}
                 duration_seconds: {type: integer, minimum: 15, maximum: 30}
                 language: {const: zh-CN}
+                output_preset_id: {type: string, enum: [douyin_feed_9x16_v1]}
+                delivery_treatment: {$ref: '#/components/schemas/AINativeDeliveryTreatment'}
       responses:
         '200':
           description: Workspace pointing to the newly appended revision.
@@ -124,6 +160,8 @@ paths:
           content:
             application/json:
               schema: {$ref: '../contracts/creative-ai-native-requirement-workspace-v1.schema.json'}
+        '400':
+          description: Required product name, product image, selling point, or target audience is missing; the error details identify each incomplete field.
         '409': {$ref: '#/components/responses/Conflict'}
   /api/creative/v1/projects/{project_id}/ai-native-ads/{workspace_id}/reopen-impact:
     get:
@@ -634,6 +672,15 @@ paths:
       responses:
         '200': {description: Workspace whose active clips reference stable project AssetVersions.}
         '409': {$ref: '#/components/responses/Conflict'}
+  /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:generate-sound-assets:
+    post:
+      operationId: generateBrandFilmSoundAssets
+      summary: Generate the current v2 music, ambience and SFX prompts through the configured Sound Asset Provider. Never falls back to Fixture media.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/TaskID'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {$ref: '#/components/requestBodies/BrandFilmRevision'}
+      responses:
+        '200': {description: Workspace whose active clips reference AI-generated project AssetVersions.}
+        '409': {$ref: '#/components/responses/Conflict'}
   /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/brand-film:render-audio-preview:
     post:
       operationId: renderBrandFilmAudioPreview
@@ -954,6 +1001,38 @@ paths:
               schema: {$ref: '../contracts/creative-brand-brief-review-v1.schema.json'}
         '400': {$ref: '#/components/responses/InvalidRequest'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-workflow:
+    get:
+      operationId: getCreativeStrategyBrandWorkflow
+      summary: Restore the Strategy-to-brand workflow without creating, confirming, generating, or upgrading resources.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/IntakeID'}]
+      responses:
+        '200':
+          description: Durable Strategy brand workflow state.
+          content:
+            application/json:
+              schema: {$ref: '../contracts/creative-strategy-brand-workflow-v1.schema.json'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-workflow:prepare:
+    post:
+      operationId: prepareCreativeStrategyBrandWorkflow
+      summary: Explicitly accept the deterministic Creative projection of one frozen Strategy brand-video intake.
+      description: This command is idempotent, does not invoke a model, does not generate directions, and does not create a Creative task.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/IntakeID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PrepareStrategyBrandWorkflowRequest'}
+      responses:
+        '200':
+          description: Prepared or restored Strategy brand workflow state.
+          content:
+            application/json:
+              schema: {$ref: '../contracts/creative-strategy-brand-workflow-v1.schema.json'}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
   /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}/brand-brief:
     get:
       operationId: getCreativeBrandBrief
@@ -1115,7 +1194,7 @@ paths:
   /api/creative/v1/projects/{project_id}/creative-intakes/{intake_id}:create-video-task:
     post:
       operationId: createCreativePreRollVideoTask
-      summary: Confirm an approved video route and create or resume one CreativeTask, including a BrandFilm workspace for brand_video.
+      summary: Confirm an approved video route and create or resume one CreativeTask; Strategy brand_video intakes require a confirmed direction.
       parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/IntakeID'}]
       requestBody:
         required: true
@@ -1304,6 +1383,19 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/CreativeTaskDetail'}
         '409': {$ref: '#/components/responses/Conflict'}
+  /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake/input-draft:
+    patch:
+      operationId: updateCreativeViralRemakeInput
+      summary: Replace product facts before re-analyzing the reference; this invalidates any stale analysis and prompt package.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/TaskID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateViralInputRequest'}
+      responses:
+        '200': {description: Input snapshot persisted and stale analysis cleared.}
+        '409': {$ref: '#/components/responses/Conflict'}
   /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake/prompt-draft:
     patch:
       operationId: updateCreativeViralRemakePrompt
@@ -1329,6 +1421,19 @@ paths:
             schema: {$ref: '#/components/schemas/ConfirmViralGenerationRequest'}
       responses:
         '200': {description: PromptPackage frozen and generation readiness enabled.}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake:retry-without-reference-image:
+    post:
+      operationId: retryCreativeViralRemakeWithoutReferenceImage
+      summary: After a real-person reference-image policy rejection, freeze a distinct text-only original-person PromptPackage for a new generation attempt.
+      parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/TaskID'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RetryViralWithoutReferenceImageRequest'}
+      responses:
+        '200': {description: A policy-safe text-only PromptPackage is frozen and ready to submit.}
         '409': {$ref: '#/components/responses/Conflict'}
   /api/creative/v1/projects/{project_id}/creative-tasks/{task_id}/viral-remake/candidates/{candidate_id}:submit-review:
     post:
@@ -1465,6 +1570,140 @@ paths:
       summary: Create the stable CreativePackage for Delivery and Insights from an approved version.
       parameters: [{$ref: '#/components/parameters/ProjectID'}, {$ref: '#/components/parameters/VersionID'}]
       responses: {'200': {description: Stable CreativePackage created or replayed.}, '409': {$ref: '#/components/responses/Conflict'}}
+  /api/creative/v1/projects/{project_id}/production-runs:
+    get:
+      operationId: listCreativeProductionRuns
+      summary: List the current Project's Creative-owned generation and render run projections.
+      description: >-
+        Returns a read-only projection over Provider and Creative render owners.
+        The projection never becomes the authority for job, asset, review,
+        delivery, or Insights state. Results are ordered by created_at and run
+        identity descending; next_cursor is opaque to callers.
+      parameters:
+        - {$ref: '#/components/parameters/ProjectID'}
+        - name: media_kind
+          in: query
+          schema: {enum: [image, video, audio, render]}
+        - name: status
+          in: query
+          style: form
+          explode: false
+          schema:
+            type: array
+            uniqueItems: true
+            items: {enum: [queued, running, ingesting, succeeded, partially_succeeded, failed, expired, cancelled]}
+        - name: source_task_id
+          in: query
+          schema: {type: string, minLength: 1, maxLength: 96}
+        - name: created_after
+          in: query
+          schema: {type: string, format: date-time}
+        - name: created_before
+          in: query
+          schema: {type: string, format: date-time}
+        - name: q
+          in: query
+          description: Matches allowed run IDs, source task display names, and error codes; full prompts are never indexed here.
+          schema: {type: string, minLength: 1, maxLength: 200}
+        - {$ref: '#/components/parameters/ProductionCursor'}
+        - {$ref: '#/components/parameters/ProductionLimit'}
+      responses:
+        '200':
+          description: Project-scoped production runs plus per-source health.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProductionRunPage'}
+              examples:
+                partialSuccess:
+                  externalValue: ../fixtures/creative-production-run-page-v1.json
+        '400': {$ref: '#/components/responses/ProductionInvalidCursor'}
+        '403': {$ref: '#/components/responses/ProjectAccessDenied'}
+        '503': {$ref: '#/components/responses/ProductionSourceUnavailable'}
+  /api/creative/v1/projects/{project_id}/production-runs/{production_source}/{production_run_id}:
+    get:
+      operationId: getCreativeProductionRun
+      summary: Get one production run projection with safe inputs, outputs, lineage, cost, error, and run events.
+      description: >-
+        The response preserves native owner status and exposes only stable
+        AssetVersion references and sanitized diagnostics. It never returns
+        Provider credentials, external task identifiers, temporary output URLs,
+        object-storage keys, or full prompts as ordinary diagnostics.
+      parameters:
+        - {$ref: '#/components/parameters/ProjectID'}
+        - {$ref: '#/components/parameters/ProductionSource'}
+        - {$ref: '#/components/parameters/ProductionRunID'}
+      responses:
+        '200':
+          description: Safe detail for the scoped production run.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProductionRunDetail'}
+              examples:
+                failedEditingRender:
+                  externalValue: ../fixtures/creative-production-run-detail-v1.json
+        '403': {$ref: '#/components/responses/ProjectAccessDenied'}
+        '404': {$ref: '#/components/responses/ProductionRunNotFound'}
+        '503': {$ref: '#/components/responses/ProductionSourceUnavailable'}
+  /api/creative/v1/projects/{project_id}/production-runs/{production_source}/{production_run_id}:retry:
+    post:
+      operationId: retryCreativeProductionRun
+      summary: Delegate a retry to the Creative workflow that owns the failed production run.
+      description: >-
+        A retry always creates a new owner Attempt or RenderJob and preserves
+        the previous run. The command must not create a bare Provider Job when
+        the source workflow cannot prove immutable inputs and retry eligibility.
+      parameters:
+        - {$ref: '#/components/parameters/ProjectID'}
+        - {$ref: '#/components/parameters/ProductionSource'}
+        - {$ref: '#/components/parameters/ProductionRunID'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '202':
+          description: Retry delegated and a new owner run accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProductionRetryResult'}
+              examples:
+                editingRenderRetry:
+                  externalValue: ../fixtures/creative-production-retry-v1.json
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '403': {$ref: '#/components/responses/ProjectAccessDenied'}
+        '404': {$ref: '#/components/responses/ProductionRunNotFound'}
+        '409': {$ref: '#/components/responses/ProductionRetryConflict'}
+        '503': {$ref: '#/components/responses/ProductionSourceUnavailable'}
+  /api/creative/v1/projects/{project_id}/production-assets:
+    get:
+      operationId: listCreativeProductionAssets
+      summary: List stable AssetVersions referenced by the current Project's production runs.
+      description: >-
+        This is a production-lineage view, not a general asset library. It
+        returns stable AssetVersion references and short-lived Assets previews,
+        never copied binaries, Provider temporary URLs, or object-storage keys.
+      parameters:
+        - {$ref: '#/components/parameters/ProjectID'}
+        - name: role
+          in: query
+          schema: {enum: [input, output]}
+        - name: media_kind
+          in: query
+          schema: {enum: [image, video, audio]}
+        - name: run_source
+          in: query
+          schema: {enum: [provider, creative_render, editing_render, audio_render]}
+        - {$ref: '#/components/parameters/ProductionCursor'}
+        - {$ref: '#/components/parameters/ProductionLimit'}
+      responses:
+        '200':
+          description: Deduplicated production AssetVersions with run lineage.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProductionAssetPage'}
+              examples:
+                stableOutput:
+                  externalValue: ../fixtures/creative-production-asset-page-v1.json
+        '400': {$ref: '#/components/responses/ProductionInvalidCursor'}
+        '403': {$ref: '#/components/responses/ProjectAccessDenied'}
+        '503': {$ref: '#/components/responses/ProductionSourceUnavailable'}
 components:
   requestBodies:
     BrandFilmRevision:
@@ -1491,13 +1730,54 @@ components:
     VersionID: {name: version_id, in: path, required: true, schema: {type: string, minLength: 1}}
     RenderJobID: {name: render_job_id, in: path, required: true, schema: {type: string, minLength: 1}}
     IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 255}}
+    ProductionSource:
+      name: production_source
+      in: path
+      required: true
+      schema: {enum: [provider, creative_render, editing_render, audio_render]}
+    ProductionRunID:
+      name: production_run_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    ProductionCursor:
+      name: cursor
+      in: query
+      description: Opaque, versioned cursor returned by the previous page.
+      schema: {type: string, minLength: 1, maxLength: 8192}
+    ProductionLimit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
   schemas:
+    AINativeProductPreview:
+      type: object
+      additionalProperties: false
+      required: [product_id, product_name, source, source_url, status, resource_type, missing_fields]
+      properties:
+        product_id: {type: string, minLength: 1}
+        product_name: {type: string}
+        source: {enum: [douyin_mall, taobao, tmall, '1688']}
+        source_url: {type: string, format: uri}
+        status: {enum: [recognized, partial, manual_required]}
+        resource_type: {const: product}
+        missing_fields: {type: array, uniqueItems: true, items: {type: string, minLength: 1}}
+    ProductionRunPage:
+      $ref: '../contracts/creative-production-center-v1.schema.json#/$defs/ProductionRunPage'
+    ProductionRunDetail:
+      $ref: '../contracts/creative-production-center-v1.schema.json#/$defs/ProductionRunDetail'
+    ProductionAssetPage:
+      $ref: '../contracts/creative-production-center-v1.schema.json#/$defs/ProductionAssetPage'
+    ProductionRetryResult:
+      $ref: '../contracts/creative-production-center-v1.schema.json#/$defs/ProductionRetryResult'
+    ProductionProblem:
+      $ref: '../contracts/creative-production-center-v1.schema.json#/$defs/ProductionProblem'
     BrandAudioWorkspace:
       type: object
       additionalProperties: false
       required: [contract_version, plan_revision, master_duration_ms, visual_preview_asset_ref, blueprint_versions, variants, active_variant_id, active_mix_revision, generation_attempts, render_jobs, status, updated_at]
       properties:
-        contract_version: {const: creative-brand-audio-workspace/v1}
+        contract_version: {enum: [creative-brand-audio-workspace/v1, creative-brand-sound-design-workspace/v2]}
         plan_revision: {type: integer, minimum: 1}
         master_duration_ms: {type: integer, minimum: 12000}
         visual_preview_asset_ref: {type: object}
@@ -1516,7 +1796,7 @@ components:
       additionalProperties: false
       required: [op]
       properties:
-        op: {type: string, enum: [set_track_gain, set_track_muted, replace_clip_asset, set_clip_timing]}
+        op: {type: string, enum: [set_track_gain, set_track_muted, replace_clip_asset, set_clip_timing, set_clip_label, set_clip_gain, set_clip_fade, remove_clip, add_fixture_clip]}
         track_id: {type: string, minLength: 1}
         gain_db: {type: number, minimum: -96, maximum: 24}
         muted: {type: boolean}
@@ -1524,6 +1804,9 @@ components:
         asset_ref: {type: object}
         timeline_start_ms: {type: integer, minimum: 0}
         timeline_end_ms: {type: integer, minimum: 1}
+        label: {type: string, minLength: 1}
+        fade_in_ms: {type: integer, minimum: 0}
+        fade_out_ms: {type: integer, minimum: 0}
     AINativeReopenImpact:
       type: object
       additionalProperties: false
@@ -1582,6 +1865,51 @@ components:
           properties:
             asset_id: {type: string, minLength: 1}
             version: {type: integer, minimum: 1}
+    AINativeOutputPreset:
+      type: object
+      additionalProperties: false
+      required: [id, label, channel, placement, aspect_ratio, width, height, resolution, profile_id, profile_version, profile_hash, safe_zone, status]
+      properties:
+        id: {type: string, minLength: 1}
+        label: {type: string, minLength: 1}
+        channel: {type: string, minLength: 1}
+        placement: {type: string, minLength: 1}
+        aspect_ratio: {type: string, minLength: 1}
+        width: {type: integer, minimum: 1}
+        height: {type: integer, minimum: 1}
+        resolution: {type: string, minLength: 1}
+        profile_id: {type: string, minLength: 1}
+        profile_version: {type: string, minLength: 1}
+        profile_hash: {type: string, pattern: '^[a-f0-9]{64}$'}
+        safe_zone:
+          type: object
+          additionalProperties: false
+          required: [top, right, bottom, left]
+          properties:
+            top: {type: integer, minimum: 0}
+            right: {type: integer, minimum: 0}
+            bottom: {type: integer, minimum: 0}
+            left: {type: integer, minimum: 0}
+        status: {const: available}
+    AINativeDeliveryTreatment:
+      type: object
+      additionalProperties: false
+      required: [preset, voiceover_mode, caption_mode, sales_overlay_mode, music_sfx_mode]
+      properties:
+        preset: {enum: [full_ad, no_voiceover, clean_material, custom]}
+        voiceover_mode: {enum: [generated, none]}
+        caption_mode: {enum: [from_voiceover, editorial, none]}
+        sales_overlay_mode: {enum: [key_points, minimal, none]}
+        music_sfx_mode: {enum: [auto, none]}
+      allOf:
+        - if: {properties: {caption_mode: {const: from_voiceover}}, required: [caption_mode]}
+          then: {properties: {voiceover_mode: {const: generated}}}
+        - if: {properties: {preset: {const: full_ad}}, required: [preset]}
+          then: {properties: {voiceover_mode: {const: generated}, caption_mode: {const: from_voiceover}, sales_overlay_mode: {const: key_points}, music_sfx_mode: {const: auto}}}
+        - if: {properties: {preset: {const: no_voiceover}}, required: [preset]}
+          then: {properties: {voiceover_mode: {const: none}, caption_mode: {const: editorial}, sales_overlay_mode: {const: key_points}, music_sfx_mode: {const: auto}}}
+        - if: {properties: {preset: {const: clean_material}}, required: [preset]}
+          then: {properties: {voiceover_mode: {const: none}, caption_mode: {const: none}, sales_overlay_mode: {const: none}, music_sfx_mode: {const: none}}}
     CreativeIntakeCreateV4:
       $ref: '../contracts/creative-intake-create-v4.schema.json'
     CreativeIntakeV4:
@@ -1733,6 +2061,14 @@ components:
         mandatory_elements: {type: array, maxItems: 20, items: {type: string, maxLength: 200}}
         prohibited_claims: {type: array, maxItems: 20, items: {type: string, maxLength: 200}}
         confirm_route: {type: boolean, const: true}
+    PrepareStrategyBrandWorkflowRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_input_identity_hash, selected_route_id, accept_strategy_projection]
+      properties:
+        expected_input_identity_hash: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        selected_route_id: {type: string, minLength: 1, maxLength: 128}
+        accept_strategy_projection: {type: boolean, const: true}
     CreativeVideoRoute:
       type: object
       additionalProperties: false
@@ -1830,6 +2166,20 @@ components:
             environment_atmosphere: {type: string, minLength: 1}
             camera_content: {type: string, minLength: 1}
             music_sound: {type: string, minLength: 1}
+    UpdateViralInputRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, product_name, selling_points, call_to_action, user_instruction]
+      properties:
+        expected_revision: {type: integer, minimum: 1}
+        product_name: {type: string, minLength: 1, maxLength: 300}
+        selling_points:
+          type: array
+          minItems: 1
+          maxItems: 12
+          items: {type: string, minLength: 1, maxLength: 300}
+        call_to_action: {type: string, minLength: 1, maxLength: 300}
+        user_instruction: {type: string, minLength: 1, maxLength: 2000}
     ConfirmViralGenerationRequest:
       type: object
       additionalProperties: false
@@ -1838,6 +2188,12 @@ components:
         expected_revision: {type: integer, minimum: 1}
         confirm_reference_video_rights: {type: boolean, const: true}
         confirm_reference_image_rights: {type: boolean}
+    RetryViralWithoutReferenceImageRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision]
+      properties:
+        expected_revision: {type: integer, minimum: 1}
     FreezeCreativeVersionRequest:
       type: object
       additionalProperties: false
@@ -2146,3 +2502,74 @@ components:
     Conflict: {description: "The resource state, scope, or idempotency key conflicts with the request."}
     NotFound: {description: The scoped resource does not exist.}
     ProjectAccessDenied: {description: The caller cannot access this Project.}
+    ProductionInvalidCursor:
+      description: The production cursor is malformed, unsupported, or does not match the current query.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ProductionProblem'}
+          example:
+            contract_version: creative-production-problem/v1
+            code: PRODUCTION_CURSOR_INVALID
+            message: The production cursor cannot be used for this query.
+            retryable: false
+            source_task: null
+    ProductionRunNotFound:
+      description: The production run does not exist in the authorized Project and source.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ProductionProblem'}
+          example:
+            contract_version: creative-production-problem/v1
+            code: PRODUCTION_RUN_NOT_FOUND
+            message: The production run does not exist in this Project.
+            retryable: false
+            source_task: null
+    ProductionSourceUnavailable:
+      description: A required production owner adapter is temporarily unavailable.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ProductionProblem'}
+          example:
+            contract_version: creative-production-problem/v1
+            code: PRODUCTION_SOURCE_UNAVAILABLE
+            message: A production source is temporarily unavailable.
+            retryable: true
+            source_task: null
+    ProductionRetryConflict:
+      description: The owner workflow rejected retry because state, immutable inputs, or idempotency did not permit it.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ProductionProblem'}
+          examples:
+            notAllowed:
+              value:
+                contract_version: creative-production-problem/v1
+                code: PRODUCTION_RETRY_NOT_ALLOWED
+                message: The current owner state does not allow retry.
+                retryable: false
+                source_task: null
+            sourceWorkflowRequired:
+              value:
+                contract_version: creative-production-problem/v1
+                code: PRODUCTION_RETRY_REQUIRES_SOURCE_WORKFLOW
+                message: Return to the source task to restore required inputs before retrying.
+                retryable: false
+                source_task:
+                  system: creative
+                  object_type: creative_task
+                  object_id: creative_task_01
+                  display_name: 白金眼霜电商前贴
+            inputUnavailable:
+              value:
+                contract_version: creative-production-problem/v1
+                code: PRODUCTION_INPUT_ASSET_UNAVAILABLE
+                message: An immutable input AssetVersion is no longer available for this use.
+                retryable: false
+                source_task: null
+            idempotencyConflict:
+              value:
+                contract_version: creative-production-problem/v1
+                code: PRODUCTION_IDEMPOTENCY_CONFLICT
+                message: The Idempotency-Key was already used for a different retry request.
+                retryable: false
+                source_task: null

@@ -45,6 +45,22 @@ type SelectShortDramaV2FirstFrameRequest struct {
 	CandidateID      string `json:"candidate_id"`
 }
 
+type GenerateShortDramaReferenceBoardsRequest struct {
+	ExpectedRevision int64 `json:"expected_revision"`
+}
+
+type ReconcileShortDramaReferenceBoardRequest struct {
+	ExpectedRevision int64                `json:"expected_revision"`
+	CandidateID      string               `json:"candidate_id"`
+	Job              contract.ProviderJob `json:"job"`
+}
+
+type SelectShortDramaReferenceBoardRequest struct {
+	ExpectedRevision int64  `json:"expected_revision"`
+	BatchID          string `json:"batch_id"`
+	CandidateID      string `json:"candidate_id"`
+}
+
 type BindShortDramaV2TrustedMaterialsRequest struct {
 	ExpectedRevision  int64  `json:"expected_revision"`
 	FirstFrameAssetID string `json:"first_frame_asset_id"`
@@ -99,7 +115,7 @@ func (s Service) PrepareShortDramaV2OpeningFrame(ctx context.Context, requestCon
 		TimestampMS: 0, DerivationID: derivationID, ExtractionVersion: extracted.Version,
 	}
 	updated.GenerationSpec = nil
-	updated.LatestVideoAttemptID = ""
+	updated.LatestVideoAttemptID, updated.VideoError = "", nil
 	updated.RawOutputAsset = nil
 	updated.OutputAsset = nil
 	updated.OutputNormalization = nil
@@ -109,6 +125,308 @@ func (s Service) PrepareShortDramaV2OpeningFrame(ctx context.Context, requestCon
 		return TaskDetail{}, err
 	}
 	return s.Repository.GetTaskDetail(ctx, requestContext.Actor.OrganizationID, projectID, taskID)
+}
+
+func (s Service) GenerateShortDramaReferenceBoards(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, taskID string, request GenerateShortDramaReferenceBoardsRequest) (TaskDetail, error) {
+	detail, err := s.requireShortDramaV2Workspace(ctx, actor, projectID, taskID, true)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	if request.ExpectedRevision != detail.VideoDraft.Revision {
+		return TaskDetail{}, ErrVersionConflict
+	}
+	workspace := detail.VideoDraft.ShortDramaPrerollV2
+	if workspace.PromptDraft == nil || workspace.PromptDraft.ReferenceBoardPlan == nil || workspace.DirectionBatch == nil || workspace.DirectionBatch.SelectedDirectionID == "" {
+		return TaskDetail{}, ErrInvalidState
+	}
+	if s.ShortDramaV2Images == nil {
+		return TaskDetail{}, fmt.Errorf("short drama reference board image generation capability is unavailable")
+	}
+	if err := validateShortDramaReferenceBoardPlan(workspace.Analysis, *workspace.PromptDraft.ReferenceBoardPlan); err != nil {
+		return TaskDetail{}, err
+	}
+	project, err := s.Projects.RequireActiveContext(ctx, actor, projectID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	sourceCanvas, modelCanvas, outputCanvas, err := deriveShortDramaCanvases(workspace.SourceMetadata)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	boardCanvas := deriveShortDramaBoardCanvas(modelCanvas)
+	batchID := fmt.Sprintf("%s_reference_board_batch_%d", taskID, detail.VideoDraft.Revision+1)
+	candidates := make([]ShortDramaReferenceBoardCandidate, 0, len(shortDramaReferenceBoardVariants))
+	submissions := make([]ShortDramaV2FirstFrameJobRequest, 0, len(shortDramaReferenceBoardVariants))
+	now := s.now()
+	for index, variant := range shortDramaReferenceBoardVariants {
+		plan := *workspace.PromptDraft.ReferenceBoardPlan
+		prompt := compileShortDramaReferenceBoardImagePrompt(plan, workspace.PromptDraft.ImagePrompt, variant.Key, variant.Instruction, boardCanvas, outputCanvas)
+		promptHash, hashErr := contract.CanonicalJSONHash(struct {
+			PlanHash string `json:"plan_hash"`
+			Variable string `json:"primary_test_variable"`
+			Prompt   string `json:"prompt"`
+		}{plan.ContentHash, variant.Key, prompt})
+		if hashErr != nil {
+			return TaskDetail{}, hashErr
+		}
+		candidateID := fmt.Sprintf("%s_candidate_%d", batchID, index+1)
+		submission := ShortDramaV2FirstFrameJobRequest{
+			TaskID: taskID, BatchID: batchID, CandidateID: candidateID, VariantIndex: index + 1,
+			Prompt: prompt, PromptHash: "sha256:" + promptHash, Width: boardCanvas.Width, Height: boardCanvas.Height,
+		}
+		submissions = append(submissions, submission)
+		candidate := ShortDramaReferenceBoardCandidate{
+			ID: candidateID, VariantIndex: index + 1, PrimaryTestVariable: variant.Key, Plan: plan,
+			Status: ShortDramaV2ResourceQueued, PromptHash: "sha256:" + promptHash,
+		}
+		attempt := initialReferenceBoardAttempt(candidateID, candidate.PromptHash, "", ShortDramaV2ResourceQueued, now)
+		candidate.Attempts = []ShortDramaReferenceBoardAttempt{attempt}
+		candidate.CurrentAttemptID = attempt.ID
+		candidates = append(candidates, candidate)
+	}
+	next := *detail.VideoDraft
+	next.Revision++
+	next.CreatedAt = now
+	updated := *workspace
+	updated.ContractVersion = ShortDramaPrerollV4ContractVersion
+	updated.Revision = next.Revision
+	updated.SourceCanvas, updated.ModelCanvas, updated.OutputCanvas = &sourceCanvas, &modelCanvas, &outputCanvas
+	updated.BoardCanvas = &boardCanvas
+	batch := &ShortDramaReferenceBoardBatch{
+		ShortDramaV2AsyncResource: ShortDramaV2AsyncResource{Status: ShortDramaV2ResourceQueued},
+		ID:                        batchID, Revision: next.Revision, PromptRevision: workspace.PromptDraft.Revision, AnalysisRevision: workspace.Analysis.Revision, Candidates: candidates,
+	}
+	refreshReferenceBoardBatchState(batch)
+	updated.ReferenceBoardBatch = batch
+	updated.FirstFrameBatch = nil
+	updated.ActiveStage = ShortDramaV2StageFramesGenerating
+	updated.GenerationSpec = nil
+	updated.LatestVideoAttemptID, updated.VideoError = "", nil
+	updated.RawOutputAsset, updated.OutputAsset, updated.OutputNormalization = nil, nil, nil
+	updated.UpdatedAt = now
+	next.ShortDramaPrerollV2 = &updated
+	next.Prompt = "正在生成 3 套视觉参考宫格"
+	if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, detail.VideoDraft.Revision, next, TaskGenerating); err != nil {
+		return TaskDetail{}, err
+	}
+	current, err := s.Repository.GetTaskDetail(ctx, actor.OrganizationID, projectID, taskID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	for _, submission := range submissions {
+		job, createErr := s.ShortDramaV2Images.CreateFirstFrameJob(ctx, actor, project, submission)
+		currentWorkspace := current.VideoDraft.ShortDramaPrerollV2
+		currentBatch := *currentWorkspace.ReferenceBoardBatch
+		currentBatch.Candidates = append([]ShortDramaReferenceBoardCandidate(nil), currentBatch.Candidates...)
+		candidateIndex := -1
+		for index := range currentBatch.Candidates {
+			if currentBatch.Candidates[index].ID == submission.CandidateID {
+				candidateIndex = index
+				break
+			}
+		}
+		if candidateIndex < 0 {
+			return TaskDetail{}, fmt.Errorf("reference board candidate disappeared before provider submission")
+		}
+		candidate := currentBatch.Candidates[candidateIndex]
+		ensureReferenceBoardAttemptHistory(&candidate, now)
+		attempt := candidate.Attempts[0]
+		if createErr != nil {
+			candidate.Status = ShortDramaV2ResourceFailed
+			candidate.ErrorCode = "REFERENCE_BOARD_JOB_CREATE_FAILED"
+			candidate.ErrorMessage = "视觉宫格任务创建失败，请补生成该方案。"
+			candidate.FailureClass = referenceBoardFailureTransient
+			candidate.Recoverable = true
+			candidate.RecoveryState = "available"
+			attempt.Status = ShortDramaV2ResourceFailed
+			attempt.ProviderErrorCode = candidate.ErrorCode
+			attempt.FailureClass = candidate.FailureClass
+			attempt.Retryable = true
+			completedAt := s.now()
+			attempt.CompletedAt = &completedAt
+		} else {
+			candidate.ProviderJobID = job.ID
+			attempt.ProviderJobID = job.ID
+		}
+		candidate.Attempts[0] = attempt
+		currentBatch.Candidates[candidateIndex] = candidate
+		refreshReferenceBoardBatchState(&currentBatch)
+		updatedAt := s.now()
+		currentNext := *current.VideoDraft
+		currentNext.Revision++
+		currentNext.CreatedAt = updatedAt
+		currentUpdated := *currentWorkspace
+		currentUpdated.Revision, currentUpdated.ReferenceBoardBatch, currentUpdated.UpdatedAt = currentNext.Revision, &currentBatch, updatedAt
+		currentNext.ShortDramaPrerollV2 = &currentUpdated
+		if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, current.VideoDraft.Revision, currentNext, TaskGenerating); err != nil {
+			return TaskDetail{}, err
+		}
+		current, err = s.Repository.GetTaskDetail(ctx, actor.OrganizationID, projectID, taskID)
+		if err != nil {
+			return TaskDetail{}, err
+		}
+	}
+	return current, nil
+}
+
+func (s Service) ReconcileShortDramaReferenceBoard(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, taskID string, request ReconcileShortDramaReferenceBoardRequest) (TaskDetail, error) {
+	detail, err := s.requireShortDramaV2Workspace(ctx, actor, projectID, taskID, true)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	if request.ExpectedRevision != detail.VideoDraft.Revision {
+		return TaskDetail{}, ErrVersionConflict
+	}
+	workspace := detail.VideoDraft.ShortDramaPrerollV2
+	if workspace.ReferenceBoardBatch == nil || workspace.BoardCanvas == nil || request.Job.ProjectID != projectID {
+		return TaskDetail{}, ErrInvalidState
+	}
+	batch := *workspace.ReferenceBoardBatch
+	batch.Candidates = append([]ShortDramaReferenceBoardCandidate(nil), batch.Candidates...)
+	index := -1
+	for i := range batch.Candidates {
+		if batch.Candidates[i].ID == request.CandidateID && batch.Candidates[i].ProviderJobID == request.Job.ID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return TaskDetail{}, fmt.Errorf("short drama reference board job does not match the active batch")
+	}
+	candidate := batch.Candidates[index]
+	ensureReferenceBoardAttemptHistory(&candidate, s.now())
+	attemptIndex := -1
+	for i := range candidate.Attempts {
+		if candidate.Attempts[i].ID == candidate.CurrentAttemptID && candidate.Attempts[i].ProviderJobID == request.Job.ID {
+			attemptIndex = i
+			break
+		}
+	}
+	if attemptIndex < 0 {
+		return TaskDetail{}, fmt.Errorf("short drama reference board attempt does not match the active job")
+	}
+	attempt := candidate.Attempts[attemptIndex]
+	completedAt := s.now()
+	switch request.Job.ProviderStatus {
+	case contract.ProviderJobSucceeded, contract.ProviderJobPartiallySucceeded:
+		if len(request.Job.ProjectAssetRefs) == 0 || request.Job.ProjectAssetRefs[0].ProjectID != projectID {
+			return TaskDetail{}, fmt.Errorf("short drama reference board completed without a durable project asset")
+		}
+		asset := request.Job.ProjectAssetRefs[0]
+		candidate.Asset = &asset
+		candidate.Status = ShortDramaV2ResourceReady
+		candidate, err = s.normalizeShortDramaReferenceBoardCandidate(ctx, actor, projectID, taskID, candidate, *workspace.BoardCanvas)
+		if err != nil {
+			return TaskDetail{}, fmt.Errorf("normalize short drama reference board: %w", err)
+		}
+		candidate.ErrorCode, candidate.ErrorMessage = "", ""
+		candidate.FailureClass, candidate.RecoveryState, candidate.Recoverable = "", "", false
+		attempt.Status = ShortDramaV2ResourceReady
+		attempt.CompletedAt = &completedAt
+	case contract.ProviderJobFailed, contract.ProviderJobCancelled, contract.ProviderJobExpired:
+		candidate.Status = ShortDramaV2ResourceFailed
+		failureClass, recoverable, providerCode := classifyReferenceBoardFailure(request.Job)
+		candidate.ErrorCode = providerCode
+		candidate.FailureClass = failureClass
+		candidate.Recoverable = recoverable && len(candidate.Attempts) < referenceBoardMaxAttempts
+		if candidate.Recoverable {
+			candidate.RecoveryState = "available"
+		} else {
+			candidate.RecoveryState = "exhausted"
+		}
+		if request.Job.Error != nil {
+			candidate.ErrorMessage = request.Job.Error.Message
+		}
+		attempt.Status = ShortDramaV2ResourceFailed
+		attempt.ProviderErrorCode = providerCode
+		attempt.FailureClass = failureClass
+		attempt.Retryable = candidate.Recoverable
+		attempt.CompletedAt = &completedAt
+	default:
+		return detail, nil
+	}
+	candidate.Attempts[attemptIndex] = attempt
+	batch.Candidates[index] = candidate
+	refreshReferenceBoardBatchState(&batch)
+	now := s.now()
+	next := *detail.VideoDraft
+	next.Revision++
+	next.CreatedAt = now
+	updated := *workspace
+	updated.Revision, updated.ReferenceBoardBatch, updated.UpdatedAt = next.Revision, &batch, now
+	if batch.SelectedCandidateID == "" && batch.ReadyCount > 0 && batch.RunningCount == 0 {
+		updated.ActiveStage = ShortDramaV2StageFramesReady
+	}
+	next.ShortDramaPrerollV2 = &updated
+	if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, detail.VideoDraft.Revision, next, TaskInProgress); err != nil {
+		return TaskDetail{}, err
+	}
+	return s.Repository.GetTaskDetail(ctx, actor.OrganizationID, projectID, taskID)
+}
+
+func (s Service) SelectShortDramaReferenceBoard(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, taskID string, request SelectShortDramaReferenceBoardRequest) (TaskDetail, error) {
+	detail, err := s.requireShortDramaV2Workspace(ctx, actor, projectID, taskID, true)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	if request.ExpectedRevision != detail.VideoDraft.Revision {
+		return TaskDetail{}, ErrVersionConflict
+	}
+	workspace := detail.VideoDraft.ShortDramaPrerollV2
+	batch := workspace.ReferenceBoardBatch
+	if batch == nil || batch.ID != request.BatchID || workspace.PromptDraft == nil || workspace.BoardCanvas == nil {
+		return TaskDetail{}, ErrInvalidState
+	}
+	copyBatch := *batch
+	copyBatch.Candidates = append([]ShortDramaReferenceBoardCandidate(nil), batch.Candidates...)
+	var selected *ShortDramaReferenceBoardCandidate
+	for index := range copyBatch.Candidates {
+		candidate := &copyBatch.Candidates[index]
+		if candidate.ID == request.CandidateID && candidate.Status == ShortDramaV2ResourceReady && candidate.ModelReferenceAsset != nil {
+			selected = candidate
+			break
+		}
+	}
+	if selected == nil {
+		return TaskDetail{}, fmt.Errorf("short drama reference board does not belong to the active ready batch")
+	}
+	now := s.now()
+	next := *detail.VideoDraft
+	next.Revision++
+	next.CreatedAt = now
+	updated := *workspace
+	updated.ContractVersion = ShortDramaPrerollV4ContractVersion
+	updated.Revision = next.Revision
+	copyBatch.SelectedCandidateID = selected.ID
+	asset := *selected.ModelReferenceAsset
+	copyBatch.SelectedAsset = &asset
+	updated.ReferenceBoardBatch = &copyBatch
+	updated.ActiveStage = ShortDramaV2StageFrameSelected
+	prompt := *workspace.PromptDraft
+	if strings.TrimSpace(prompt.BaseVideoPrompt) == "" {
+		prompt.BaseVideoPrompt = prompt.VideoPrompt
+	}
+	prompt.Revision++
+	prompt.SelectedVariantKey = selected.PrimaryTestVariable
+	prompt.VideoPrompt = compileShortDramaReferenceBoardVideoPrompt(prompt.BaseVideoPrompt, prompt.DurationSeconds, *selected, workspace.OutputCanvas)
+	prompt.ContentHash, err = shortDramaV2PromptHash(prompt)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	updated.PromptDraft = &prompt
+	updated.GenerationSpec, err = compileShortDramaV2GenerationSpec(updated, projectID, next.Revision)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	updated.LatestVideoAttemptID, updated.VideoError = "", nil
+	updated.RawOutputAsset, updated.OutputAsset, updated.OutputNormalization = nil, nil, nil
+	updated.UpdatedAt = now
+	next.ShortDramaPrerollV2 = &updated
+	next.Prompt = prompt.VideoPrompt
+	if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, detail.VideoDraft.Revision, next, TaskReady); err != nil {
+		return TaskDetail{}, err
+	}
+	return s.Repository.GetTaskDetail(ctx, actor.OrganizationID, projectID, taskID)
 }
 
 func (s Service) GenerateShortDramaV2FirstFrames(ctx context.Context, actor contract.ActorContext, projectID contract.ProjectID, taskID string, request GenerateShortDramaV2FirstFramesRequest) (TaskDetail, error) {
@@ -188,7 +506,7 @@ func (s Service) GenerateShortDramaV2FirstFrames(ctx context.Context, actor cont
 	updated.ActiveStage = ShortDramaV2StageFramesGenerating
 	updated.TrustedMaterials = nil
 	updated.GenerationSpec = nil
-	updated.LatestVideoAttemptID = ""
+	updated.LatestVideoAttemptID, updated.VideoError = "", nil
 	updated.RawOutputAsset = nil
 	updated.OutputAsset = nil
 	updated.OutputNormalization = nil
@@ -373,7 +691,7 @@ func (s Service) SelectShortDramaV2FirstFrame(ctx context.Context, actor contrac
 		return TaskDetail{}, err
 	}
 	updated.GenerationSpec = spec
-	updated.LatestVideoAttemptID = ""
+	updated.LatestVideoAttemptID, updated.VideoError = "", nil
 	updated.RawOutputAsset = nil
 	updated.OutputAsset = nil
 	updated.OutputNormalization = nil
@@ -414,7 +732,7 @@ func (s Service) BindShortDramaV2TrustedMaterials(ctx context.Context, actor con
 	updated.Revision = next.Revision
 	updated.ActiveStage = ShortDramaV2StageFrameSelected
 	updated.TrustedMaterials = &binding
-	updated.LatestVideoAttemptID = ""
+	updated.LatestVideoAttemptID, updated.VideoError = "", nil
 	updated.RawOutputAsset = nil
 	updated.OutputAsset = nil
 	updated.OutputNormalization = nil
@@ -432,21 +750,41 @@ func (s Service) BindShortDramaV2TrustedMaterials(ctx context.Context, actor con
 }
 
 func compileShortDramaV2GenerationSpec(workspace ShortDramaPrerollV2Workspace, projectID contract.ProjectID, revision int64) (*ShortDramaV2GenerationSpec, error) {
-	if workspace.PromptDraft == nil || workspace.FirstFrameBatch == nil || workspace.FirstFrameBatch.SelectedAsset == nil ||
-		workspace.SourceCanvas == nil || workspace.ModelCanvas == nil || workspace.OutputCanvas == nil {
+	if workspace.PromptDraft == nil || workspace.SourceCanvas == nil || workspace.ModelCanvas == nil || workspace.OutputCanvas == nil {
 		return nil, ErrInvalidState
 	}
-	first := *workspace.FirstFrameBatch.SelectedAsset
-	if first.ProjectID != projectID {
+	var reference contract.ProjectAssetRef
+	contractVersion := ShortDramaGenerationSpecV3
+	var referenceBoard *contract.ProjectAssetRef
+	if workspace.ReferenceBoardBatch != nil && workspace.ReferenceBoardBatch.SelectedAsset != nil {
+		reference = *workspace.ReferenceBoardBatch.SelectedAsset
+		referenceBoard = &reference
+		contractVersion = ShortDramaGenerationSpecV4
+	} else if workspace.FirstFrameBatch != nil && workspace.FirstFrameBatch.SelectedAsset != nil {
+		reference = *workspace.FirstFrameBatch.SelectedAsset
+	} else {
+		return nil, ErrInvalidState
+	}
+	if reference.ProjectID != projectID {
 		return nil, ErrInvalidState
 	}
 	spec := ShortDramaV2GenerationSpec{
-		ContractVersion: ShortDramaGenerationSpecV3, DraftRevision: revision,
+		ContractVersion: contractVersion, DraftRevision: revision,
 		PromptRevision: workspace.PromptDraft.Revision, DurationSeconds: workspace.PromptDraft.DurationSeconds,
 		AspectRatio: workspace.ModelCanvas.Ratio, Resolution: workspace.ModelCanvas.Resolution, AudioPolicy: string(provider.VideoAudioGenerated),
-		InputMode: string(provider.VideoInputReferenceImage), FirstFrameAsset: first,
+		InputMode: string(provider.VideoInputReferenceImage), FirstFrameAsset: reference, ReferenceBoardAsset: referenceBoard,
 		SourceCanvas: workspace.SourceCanvas, ModelCanvas: workspace.ModelCanvas, OutputCanvas: workspace.OutputCanvas,
+		BoardCanvas: workspace.BoardCanvas, AnalysisRevision: workspace.Analysis.Revision,
 		CompiledPrompt: workspace.PromptDraft.VideoPrompt, PromptHash: workspace.PromptDraft.ContentHash,
+		CompilerVersion: workspace.PromptDraft.CompilerVersion,
+	}
+	if workspace.DirectionBatch != nil {
+		spec.DirectionBatchID = workspace.DirectionBatch.ID
+		spec.DirectionID = workspace.DirectionBatch.SelectedDirectionID
+	}
+	if workspace.ReferenceBoardBatch != nil {
+		spec.BoardBatchID = workspace.ReferenceBoardBatch.ID
+		spec.BoardCandidateID = workspace.ReferenceBoardBatch.SelectedCandidateID
 	}
 	hash, err := contract.CanonicalJSONHash(spec)
 	if err != nil {
@@ -480,11 +818,17 @@ func (s Service) ShortDramaV2ProviderInput(ctx context.Context, actor contract.A
 	if spec.PromptHash != workspace.PromptDraft.ContentHash || strings.TrimSpace(spec.SpecHash) == "" {
 		return provider.VideoGenerationInput{}, "", "", ErrInvalidState
 	}
+	reference := spec.FirstFrameAsset
+	if spec.ReferenceBoardAsset != nil {
+		reference = *spec.ReferenceBoardAsset
+	}
 	input := provider.VideoGenerationInput{
 		Prompt: spec.CompiledPrompt, DurationSeconds: spec.DurationSeconds,
 		AspectRatio: spec.AspectRatio, Resolution: spec.Resolution,
 		AudioPolicy: provider.VideoAudioPolicy(spec.AudioPolicy), InputMode: provider.VideoInputMode(spec.InputMode),
-		ConditioningAssets: []provider.VideoConditioningAsset{{Role: provider.VideoConditioningReferenceImage, Reference: spec.FirstFrameAsset}},
+	}
+	if input.InputMode == provider.VideoInputReferenceImage {
+		input.ConditioningAssets = []provider.VideoConditioningAsset{{Role: provider.VideoConditioningReferenceImage, Reference: reference}}
 	}
 	if err := input.Validate(); err != nil {
 		return provider.VideoGenerationInput{}, "", "", err
@@ -506,7 +850,7 @@ func (s Service) RegisterShortDramaV2VideoJob(ctx context.Context, actor contrac
 	next.CreatedAt = now
 	updated := *detail.VideoDraft.ShortDramaPrerollV2
 	updated.Revision, updated.ActiveStage, updated.LatestVideoAttemptID = next.Revision, ShortDramaV2StageVideoGenerating, providerJobID
-	updated.OutputAsset, updated.UpdatedAt = nil, now
+	updated.VideoError, updated.OutputAsset, updated.UpdatedAt = nil, nil, now
 	next.ShortDramaPrerollV2 = &updated
 	if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, detail.VideoDraft.Revision, next, TaskGenerating); err != nil {
 		return TaskDetail{}, err
@@ -530,6 +874,39 @@ func (s Service) ReconcileShortDramaV2Video(ctx context.Context, actor contract.
 	}
 	if request.Job.ID != workspace.LatestVideoAttemptID || request.Job.ProjectID != projectID {
 		return TaskDetail{}, ErrInvalidState
+	}
+	if request.Job.ProviderStatus == contract.ProviderJobFailed || request.Job.ProviderStatus == contract.ProviderJobCancelled || request.Job.ProviderStatus == contract.ProviderJobExpired {
+		jobError := request.Job.Error
+		if jobError == nil {
+			jobError = &contract.JobError{Code: "VIDEO_GENERATION_FAILED", Message: "视频生成任务未完成，请重试。", Retryable: request.Job.ProviderStatus != contract.ProviderJobCancelled}
+		}
+		now := s.now()
+		next := *detail.VideoDraft
+		next.Revision++
+		next.CreatedAt = now
+		updated := *workspace
+		if jobError.Code == "REFERENCE_ASSET_CONTENT_REJECTED" && workspace.GenerationSpec != nil && workspace.GenerationSpec.InputMode == string(provider.VideoInputReferenceImage) {
+			fallbackSpec := *workspace.GenerationSpec
+			fallbackSpec.InputMode = string(provider.VideoInputTextOnly)
+			fallbackSpec.FallbackMode = "text_only_realistic"
+			fallbackSpec.FallbackReason = jobError.Code
+			fallbackSpec.SpecHash = ""
+			if hash, hashErr := contract.CanonicalJSONHash(fallbackSpec); hashErr == nil {
+				fallbackSpec.SpecHash = "sha256:" + hash
+				updated.GenerationSpec = &fallbackSpec
+			}
+			jobError = &contract.JobError{
+				Code:      "REFERENCE_ASSET_CONTENT_REJECTED",
+				Message:   "所选视觉宫格因清晰写实人物被视频模型拒绝。系统已保留当前方案；再次点击生成时将改用文字生成原创写实人物，不再传入该宫格，也不保证保持同一张脸。",
+				Retryable: true,
+			}
+		}
+		updated.Revision, updated.ActiveStage, updated.VideoError, updated.UpdatedAt = next.Revision, ShortDramaV2StageFrameSelected, jobError, now
+		next.ShortDramaPrerollV2 = &updated
+		if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, detail.VideoDraft.Revision, next, TaskInProgress); err != nil {
+			return TaskDetail{}, err
+		}
+		return s.Repository.GetTaskDetail(ctx, actor.OrganizationID, projectID, taskID)
 	}
 	if request.Job.ProviderStatus != contract.ProviderJobSucceeded && request.Job.ProviderStatus != contract.ProviderJobPartiallySucceeded {
 		return detail, nil
@@ -573,7 +950,7 @@ func (s Service) ReconcileShortDramaV2Video(ctx context.Context, actor contract.
 	next.Revision++
 	next.CreatedAt = now
 	updated := *workspace
-	updated.Revision, updated.ActiveStage, updated.OutputAsset, updated.UpdatedAt = next.Revision, ShortDramaV2StageCompleted, &asset, now
+	updated.Revision, updated.ActiveStage, updated.VideoError, updated.OutputAsset, updated.UpdatedAt = next.Revision, ShortDramaV2StageCompleted, nil, &asset, now
 	updated.RawOutputAsset, updated.OutputNormalization = &rawAsset, normalization
 	next.ShortDramaPrerollV2 = &updated
 	if _, err := s.ViralRemakes.ReviseVideoDraft(ctx, actor.OrganizationID, projectID, taskID, detail.VideoDraft.Revision, next, TaskGenerated); err != nil {
